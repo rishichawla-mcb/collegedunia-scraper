@@ -171,12 +171,22 @@ with tab_run:
     # ---- Phase 1 ----
     with colA:
         st.subheader("Phase 1 — Courses")
-        st.caption("Scrapes every course (~21,500). Fast: a few minutes.")
+        st.caption("Scrapes every course (~21,500). Fast on a clean IP; "
+                   "datacenter IPs (incl. Streamlit Cloud) get rate-limited.")
+        resume_page = int(db.get_setting("courses_resume_page", 1))
+        if resume_page > 1:
+            st.info(f"⏯️ A previous run stopped early. Starting will **resume from "
+                    f"page {resume_page}** (≈{(resume_page-1)*10} courses already saved). "
+                    f"Already-scraped courses are skipped automatically.")
         test1 = st.checkbox("Test run (first 3 pages only)", key="t1")
+        restart1 = st.checkbox("Force restart from page 1", key="r1",
+                               help="Ignore the saved resume point and re-scrape from the top "
+                                    "(existing rows are updated, not duplicated).")
         if st.button("▶️ Start course scrape", type="primary", key="run1"):
             cfg = proxy_config_from_ui()
             if test1:
                 cfg["max_pages"] = 3
+            cfg["force_restart"] = restart1
             jid = db.create_job("courses", cfg)
             launch_worker(jid)
             st.session_state["watch_job"] = jid

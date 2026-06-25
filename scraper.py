@@ -355,43 +355,96 @@ def run_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
     max_pages = cfg.get("max_pages")
     start_page = int(cfg.get("start_page", 1))
 
-    db.update_job(job_id, status="running", message="starting courses scrape",
-                  db_path=db_path)
+    # Resume: if not forced and no explicit start_page, continue from saved point.
+    if start_page == 1 and not cfg.get("force_restart"):
+        saved = db.get_setting("courses_resume_page", 1, db_path=db_path)
+        try:
+            start_page = max(1, int(saved))
+        except (TypeError, ValueError):
+            start_page = 1
+
+    soft_retries = int(cfg.get("soft_block_retries", 4))
+
+    db.update_job(job_id, status="running",
+                  message=f"starting courses scrape at page {start_page}", db_path=db_path)
     page = start_page
     pages_done = 0
     written = 0
     total = None
     try:
+        # Seed the running total from what's already in the DB (for resume).
+        written = db.counts(db_path=db_path).get("courses", 0)
         while True:
             if db.stop_requested(job_id, db_path=db_path):
-                db.update_job(job_id, status="stopped", message="stopped by user",
+                db.set_setting("courses_resume_page", page, db_path=db_path)
+                db.update_job(job_id, status="stopped",
+                              message=f"stopped by user at page {page} ({written} courses)",
                               finished_at=time.time(), db_path=db_path)
                 log("Stopped by user.")
                 return
+
             data = client.fetch({"page": page})
             courses = data.get("courses") or []
             if total is None:
                 total = data.get("count")
                 db.update_job(job_id, total_units=(total or 0), db_path=db_path)
+
+            # An empty page or hasNext=false BEFORE we've reached the known total
+            # is almost always a soft rate-limit, not a real end. Treat it as a
+            # block: retry the same page a few times, then stop INCOMPLETE so the
+            # run can be resumed — never silently report "completed".
+            reached_end = (total is not None and written >= (total - PAGE_SIZE))
+            looks_blocked = (not courses or not data.get("hasNext", False)) and not reached_end \
+                and not (max_pages and pages_done + 1 >= int(max_pages))
+
+            if not courses and looks_blocked:
+                ok = False
+                for attempt in range(1, soft_retries + 1):
+                    wait = 10 * attempt
+                    log(f"  ! page {page} returned empty but only {written}/{total} done "
+                        f"— likely a soft block. Retry {attempt}/{soft_retries} in {wait}s")
+                    time.sleep(wait)
+                    data = client.fetch({"page": page})
+                    courses = data.get("courses") or []
+                    if courses:
+                        ok = True
+                        break
+                if not ok:
+                    db.set_setting("courses_resume_page", page, db_path=db_path)
+                    msg = (f"INCOMPLETE — blocked at page {page} ({written}/{total} courses). "
+                           f"Increase delay / add proxies, then resume.")
+                    db.update_job(job_id, status="stopped", message=msg,
+                                  finished_at=time.time(), db_path=db_path)
+                    log(msg)
+                    return
+
             if not courses:
-                break
+                break  # genuine end (we're at/near the known total)
+
             parsed = [parse_course(c) for c in courses if (c.get("lead_params") or {}).get("course_id")]
-            written += db.upsert_courses(parsed, db_path=db_path)
+            db.upsert_courses(parsed, db_path=db_path)
+            written = db.counts(db_path=db_path).get("courses", 0)
             pages_done += 1
-            db.update_job(job_id, done_units=written, items_written=written,
-                          message=f"page {page}: {written} courses", db_path=db_path)
-            log(f"  page {page}: +{len(parsed)} (total {written})")
             page += 1
+            db.set_setting("courses_resume_page", page, db_path=db_path)
+            db.update_job(job_id, done_units=written, items_written=written,
+                          message=f"page {page-1}: {written}/{total} courses", db_path=db_path)
+            log(f"  page {page-1}: +{len(parsed)} (total {written}/{total})")
+
             if max_pages and pages_done >= int(max_pages):
                 break
-            if not data.get("hasNext", False):
+            if not data.get("hasNext", False) and reached_end:
                 break
             time.sleep(delay)
-        db.update_job(job_id, status="completed", message=f"done: {written} courses",
-                      finished_at=time.time(), db_path=db_path)
+
+        db.set_setting("courses_resume_page", 1, db_path=db_path)  # reset for next full run
+        db.update_job(job_id, status="completed",
+                      message=f"done: {written} courses", finished_at=time.time(), db_path=db_path)
         log(f"Done. {written} courses.")
     except Exception as err:  # noqa: BLE001
-        db.update_job(job_id, status="error", message=str(err)[:300],
+        db.set_setting("courses_resume_page", page, db_path=db_path)
+        db.update_job(job_id, status="error",
+                      message=f"{str(err)[:240]} (resume from page {page})",
                       finished_at=time.time(), db_path=db_path)
         log(f"ERROR: {err}")
         raise
@@ -436,6 +489,8 @@ def run_offerings(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
                 return
             page = 1
             course_total = None
+            seen = 0
+            soft_retries = int(cfg.get("soft_block_retries", 4))
             while True:
                 if db.stop_requested(job_id, db_path=db_path):
                     break
@@ -443,12 +498,38 @@ def run_offerings(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
                 rows = data.get("courses") or []
                 if course_total is None:
                     course_total = data.get("count")
+
+                capped = bool(max_pages_per_course and page >= int(max_pages_per_course))
+                reached_end = (course_total is not None and seen >= (course_total - PAGE_SIZE))
+                if not rows and not reached_end and not capped:
+                    # Soft block mid-course: retry this page before giving up.
+                    ok = False
+                    for attempt in range(1, soft_retries + 1):
+                        wait = 10 * attempt
+                        log(f"  ! course {cid} page {page} empty ({seen}/{course_total}) "
+                            f"— soft block? retry {attempt}/{soft_retries} in {wait}s")
+                        time.sleep(wait)
+                        data = client.fetch({"page": page, "course_id": cid})
+                        rows = data.get("courses") or []
+                        if rows:
+                            ok = True
+                            break
+                    if not ok:
+                        # Leave this course as 'partial' so it resumes later, then stop.
+                        db.set_offering_progress(cid, "partial", page - 1, course_total, db_path=db_path)
+                        msg = (f"INCOMPLETE — blocked on course {cid} page {page} "
+                               f"({processed} courses done). Increase delay / add proxies, then resume.")
+                        db.update_job(job_id, status="stopped", message=msg,
+                                      finished_at=time.time(), db_path=db_path)
+                        log(msg)
+                        return
                 if not rows:
                     break
                 colleges = [pc for pc in (parse_college(r) for r in rows) if pc]
                 offerings = [parse_offering(cid, r) for r in rows]
                 db.upsert_colleges(colleges, db_path=db_path)
                 offerings_written += db.upsert_offerings(offerings, db_path=db_path)
+                seen += len(rows)
                 db.set_offering_progress(cid, "partial", page, course_total, db_path=db_path)
                 page += 1
                 if max_pages_per_course and page > int(max_pages_per_course):
