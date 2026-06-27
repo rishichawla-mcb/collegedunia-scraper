@@ -541,12 +541,14 @@ def _to_float(v: Any) -> Optional[float]:
 # pagination ceiling. Order matters: broad → narrow.
 COURSE_TYPE_VALUES = ["Degree", "Diploma", "Certification"]
 LEVEL_VALUES = ["Graduation", "Post Graduation", "10+2", "Doctorate/M.Phil", "10th"]
-PARTITION_FACETS = [
-    ("stream", list(range(1, 21))),          # MUST be ints — string values are ignored
-    ("course_type", COURSE_TYPE_VALUES),
-    ("level", LEVEL_VALUES),
-]
-PAGINATION_CAP = 1500  # stay safely under the ~1,700 ceiling
+# NOTE: the `stream` filter breaks deep pagination on this API (results go empty
+# after ~2 pages). `course_tag_id`, `level`, and `course_type` paginate properly,
+# so we partition by those instead. Tag ids are discovered at runtime.
+SUB_FACETS = [("level", LEVEL_VALUES), ("course_type", COURSE_TYPE_VALUES)]
+TAG_ID_RANGE = range(1, 231)
+PAGINATION_CAP = 1500   # split a slice finer if its count exceeds this
+MAX_EMPTY_PAGES = 6     # stop a chunk after this many consecutive empty pages
+MAX_CHUNK_PAGES = 400   # hard safety cap on pages per chunk
 
 
 def run_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
@@ -689,44 +691,28 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
 
     def page_through(filters: Dict[str, Any], first: Optional[Dict[str, Any]],
                      expected: int = 0) -> None:
-        """Page a chunk fully. An empty page or hasNext=false BEFORE we've reached
-        the chunk's known `count` is treated as a transient hiccup (flaky proxy /
-        soft block) and retried, so chunks don't terminate early."""
+        """Page a slice, following its (often sparse/degrading) tail: keep going
+        until MAX_EMPTY_PAGES consecutive empty pages, capturing every straggler.
+        Anchoring on `count` doesn't work because the API rarely serves it all."""
         page = 1
         data = first
-        seen = 0
-        soft = 0
-        while not stopped():
+        consec_empty = 0
+        while not stopped() and page <= MAX_CHUNK_PAGES:
             if data is None:
                 data = fetch_page(filters, page)
             rows = data.get("courses") or []
-            below = expected and seen < (expected - PAGE_SIZE)
-            if (not rows or not data.get("hasNext", False)):
-                if rows:
-                    parsed = [parse_course(c) for c in rows
-                              if (c.get("lead_params") or {}).get("course_id")]
-                    db.upsert_courses(parsed, db_path=db_path)
-                    seen += len(rows)
-                    below = expected and seen < (expected - PAGE_SIZE)
-                if below and soft < soft_retries:
-                    soft += 1
-                    wait = long_cooldown if long_cooldown else 8 * soft
-                    log(f"   ~ chunk page {page} short ({seen}/{expected}) — "
-                        f"retry {soft}/{soft_retries} in {wait:.0f}s")
-                    time.sleep(wait)
-                    if rows:          # had a (final-looking) page -> advance
-                        page += 1
-                    data = None       # empty page -> re-fetch the SAME page
-                    continue
-                break
-            soft = 0
-            parsed = [parse_course(c) for c in rows
-                      if (c.get("lead_params") or {}).get("course_id")]
-            db.upsert_courses(parsed, db_path=db_path)
-            seen += len(rows)
+            if rows:
+                consec_empty = 0
+                parsed = [parse_course(c) for c in rows
+                          if (c.get("lead_params") or {}).get("course_id")]
+                db.upsert_courses(parsed, db_path=db_path)
+            else:
+                consec_empty += 1
+                if consec_empty >= MAX_EMPTY_PAGES:
+                    break
             page += 1
             data = None
-            if page % 5 == 0:
+            if page % 10 == 0:
                 push()
             time.sleep(adaptive.value())
         leaves_done["v"] += 1
@@ -751,14 +737,11 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
             grand_total["v"] = count  # root count = full universe
         if count == 0:
             return
-        if count <= PAGINATION_CAP or idx >= len(PARTITION_FACETS):
-            if count > PAGINATION_CAP:
-                log(f"  ~ '{label}' has {count} (> cap) and no finer facet — "
-                    f"paging as deep as the API allows.")
-            log(f"  → scraping chunk '{label}' (~{count})")
+        if count <= PAGINATION_CAP or idx >= len(facets):
+            log(f"  → scraping chunk '{label}' (count {count})")
             page_through(filters, first=data, expected=count)
             return
-        key, values = PARTITION_FACETS[idx]
+        key, values = facets[idx]
         if key in filters:
             recurse(filters, idx + 1, label)
             return
@@ -767,10 +750,25 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
                 return
             recurse({**filters, key: v}, idx + 1, f"{label} {key}={v}")
 
-    db.update_job(job_id, status="running", message="partitioned course scrape starting",
+    db.update_job(job_id, status="running", message="discovering course tags…",
                   db_path=db_path)
-    log("Phase 1 (complete/partitioned) [BUILD: sticky-v4] — "
-        "sticky-IP chunks under the ~1,700 pagination cap.")
+    log("Phase 1 (complete/partitioned) [BUILD: tagid-v5] — "
+        "partitioning by course_tag_id (stream breaks deep pagination).")
+    # Discover valid course_tag_id values (rotate IP per probe).
+    tag_ids: List[int] = []
+    for t in TAG_ID_RANGE:
+        if stopped():
+            break
+        client.session_id = f"d{t}"
+        try:
+            d = fetch_page({"course_tag_id": t}, 1)
+            if (d.get("count") or 0) > 0:
+                tag_ids.append(t)
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(adaptive.value())
+    log(f"Discovered {len(tag_ids)} course tags.")
+    facets = [("course_tag_id", tag_ids)] + SUB_FACETS
     try:
         recurse({}, 0, "all")
         written = db.counts(db_path=db_path).get("courses", 0)
