@@ -33,6 +33,7 @@ import random
 import re
 import threading
 import time
+from urllib.parse import urlparse, urlunparse
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -73,6 +74,25 @@ def abs_url(path: Optional[str]) -> str:
     if path.startswith("http"):
         return path
     return f"{SITE}/{path.lstrip('/')}"
+
+
+def sticky_gateway(url: str, session_id: Optional[str]) -> str:
+    """Inject a DataImpulse-style sticky session id into a proxy gateway URL's
+    username (``user;sessid.<id>``) so all requests in a session use one IP.
+    Harmless for providers that ignore the suffix."""
+    if not url or not session_id:
+        return url
+    try:
+        p = urlparse(url)
+        if not p.username:
+            return url
+        user = f"{p.username};sessid.{session_id}"
+        auth = user + (f":{p.password}" if p.password else "")
+        host = p.hostname or ""
+        netloc = f"{auth}@{host}" + (f":{p.port}" if p.port else "")
+        return urlunparse((p.scheme, netloc, p.path, p.params, p.query, p.fragment))
+    except Exception:
+        return url
 
 
 class BlockedError(Exception):
@@ -213,11 +233,13 @@ class ProxyManager:
     def __post_init__(self) -> None:
         self._cycle = itertools.cycle(self.proxies) if self.proxies else None
 
-    def get(self) -> Optional[Proxy]:
+    def get(self, session_id: Optional[str] = None) -> Optional[Proxy]:
         if self.mode == "none":
             return None
         if self.mode == "gateway":
-            return Proxy(url=self.gateway) if self.gateway else None
+            if not self.gateway:
+                return None
+            return Proxy(url=sticky_gateway(self.gateway, session_id) if session_id else self.gateway)
         # list mode
         with self._lock:
             if not self.proxies:
@@ -282,12 +304,13 @@ class Client:
         self.log = log or (lambda m: None)
         self.stats = stats or Stats()
         self.adaptive = adaptive
+        self.session_id: Optional[str] = None  # set for sticky-IP pagination
 
     def fetch(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         params = {"data": encode_payload(payload)}
         last_err: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
-            proxy = self.pm.get()
+            proxy = self.pm.get(self.session_id)
             try:
                 resp = self.session.get(
                     API_URL, params=params, headers=base_headers(),
@@ -323,7 +346,7 @@ class Client:
         same retry/rotation/block handling. Returns the response text."""
         last_err: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
-            proxy = self.pm.get()
+            proxy = self.pm.get(self.session_id)
             try:
                 resp = self.session.get(
                     url, headers=base_headers(),
@@ -712,6 +735,8 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
     def recurse(filters: Dict[str, Any], idx: int, label: str) -> None:
         if stopped():
             return
+        # one sticky IP per slice so pagination stays consistent
+        client.session_id = f"cf{random.randint(0, 10**9)}"
         # probe the size of this slice
         data = None
         for attempt in range(1, soft_retries + 1):
@@ -744,8 +769,8 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
 
     db.update_job(job_id, status="running", message="partitioned course scrape starting",
                   db_path=db_path)
-    log("Phase 1 (complete/partitioned) [BUILD: chunk-retry-v3] — "
-        "splitting the catalog under the ~1,700 pagination cap.")
+    log("Phase 1 (complete/partitioned) [BUILD: sticky-v4] — "
+        "sticky-IP chunks under the ~1,700 pagination cap.")
     try:
         recurse({}, 0, "all")
         written = db.counts(db_path=db_path).get("courses", 0)
@@ -859,6 +884,7 @@ def run_offerings(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
                                   f"delay {adaptive.value():.1f}s", db_path=db_path)
 
     def scrape_course(cid: int, client: Client) -> int:
+        client.session_id = f"crs{cid}"   # one sticky IP per course's pagination
         prog = db.get_offering_progress(cid, db_path=db_path)
         start_page = 1
         course_total = prog.get("total_count") if prog else None
