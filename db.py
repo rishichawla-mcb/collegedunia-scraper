@@ -90,15 +90,24 @@ CREATE TABLE IF NOT EXISTS courses (
 );
 
 CREATE TABLE IF NOT EXISTS colleges (
-    college_id  INTEGER PRIMARY KEY,
-    name        TEXT,
-    short_form  TEXT,
-    city        TEXT,
-    state_id    INTEGER,
-    link        TEXT,
-    logo        TEXT,
-    raw_json    TEXT,
-    scraped_at  REAL
+    college_id   INTEGER PRIMARY KEY,
+    name         TEXT,
+    short_form   TEXT,
+    city         TEXT,
+    state_id     INTEGER,
+    link         TEXT,
+    logo         TEXT,
+    raw_json     TEXT,
+    website      TEXT,
+    email        TEXT,
+    phone        TEXT,
+    rating_value REAL,
+    rating_count INTEGER,
+    pros         TEXT,
+    cons         TEXT,
+    address      TEXT,
+    enriched_at  REAL,
+    scraped_at   REAL
 );
 
 CREATE TABLE IF NOT EXISTS offerings (
@@ -177,8 +186,30 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT
 );
 
+-- Phase 4: per-college courses & fees (scraped from /college/<id>/courses-fees)
+CREATE TABLE IF NOT EXISTS college_courses (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    college_id   INTEGER,
+    college_name TEXT,
+    course_name  TEXT,
+    eligibility  TEXT,
+    total_fees   TEXT,
+    hostel_fees  TEXT,
+    source_url   TEXT,
+    scraped_at   REAL,
+    UNIQUE(college_id, course_name)
+);
+
+CREATE TABLE IF NOT EXISTS cc_progress (
+    college_id INTEGER PRIMARY KEY,
+    status     TEXT,            -- 'done' | 'empty' | 'error'
+    found      INTEGER DEFAULT 0,
+    updated_at REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_offerings_course ON offerings(course_id);
 CREATE INDEX IF NOT EXISTS idx_offerings_college ON offerings(college_id);
+CREATE INDEX IF NOT EXISTS idx_cc_college ON college_courses(college_id);
 """
 
 
@@ -201,6 +232,14 @@ def init_db(db_path: str = DB_PATH) -> None:
             conn.execute("ALTER TABLE jobs ADD COLUMN req_count INTEGER DEFAULT 0")
         if "bytes_count" not in jcols:
             conn.execute("ALTER TABLE jobs ADD COLUMN bytes_count INTEGER DEFAULT 0")
+        # Migration: Phase-3 college enrichment columns.
+        kcols = {r[1] for r in conn.execute("PRAGMA table_info(colleges)")}
+        for col, typ in (("website", "TEXT"), ("email", "TEXT"), ("phone", "TEXT"),
+                         ("rating_value", "REAL"), ("rating_count", "INTEGER"),
+                         ("pros", "TEXT"), ("cons", "TEXT"), ("address", "TEXT"),
+                         ("enriched_at", "REAL")):
+            if col not in kcols:
+                conn.execute(f"ALTER TABLE colleges ADD COLUMN {col} {typ}")
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +356,70 @@ def get_done_course_ids(db_path: str = DB_PATH) -> set:
             "SELECT course_id FROM offering_progress WHERE status='done'"
         ).fetchall()
     return {r["course_id"] for r in rows}
+
+
+def list_colleges_to_enrich(db_path: str = DB_PATH, where: str = "", params: tuple = (),
+                            include_done: bool = False, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    sql = "SELECT college_id, link FROM colleges"
+    conds = []
+    if where:
+        conds.append(where)
+    if not include_done:
+        conds.append("(enriched_at IS NULL)")
+    conds.append("link IS NOT NULL AND link<>''")
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY college_id"
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    with connect(db_path) as conn:
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def update_college_details(college_id: int, fields: Dict[str, Any], db_path: str = DB_PATH) -> None:
+    cols = ["website", "email", "phone", "rating_value", "rating_count",
+            "pros", "cons", "address"]
+    sets = ", ".join(f"{c}=?" for c in cols) + ", enriched_at=?"
+    vals = [fields.get(c) for c in cols] + [time.time(), college_id]
+    with connect(db_path) as conn:
+        conn.execute(f"UPDATE colleges SET {sets} WHERE college_id=?", vals)
+
+
+def upsert_college_courses(rows: Iterable[Dict[str, Any]], db_path: str = DB_PATH) -> int:
+    rows = [r for r in rows if r.get("course_name")]
+    if not rows:
+        return 0
+    cols = ["college_id", "college_name", "course_name", "eligibility",
+            "total_fees", "hostel_fees", "source_url", "scraped_at"]
+    ph = ",".join("?" for _ in cols)
+    sql = (f"INSERT INTO college_courses ({','.join(cols)}) VALUES ({ph}) "
+           f"ON CONFLICT(college_id, course_name) DO UPDATE SET "
+           + ",".join(f"{c}=excluded.{c}" for c in cols
+                      if c not in ("college_id", "course_name")))
+    with connect(db_path) as conn:
+        conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
+    return len(rows)
+
+
+def set_cc_progress(college_id: int, status: str, found: int, db_path: str = DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO cc_progress(college_id, status, found, updated_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(college_id) DO UPDATE SET status=excluded.status, "
+            "found=excluded.found, updated_at=excluded.updated_at",
+            (college_id, status, found, time.time()))
+
+
+def get_cc_done_ids(db_path: str = DB_PATH) -> set:
+    with connect(db_path) as conn:
+        return {r[0] for r in conn.execute(
+            "SELECT college_id FROM cc_progress WHERE status IN ('done','empty')")}
+
+
+def list_known_college_ids(db_path: str = DB_PATH) -> List[int]:
+    with connect(db_path) as conn:
+        return [r[0] for r in conn.execute(
+            "SELECT college_id FROM colleges ORDER BY college_id")]
 
 
 def get_offering_progress(course_id: int, db_path: str = DB_PATH) -> Optional[Dict[str, Any]]:

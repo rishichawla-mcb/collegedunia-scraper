@@ -27,6 +27,7 @@ does NOT solve CAPTCHAs or spoof browser fingerprints.
 from __future__ import annotations
 
 import base64
+import html as _html
 import itertools
 import json
 import random
@@ -1104,6 +1105,193 @@ def run_enrichment(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
         log(msg)
         if status == "completed":
             send_notification(cfg, "Collegedunia Phase 3 complete", msg, log)
+    except Exception as err:  # noqa: BLE001
+        db.update_job(job_id, status="error", message=str(err)[:300],
+                      finished_at=time.time(), db_path=db_path)
+        log(f"ERROR: {err}")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: per-college courses & fees (parse the SSR fees table)
+# ---------------------------------------------------------------------------
+_TABLE_RE = re.compile(r"<table\b[^>]*>(.*?)</table>", re.S | re.I)
+_TR_RE = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.S | re.I)
+_TD_RE = re.compile(r"<t[hd]\b[^>]*>(.*?)</t[hd]>", re.S | re.I)
+
+
+def _clean_html(s: str) -> str:
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    return re.sub(r"\s+", " ", _html.unescape(s)).strip()
+
+
+def parse_courses_fees(page_html: str) -> Dict[str, Any]:
+    """Parse the courses-&-fees table(s) from a college page's server HTML.
+    Returns {'college_name': str, 'courses': [ {course_name, eligibility,
+    total_fees, hostel_fees}, ... ]}."""
+    name = ""
+    m = re.search(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+                  page_html or "", re.S | re.I)
+    # college name from <title> as a cheap fallback
+    mt = re.search(r"<title>(.*?)</title>", page_html or "", re.S | re.I)
+    if mt:
+        name = _clean_html(mt.group(1)).split(":")[0].split(" Courses")[0].strip()
+
+    courses: List[Dict[str, Any]] = []
+    seen = set()
+    for tbl in _TABLE_RE.findall(page_html or ""):
+        rows = _TR_RE.findall(tbl)
+        if not rows:
+            continue
+        hdr = [_clean_html(h).lower() for h in _TD_RE.findall(rows[0])]
+        if not hdr or not any("fee" in h for h in hdr):
+            continue
+
+        def col(*keys):
+            for i, h in enumerate(hdr):
+                if all(k in h for k in keys):
+                    return i
+            return None
+
+        ci_course = col("course")
+        ci_elig = col("eligib")
+        ci_total = col("total", "fee")
+        if ci_total is None:
+            ci_total = col("fee")
+        ci_hostel = col("hostel")
+        for r in rows[1:]:
+            cells = [_clean_html(c) for c in _TD_RE.findall(r)]
+            if not cells or not any(cells):
+                continue
+
+            def g(i):
+                return cells[i] if (i is not None and i < len(cells)) else ""
+
+            cn = g(ci_course) or (cells[0] if cells else "")
+            if not cn or cn.lower() in seen:
+                continue
+            seen.add(cn.lower())
+            courses.append({"course_name": cn, "eligibility": g(ci_elig),
+                            "total_fees": g(ci_total), "hostel_fees": g(ci_hostel)})
+    return {"college_name": name, "courses": courses}
+
+
+def run_college_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
+                        log: Optional[Callable[[str], None]] = None) -> None:
+    """Phase 4: for each college id, fetch /college/<id>/courses-fees and store
+    its course+fee rows. IDs come from the known colleges table and/or an
+    explicit id range (cfg id_start/id_end). The id alone resolves (the site
+    redirects to the canonical slug)."""
+    import queue as _queue
+    log = log or (lambda m: print(m, flush=True))
+    pm = ProxyManager.from_config(cfg)
+    stats = Stats()
+    adaptive = AdaptiveDelay(float(cfg.get("delay", 1.0)), enabled=bool(cfg.get("adaptive", True)))
+    concurrency = max(1, int(cfg.get("concurrency", 1)))
+    budget_bytes = int(float(cfg.get("budget_mb", 0)) * 1024 * 1024)
+    budget_requests = int(cfg.get("budget_requests", 0))
+
+    ids: List[int] = list(cfg.get("college_ids") or [])
+    if cfg.get("use_known", True) and not ids:
+        ids = db.list_known_college_ids(db_path=db_path)
+    if cfg.get("id_start") and cfg.get("id_end"):
+        ids = sorted(set(ids) | set(range(int(cfg["id_start"]), int(cfg["id_end"]) + 1)))
+    if not cfg.get("force_rescrape"):
+        done = db.get_cc_done_ids(db_path=db_path)
+        ids = [i for i in ids if i not in done]
+
+    total = len(ids)
+    db.update_job(job_id, status="running", total_units=total,
+                  message=f"{total} colleges' courses-fees to scrape", db_path=db_path)
+    log(f"Phase 4 [BUILD: ccfees-v1]: {total} colleges, concurrency={concurrency}")
+
+    stop_event = threading.Event()
+    db_lock = threading.Lock()
+    prog_lock = threading.Lock()
+    state = {"done": 0, "rows": 0, "incomplete": False, "msg": ""}
+
+    def budget_hit():
+        reqs, byts, _ = stats.snapshot()
+        if budget_requests and reqs >= budget_requests:
+            return f"request budget reached ({reqs})"
+        if budget_bytes and byts >= budget_bytes:
+            return f"bandwidth budget reached ({byts/1048576:.1f} MB)"
+        return None
+
+    def push():
+        reqs, byts, _ = stats.snapshot()
+        with prog_lock:
+            d, rw = state["done"], state["rows"]
+        with db_lock:
+            db.update_job(job_id, done_units=d, items_written=rw, req_count=reqs,
+                          bytes_count=byts,
+                          message=f"{d}/{total} colleges · {rw} course-rows · {byts/1048576:.1f} MB",
+                          db_path=db_path)
+
+    q: "_queue.Queue" = _queue.Queue()
+    for i in ids:
+        q.put(i)
+
+    def worker():
+        client = Client(pm, log=log, max_retries=int(cfg.get("max_retries", 5)),
+                        backoff=float(cfg.get("backoff", 4)), stats=stats, adaptive=adaptive)
+        while not stop_event.is_set():
+            try:
+                cid = q.get_nowait()
+            except _queue.Empty:
+                return
+            if db.stop_requested(job_id, db_path=db_path):
+                stop_event.set(); return
+            bh = budget_hit()
+            if bh:
+                with prog_lock:
+                    state["incomplete"] = True; state["msg"] = bh
+                stop_event.set(); return
+            client.session_id = f"cc{cid}"
+            url = f"{SITE}/college/{cid}/courses-fees"
+            n = 0
+            try:
+                parsed = parse_courses_fees(client.get_text(url))
+                rows = [{**r, "college_id": cid, "college_name": parsed.get("college_name", ""),
+                         "source_url": url, "scraped_at": time.time()}
+                        for r in parsed.get("courses", [])]
+                with db_lock:
+                    n = db.upsert_college_courses(rows, db_path=db_path)
+                    db.set_cc_progress(cid, "done" if n else "empty", n, db_path=db_path)
+            except Exception as err:  # noqa: BLE001
+                with db_lock:
+                    db.set_cc_progress(cid, "error", 0, db_path=db_path)
+                log(f"  college {cid} err: {str(err)[:60]}")
+            with prog_lock:
+                state["done"] += 1
+                state["rows"] += n
+                d = state["done"]
+            if d % 5 == 0:
+                push()
+            time.sleep(adaptive.value())
+
+    try:
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(concurrency)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        reqs, byts, _ = stats.snapshot()
+        if state["incomplete"]:
+            msg = (f"INCOMPLETE — {state['msg']} ({state['done']}/{total}, "
+                   f"{byts/1048576:.1f} MB). Resume to continue.")
+            status = "stopped"
+        elif db.stop_requested(job_id, db_path=db_path):
+            msg = f"stopped by user after {state['done']} colleges"
+            status = "stopped"
+        else:
+            msg = f"done: {state['done']} colleges, {state['rows']} course-rows, {byts/1048576:.1f} MB"
+            status = "completed"
+        db.update_job(job_id, status=status, message=msg, finished_at=time.time(),
+                      req_count=reqs, bytes_count=byts, db_path=db_path)
+        log(msg)
+        if status == "completed":
+            send_notification(cfg, "Collegedunia Phase 4 complete", msg, log)
     except Exception as err:  # noqa: BLE001
         db.update_job(job_id, status="error", message=str(err)[:300],
                       finished_at=time.time(), db_path=db_path)

@@ -17,7 +17,7 @@ from openpyxl.utils import get_column_letter
 
 import db
 
-TABLES = ("courses", "colleges", "offerings")
+TABLES = ("courses", "colleges", "offerings", "college_courses")
 
 
 def _fetch(table: str, db_path: str = db.DB_PATH) -> Tuple[List[str], List[tuple]]:

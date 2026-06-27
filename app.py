@@ -480,6 +480,113 @@ with tab_run:
             st.success(f"Started job #{jid}")
 
     st.divider()
+    st.markdown("#### 🏫 Phase 3 — College enrichment")
+    st.caption("Fetches each college's page for official website, email, phone, rating, "
+               "pros/cons, and address (no reviews). Pages are ~300 KB each.")
+    with db.connect() as conn:
+        n_total = conn.execute("SELECT COUNT(*) FROM colleges").fetchone()[0]
+        n_done = conn.execute(
+            "SELECT COUNT(*) FROM colleges WHERE enriched_at IS NOT NULL").fetchone()[0]
+    pending = n_total - n_done
+    e1, e2, e3 = st.columns(3)
+    e1.metric("Colleges", f"{n_total:,}")
+    e2.metric("Enriched", f"{n_done:,}")
+    e3.metric("Pending", f"{pending:,}")
+    if n_total == 0:
+        st.info("Run Phase 2 first so there are colleges to enrich.")
+    escope = st.radio("Scope", ["All not-yet-enriched", "Filter by city", "Test (50)"],
+                      horizontal=True, key="escope")
+    ecfg: dict = {}
+    if escope == "Filter by city":
+        ecity = st.text_input("City contains", key="ecity")
+        if ecity:
+            ecfg["college_where"] = "city LIKE ?"
+            ecfg["college_where_params"] = [f"%{ecity}%"]
+    elif escope == "Test (50)":
+        ecfg["limit"] = 50
+    target = ecfg.get("limit") or (pending if escope != "Filter by city" else pending)
+    est_mb = target * 300 / 1024
+    st.info(f"📊 ~{target:,} colleges → ~**{est_mb:.0f} MB** "
+            f"({est_mb/1024:.2f} GB) at ~300 KB each. Mind your proxy quota.")
+    ec1, ec2 = st.columns(2)
+    e_conc = ec1.number_input("Parallel workers", 1, 20, 3, key="econc")
+    e_bud = ec2.number_input("Max bandwidth MB (0=∞)", 0, 100000, 0, step=100, key="ebud")
+    e_force = st.checkbox("Re-enrich already-done", key="eforce")
+    if st.button("🏫 Start college enrichment", key="rune", disabled=n_total == 0):
+        cfg = proxy_config_from_ui()
+        cfg.update(ecfg)
+        cfg["concurrency"] = int(e_conc)
+        cfg["budget_mb"] = float(e_bud)
+        cfg["force_rescrape"] = e_force
+        jid = db.create_job("enrichment", cfg)
+        launch_worker(jid)
+        st.session_state["watch_job"] = jid
+        st.success(f"Started enrichment — job #{jid}")
+
+    st.divider()
+    st.markdown("#### 🏫 Phase 4 — College courses & fees (college-side)")
+    st.caption("Fetches each college's /courses-fees page → its courses + total/hostel fees. "
+               "ID-addressable (the id alone resolves), so this is the most complete path. "
+               "~0.3–0.9 MB per college.")
+    with db.connect() as conn:
+        cc_known = conn.execute("SELECT COUNT(*) FROM colleges").fetchone()[0]
+        cc_done = conn.execute(
+            "SELECT COUNT(*) FROM cc_progress WHERE status IN ('done','empty')").fetchone()[0]
+        cc_rows = conn.execute("SELECT COUNT(*) FROM college_courses").fetchone()[0]
+    g1, g2, g3 = st.columns(3)
+    g1.metric("Known colleges", f"{cc_known:,}")
+    g2.metric("Processed", f"{cc_done:,}")
+    g3.metric("Course-rows", f"{cc_rows:,}")
+    cscope = st.radio("Source", ["Known colleges (from Phase 2)", "College ID range"],
+                      horizontal=True, key="ccscope")
+    ccfg: dict = {}
+    n_target = max(0, cc_known - cc_done)
+    if cscope == "College ID range":
+        r1, r2 = st.columns(2)
+        ccfg["id_start"] = r1.number_input("ID start", 1, 100000, 1, key="ccs")
+        ccfg["id_end"] = r2.number_input("ID end", 1, 100000, 2000, key="cce")
+        ccfg["use_known"] = False
+        n_target = int(ccfg["id_end"]) - int(ccfg["id_start"]) + 1
+    est_mb = n_target * 500 / 1024
+    st.info(f"📊 ~{n_target:,} colleges → ~**{est_mb:.0f} MB** ({est_mb/1024:.2f} GB) "
+            f"at ~0.5 MB each. Set a budget cap for big ranges.")
+    ct1, ct2 = st.columns(2)
+    cc_conc = ct1.number_input("Parallel workers", 1, 20, 3, key="cconc")
+    cc_bud = ct2.number_input("Max bandwidth MB (0=∞)", 0, 200000, 0, step=200, key="ccbud")
+    test4 = st.checkbox("Test run (first 25 known colleges)", key="t4")
+    cforce = st.checkbox("Re-scrape already-done", key="ccf")
+    if st.button("🏫 Start courses-fees scrape", key="run4",
+                 disabled=(cc_known == 0 and cscope.startswith("Known"))):
+        cfg = proxy_config_from_ui()
+        cfg.update(ccfg)
+        if test4:
+            cfg["college_ids"] = db.list_known_college_ids()[:25]
+            cfg["use_known"] = False
+        cfg["concurrency"] = int(cc_conc)
+        cfg["budget_mb"] = float(cc_bud)
+        cfg["force_rescrape"] = cforce
+        jid = db.create_job("college_courses", cfg)
+        launch_worker(jid)
+        st.session_state["watch_job"] = jid
+        st.success(f"Started courses-fees scrape — job #{jid}")
+
+    if cc_rows > 0:
+        with st.expander("🔀 Reconcile: college-side vs course-side"):
+            with db.connect() as conn:
+                cc_colleges = conn.execute(
+                    "SELECT COUNT(DISTINCT college_id) FROM college_courses").fetchone()[0]
+                off_colleges = conn.execute(
+                    "SELECT COUNT(DISTINCT college_id) FROM offerings").fetchone()[0]
+                only_cc = conn.execute(
+                    "SELECT COUNT(*) FROM (SELECT DISTINCT college_id FROM college_courses "
+                    "WHERE college_id NOT IN (SELECT DISTINCT college_id FROM offerings))").fetchone()[0]
+            rc1, rc2, rc3 = st.columns(3)
+            rc1.metric("Colleges (Phase 4)", f"{cc_colleges:,}")
+            rc2.metric("Colleges (Phase 2)", f"{off_colleges:,}")
+            rc3.metric("In Phase 4 only", f"{only_cc:,}",
+                       help="Colleges the course-finder never surfaced — the gap this fills.")
+
+    st.divider()
 
     # ---- Live monitor ----
     st.subheader("Live progress")
@@ -582,7 +689,8 @@ with tab_query:
             where.append(f"course_type IN ({','.join('?'*len(ctype))})"); params += ctype
     else:
         table = "colleges"
-        cols = "college_id, name, short_form, city, state_id, link"
+        cols = ("college_id, name, short_form, city, state_id, website, email, phone, "
+                "rating_value, rating_count, address, link")
         fn = st.text_input("Name contains", key="qco_n")
         fcy = st.text_input("City contains", key="qco_c")
         if fn: where.append("name LIKE ?"); params.append(f"%{fn}%")
@@ -717,7 +825,7 @@ with tab_index:
 # Data tab
 # ---------------------------------------------------------------------------
 with tab_data:
-    table = st.selectbox("Table", ["courses", "colleges", "offerings"])
+    table = st.selectbox("Table", ["courses", "colleges", "offerings", "college_courses"])
     with db.connect() as conn:
         ncols = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
     st.caption(f"{ncols:,} rows in `{table}`")
@@ -731,6 +839,9 @@ with tab_data:
             params = [f"%{q}%"]
         elif table == "colleges":
             where = "WHERE name LIKE ? OR city LIKE ?"
+            params = [f"%{q}%", f"%{q}%"]
+        elif table == "college_courses":
+            where = "WHERE course_name LIKE ? OR college_name LIKE ?"
             params = [f"%{q}%", f"%{q}%"]
         else:
             where = "WHERE course_name LIKE ? OR college_name LIKE ? OR city LIKE ?"
