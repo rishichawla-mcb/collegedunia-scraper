@@ -28,6 +28,23 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 DB_PATH = os.environ.get("CD_DB_PATH", os.path.join(os.path.dirname(__file__), "data.db"))
 
+# Collegedunia internal stream IDs -> human-readable names (verified via the API).
+STREAMS = {
+    1: "Agriculture", 2: "Architecture", 3: "Arts", 4: "Aviation",
+    5: "Commerce", 6: "Computer Applications", 7: "Dental", 8: "Design",
+    9: "Education", 10: "Engineering", 11: "Hotel Management", 12: "Law",
+    13: "Management", 14: "Mass Communications", 15: "Medical",
+    16: "Paramedical", 17: "Pharmacy", 18: "Science",
+    19: "Veterinary Sciences", 20: "Vocational Courses",
+}
+
+
+def stream_name(sid: Any) -> str:
+    try:
+        return STREAMS.get(int(sid), f"Stream {sid}")
+    except (TypeError, ValueError):
+        return ""
+
 
 @contextmanager
 def connect(db_path: str = DB_PATH) -> Iterator[sqlite3.Connection]:
@@ -63,6 +80,7 @@ CREATE TABLE IF NOT EXISTS courses (
     job_roles      TEXT,
     topics_covered TEXT,
     stream_id      TEXT,
+    stream_name    TEXT,
     course_tag     TEXT,
     course_tag_id  TEXT,
     description    TEXT,
@@ -165,6 +183,16 @@ CREATE INDEX IF NOT EXISTS idx_offerings_college ON offerings(college_id);
 def init_db(db_path: str = DB_PATH) -> None:
     with connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        # Migration: add stream_name to existing course tables + backfill.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(courses)")}
+        if "stream_name" not in cols:
+            conn.execute("ALTER TABLE courses ADD COLUMN stream_name TEXT")
+        for sid, name in STREAMS.items():
+            conn.execute(
+                "UPDATE courses SET stream_name=? WHERE stream_id=? AND "
+                "(stream_name IS NULL OR stream_name='')",
+                (name, str(sid)),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -201,8 +229,8 @@ def upsert_courses(rows: Iterable[Dict[str, Any]], db_path: str = DB_PATH) -> in
         "course_id", "name", "course_link", "listing_link", "duration", "course_type",
         "level", "eligibility", "program_type", "mode", "exam_name", "exam_url",
         "fees", "avg_salary", "colleges_count", "job_roles", "topics_covered",
-        "stream_id", "course_tag", "course_tag_id", "description", "colleges_url",
-        "raw_json", "scraped_at",
+        "stream_id", "stream_name", "course_tag", "course_tag_id", "description",
+        "colleges_url", "raw_json", "scraped_at",
     ]
     placeholders = ",".join("?" for _ in cols)
     sql = (

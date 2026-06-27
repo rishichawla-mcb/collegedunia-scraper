@@ -243,11 +243,12 @@ with tab_run:
             cfg2_extra["course_ids"] = db.list_course_ids()[: int(n)]
         elif scope == "Filter by stream/type":
             with db.connect() as conn:
-                streams = [r[0] for r in conn.execute(
-                    "SELECT DISTINCT stream_id FROM courses WHERE stream_id<>'' ORDER BY stream_id")]
                 ctypes = [r[0] for r in conn.execute(
                     "SELECT DISTINCT course_type FROM courses WHERE course_type<>'' ORDER BY course_type")]
-            sel_stream = st.multiselect("Stream IDs", streams)
+            stream_ids = [str(s) for s in sorted(db.STREAMS, key=lambda s: db.STREAMS[s])]
+            sel_stream = st.multiselect(
+                "Streams", stream_ids,
+                format_func=lambda s: f"{db.stream_name(s)} ({s})")
             sel_type = st.multiselect("Course types", ctypes)
             wheres, params = [], []
             if sel_stream:

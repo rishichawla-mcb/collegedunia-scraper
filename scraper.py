@@ -244,6 +244,7 @@ def parse_course(c: Dict[str, Any]) -> Dict[str, Any]:
         "job_roles": ", ".join(c.get("job_roles") or []),
         "topics_covered": ", ".join(c.get("topics_covered") or []),
         "stream_id": str(lp.get("stream_id", "")),
+        "stream_name": db.stream_name(lp.get("stream_id")),
         "course_tag": lp.get("course_tag", ""),
         "course_tag_id": str(lp.get("course_tag_id", "")),
         "description": c.get("description", ""),
