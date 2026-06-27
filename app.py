@@ -18,6 +18,7 @@ Run:  streamlit run app.py
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -52,10 +53,22 @@ def _expected_password():
         return None
 
 
+def _auth_token():
+    pw = _expected_password()
+    return hashlib.sha256(f"cd::{pw}".encode()).hexdigest()[:24] if pw else None
+
+
 def require_login() -> None:
     pw = _expected_password()
     if not pw:
         return  # no password configured -> open access
+    tok = _auth_token()
+    # Auto-login from a URL token so login survives idle reconnects / restarts.
+    try:
+        if st.query_params.get("t") == tok:
+            st.session_state["authed"] = True
+    except Exception:
+        pass
     if st.session_state.get("authed"):
         return
     st.markdown("## 🔒 Collegedunia Scraper")
@@ -64,6 +77,10 @@ def require_login() -> None:
     if st.button("Log in"):
         if entered == pw:
             st.session_state["authed"] = True
+            try:
+                st.query_params["t"] = tok   # keeps you logged in across reloads
+            except Exception:
+                pass
             st.rerun()
         else:
             st.error("Incorrect password.")
@@ -120,6 +137,56 @@ def human_mb(byts) -> str:
         return f"{(byts or 0)/1048576:.1f} MB"
     except Exception:
         return "0 MB"
+
+
+# --- Cached SQL aggregations for the dashboards (tiny result sets, computed at
+# --- most every TTL seconds — never loads full tables into memory). ---
+@st.cache_data(ttl=15, show_spinner=False)
+def agg_group(col: str) -> pd.DataFrame:
+    with db.connect() as conn:
+        return pd.read_sql_query(
+            f"SELECT {col} AS k, COUNT(*) AS n FROM courses WHERE {col}<>'' "
+            f"GROUP BY {col} ORDER BY n DESC", conn)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def agg_city_counts(n: int) -> pd.DataFrame:
+    with db.connect() as conn:
+        return pd.read_sql_query(
+            "SELECT city AS k, COUNT(DISTINCT college_id) AS n FROM offerings "
+            "WHERE city<>'' GROUP BY city ORDER BY n DESC LIMIT ?", conn, params=[int(n)])
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def agg_fee_buckets() -> pd.DataFrame:
+    with db.connect() as conn:
+        return pd.read_sql_query(
+            "SELECT CASE "
+            "WHEN fees_amount<=25000 THEN '0-25k' WHEN fees_amount<=50000 THEN '25-50k' "
+            "WHEN fees_amount<=75000 THEN '50-75k' WHEN fees_amount<=100000 THEN '75k-1L' "
+            "WHEN fees_amount<=200000 THEN '1-2L' WHEN fees_amount<=500000 THEN '2-5L' "
+            "ELSE '5L+' END AS k, COUNT(*) AS n, MIN(fees_amount) AS mn "
+            "FROM offerings WHERE fees_amount>0 GROUP BY k ORDER BY mn", conn)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def agg_top_ranked() -> pd.DataFrame:
+    with db.connect() as conn:
+        return pd.read_sql_query(
+            "SELECT college_name, course_name, ranking_rank, ranking_agency, city, "
+            "fees_amount, course_rating FROM offerings WHERE ranking_rank>0 "
+            "ORDER BY ranking_rank LIMIT 50", conn)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def agg_coverage() -> pd.DataFrame:
+    with db.connect() as conn:
+        return pd.read_sql_query(
+            "SELECT c.stream_name AS stream, COUNT(*) AS courses, "
+            "SUM(CASE WHEN op.status='done' THEN 1 ELSE 0 END) AS done "
+            "FROM courses c LEFT JOIN offering_progress op ON c.course_id=op.course_id "
+            "WHERE c.stream_name IS NOT NULL AND c.stream_name<>'' "
+            "GROUP BY c.stream_name ORDER BY courses DESC", conn)
 
 
 def fmt_eta(done: int, total: int, started: float) -> str:
@@ -402,53 +469,38 @@ with tab_report:
     if rc["courses"] == 0:
         st.info("No data yet — run a scrape first.")
     else:
-        st.download_button("⬇️ Analytics summary (.xlsx)", data=export.to_analytics_xlsx(),
-                           file_name="collegedunia_analytics.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        with db.connect() as conn:
-            cdf = pd.read_sql_query(
-                "SELECT stream_name, course_type, level, colleges_count FROM courses", conn)
-        streams_avail = sorted([s for s in cdf["stream_name"].dropna().unique() if s])
-        pick = st.multiselect("Filter streams", streams_avail, default=streams_avail)
-        fdf = cdf[cdf["stream_name"].isin(pick)] if pick else cdf
+        if st.button("🛠️ Prepare analytics export"):
+            with st.spinner("Building…"):
+                st.session_state["andata"] = export.to_analytics_xlsx()
+        if st.session_state.get("andata"):
+            st.download_button("⬇️ Analytics summary (.xlsx)", data=st.session_state["andata"],
+                               file_name="collegedunia_analytics.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+        bs = agg_group("stream_name").rename(columns={"k": "stream"}).set_index("stream")["n"]
+        bt = agg_group("course_type").rename(columns={"k": "type"}).set_index("type")["n"]
+        bl = agg_group("level").rename(columns={"k": "level"}).set_index("level")["n"]
         a, b = st.columns(2)
         with a:
-            st.markdown("**Courses by stream**")
-            st.bar_chart(fdf.groupby("stream_name").size().sort_values(ascending=False))
+            st.markdown("**Courses by stream**"); st.bar_chart(bs)
         with b:
-            st.markdown("**Courses by type**")
-            st.bar_chart(fdf[fdf["course_type"] != ""].groupby("course_type").size())
-        st.markdown("**Courses by level**")
-        st.bar_chart(fdf[fdf["level"] != ""].groupby("level").size().sort_values(ascending=False))
+            st.markdown("**Courses by type**"); st.bar_chart(bt)
+        st.markdown("**Courses by level**"); st.bar_chart(bl)
 
         if rc["offerings"] > 0:
             st.divider()
             st.markdown("### College / fee / ranking analytics (Phase 2)")
-            with db.connect() as conn:
-                off = pd.read_sql_query(
-                    "SELECT college_name, city, fees_amount, ranking_rank, ranking_agency, "
-                    "course_name, course_rating FROM offerings", conn)
             topn = st.slider("Top N cities", 5, 50, 15)
-            city_counts = (off[off["city"] != ""].groupby("city")["college_name"]
-                           .nunique().sort_values(ascending=False).head(topn))
-            st.markdown("**Unique colleges by city**")
-            st.bar_chart(city_counts)
-
-            fees = off[off["fees_amount"].fillna(0) > 0]["fees_amount"]
-            if len(fees):
+            cc = agg_city_counts(topn).set_index("k")["n"]
+            st.markdown("**Unique colleges by city**"); st.bar_chart(cc)
+            fb = agg_fee_buckets()
+            if not fb.empty:
                 st.markdown("**1st-year fee distribution (₹)**")
-                buckets = pd.cut(
-                    fees, bins=[0, 25000, 50000, 75000, 100000, 200000, 500000, 10**9],
-                    labels=["0-25k", "25-50k", "50-75k", "75k-1L", "1-2L", "2-5L", "5L+"])
-                st.bar_chart(buckets.value_counts().sort_index())
-
-            tr = off[off["ranking_rank"].fillna(0) > 0].sort_values("ranking_rank").head(50)
-            if len(tr):
+                st.bar_chart(fb.set_index("k")["n"])
+            tr = agg_top_ranked()
+            if not tr.empty:
                 st.markdown("**Top-ranked offerings**")
-                st.dataframe(tr[["college_name", "course_name", "ranking_rank",
-                                 "ranking_agency", "city", "fees_amount", "course_rating"]],
-                             use_container_width=True, height=320)
+                st.dataframe(tr, use_container_width=True, height=320)
         else:
             st.caption("Run Phase 2 to unlock college / fee / ranking analytics.")
 
@@ -473,13 +525,7 @@ with tab_index:
         st.progress(done / total_courses, text=f"Phase-2 coverage: {done:,}/{total_courses:,} courses")
 
     if total_courses:
-        with db.connect() as conn:
-            cov = pd.read_sql_query(
-                "SELECT c.stream_name AS stream, COUNT(*) AS courses, "
-                "SUM(CASE WHEN op.status='done' THEN 1 ELSE 0 END) AS done "
-                "FROM courses c LEFT JOIN offering_progress op ON c.course_id=op.course_id "
-                "WHERE c.stream_name IS NOT NULL AND c.stream_name<>'' "
-                "GROUP BY c.stream_name ORDER BY courses DESC", conn)
+        cov = agg_coverage()
         if not cov.empty:
             cov["done"] = cov["done"].fillna(0).astype(int)
             cov["% done"] = (cov["done"] / cov["courses"] * 100).round(1)
@@ -547,21 +593,28 @@ with tab_data:
     st.dataframe(df, use_container_width=True, height=420)
 
     st.subheader("Download")
-    d1, d2, d3, d4 = st.columns(4)
-    with d1:
-        st.download_button("⬇️ All tables (.xlsx)", data=export.to_xlsx(),
-                           file_name="collegedunia_all.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    with d2:
-        st.download_button(f"⬇️ {table} (.csv)", data=export.to_csv(table),
-                           file_name=f"collegedunia_{table}.csv", mime="text/csv")
-    with d3:
-        st.download_button(f"⬇️ {table} (.json)", data=export.to_json(table),
-                           file_name=f"collegedunia_{table}.json", mime="application/json")
-    with d4:
-        st.download_button(f"⬇️ {table} (.xlsx)", data=export.to_xlsx((table,)),
-                           file_name=f"collegedunia_{table}.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.caption("Exports are built only when you click Prepare (keeps memory low).")
+    fmt = st.radio("Format", ["CSV", "JSON", "Excel (this table)", "Excel (all tables)"],
+                   horizontal=True, key="expfmt")
+    if st.button("🛠️ Prepare download"):
+        with st.spinner("Building export…"):
+            if fmt == "CSV":
+                st.session_state["expdata"] = (export.to_csv(table),
+                                               f"collegedunia_{table}.csv", "text/csv")
+            elif fmt == "JSON":
+                st.session_state["expdata"] = (export.to_json(table),
+                                               f"collegedunia_{table}.json", "application/json")
+            elif fmt == "Excel (this table)":
+                st.session_state["expdata"] = (
+                    export.to_xlsx((table,)), f"collegedunia_{table}.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            else:
+                st.session_state["expdata"] = (
+                    export.to_xlsx(), "collegedunia_all.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    if st.session_state.get("expdata"):
+        data, fname, mime = st.session_state["expdata"]
+        st.download_button(f"⬇️ Download {fname}", data=data, file_name=fname, mime=mime)
 
 
 # ---------------------------------------------------------------------------

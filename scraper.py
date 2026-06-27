@@ -451,7 +451,7 @@ def _to_float(v: Any) -> Optional[float]:
 COURSE_TYPE_VALUES = ["Degree", "Diploma", "Certification"]
 LEVEL_VALUES = ["Graduation", "Post Graduation", "10+2", "Doctorate/M.Phil", "10th"]
 PARTITION_FACETS = [
-    ("stream", [str(i) for i in range(1, 21)]),
+    ("stream", list(range(1, 21))),          # MUST be ints — string values are ignored
     ("course_type", COURSE_TYPE_VALUES),
     ("level", LEVEL_VALUES),
 ]
