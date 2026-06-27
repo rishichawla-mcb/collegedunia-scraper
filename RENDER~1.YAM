@@ -1,0 +1,24 @@
+# Render Blueprint — one-click deploy of the Collegedunia Scraper as a
+# persistent, always-on app with a password and a disk that survives restarts.
+#
+# Deploy: push this repo to GitHub, then in Render -> "New +" -> "Blueprint",
+# point it at the repo. Render reads this file and creates the service + disk.
+#
+# NOTE: a persistent disk and always-on (no sleeping) require Render's paid
+# "Starter" instance (~$7/mo). The free tier sleeps and has no disk.
+services:
+  - type: web
+    name: collegedunia-scraper
+    runtime: docker
+    plan: starter
+    healthCheckPath: /_stcore/health
+    autoDeploy: true
+    disk:
+      name: data
+      mountPath: /data        # SQLite DB lives here and persists across restarts
+      sizeGB: 1
+    envVars:
+      - key: CD_DB_PATH
+        value: /data/data.db
+      - key: APP_PASSWORD      # set this in the Render dashboard (kept secret)
+        sync: false

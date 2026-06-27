@@ -38,6 +38,42 @@ db.init_db()
 
 
 # ---------------------------------------------------------------------------
+# Authentication (optional password gate)
+# ---------------------------------------------------------------------------
+def _expected_password():
+    """Password comes from the APP_PASSWORD env var (or Streamlit secrets).
+    If none is set, the app runs open — handy for local development."""
+    pw = os.environ.get("APP_PASSWORD")
+    if pw:
+        return pw
+    try:
+        return st.secrets["APP_PASSWORD"]
+    except Exception:
+        return None
+
+
+def require_login() -> None:
+    pw = _expected_password()
+    if not pw:
+        return  # no password configured -> open access
+    if st.session_state.get("authed"):
+        return
+    st.markdown("## 🔒 Collegedunia Scraper")
+    st.caption("This app is password protected.")
+    entered = st.text_input("Password", type="password")
+    if st.button("Log in"):
+        if entered == pw:
+            st.session_state["authed"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()
+
+
+require_login()
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def launch_worker(job_id: int) -> None:
