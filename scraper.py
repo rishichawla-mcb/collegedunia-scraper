@@ -30,6 +30,7 @@ import base64
 import itertools
 import json
 import random
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -316,6 +317,73 @@ class Client:
                          f"{err} -> retry in {wait:.0f}s")
                 time.sleep(wait)
         raise RuntimeError(f"Failed after {self.max_retries} attempts: {last_err}")
+
+    def get_text(self, url: str) -> str:
+        """GET an HTML page (for Phase-3 enrichment) through the proxy, with the
+        same retry/rotation/block handling. Returns the response text."""
+        last_err: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            proxy = self.pm.get()
+            try:
+                resp = self.session.get(
+                    url, headers=base_headers(),
+                    proxies=proxy.as_dict() if proxy else None, timeout=self.timeout)
+                self.stats.add(requests=1, byts=len(resp.content or b""))
+                if resp.status_code in (403, 429, 503):
+                    raise BlockedError(f"HTTP {resp.status_code}")
+                resp.raise_for_status()
+                self.pm.report_success(proxy)
+                if self.adaptive:
+                    self.adaptive.on_success()
+                return resp.text
+            except (BlockedError, requests.RequestException) as err:
+                last_err = err
+                self.stats.add(blocks=1)
+                self.pm.report_failure(proxy)
+                if self.adaptive:
+                    self.adaptive.on_block()
+                time.sleep(self.backoff * attempt + random.uniform(0, 2))
+        raise RuntimeError(f"GET failed after {self.max_retries} attempts: {last_err}")
+
+
+# ---------------------------------------------------------------------------
+# Phase-3: parse the CollegeOrUniversity JSON-LD from a college page (no reviews)
+# ---------------------------------------------------------------------------
+_LD_RE = re.compile(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+                    re.DOTALL | re.IGNORECASE)
+
+
+def parse_college_ld(html: str) -> Dict[str, Any]:
+    """Extract structured college fields from the page's JSON-LD. Deliberately
+    ignores UserComments/reviews."""
+    best: Dict[str, Any] = {}
+    for block in _LD_RE.findall(html or ""):
+        try:
+            obj = json.loads(block.strip())
+        except (json.JSONDecodeError, ValueError):
+            continue
+        items = obj if isinstance(obj, list) else [obj]
+        for o in items:
+            if not isinstance(o, dict) or o.get("@type") != "CollegeOrUniversity":
+                continue
+            agg = o.get("aggregateRating") or {}
+            addr = o.get("address")
+            if isinstance(addr, dict):
+                addr = ", ".join(str(addr.get(k, "")) for k in
+                                 ("streetAddress", "addressLocality", "addressRegion",
+                                  "postalCode", "addressCountry") if addr.get(k))
+            best = {
+                "website": o.get("url", ""),
+                "email": o.get("email", ""),
+                "phone": o.get("telephone", ""),
+                "rating_value": _to_float(agg.get("ratingValue")),
+                "rating_count": _to_int(agg.get("ratingCount") or agg.get("reviewCount")),
+                "pros": (o.get("positiveNotes") or "")[:2000] if isinstance(o.get("positiveNotes"), str) else "",
+                "cons": (o.get("negativeNotes") or "")[:2000] if isinstance(o.get("negativeNotes"), str) else "",
+                "address": addr if isinstance(addr, str) else "",
+            }
+            return best
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -623,8 +691,9 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
                     log(f"   ~ chunk page {page} short ({seen}/{expected}) — "
                         f"retry {soft}/{soft_retries} in {wait:.0f}s")
                     time.sleep(wait)
-                    page += 1
-                    data = None
+                    if rows:          # had a (final-looking) page -> advance
+                        page += 1
+                    data = None       # empty page -> re-fetch the SAME page
                     continue
                 break
             soft = 0
@@ -662,7 +731,7 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
                 log(f"  ~ '{label}' has {count} (> cap) and no finer facet — "
                     f"paging as deep as the API allows.")
             log(f"  → scraping chunk '{label}' (~{count})")
-            page_through(filters, first=data)
+            page_through(filters, first=data, expected=count)
             return
         key, values = PARTITION_FACETS[idx]
         if key in filters:
@@ -675,7 +744,8 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
 
     db.update_job(job_id, status="running", message="partitioned course scrape starting",
                   db_path=db_path)
-    log("Phase 1 (complete/partitioned): splitting the catalog to beat the pagination cap.")
+    log("Phase 1 (complete/partitioned) [BUILD: chunk-retry-v3] — "
+        "splitting the catalog under the ~1,700 pagination cap.")
     try:
         recurse({}, 0, "all")
         written = db.counts(db_path=db_path).get("courses", 0)
@@ -898,6 +968,118 @@ def run_offerings(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
             db.update_job(job_id, status="completed", message=msg, finished_at=time.time(),
                           req_count=reqs, bytes_count=byts, db_path=db_path)
             log(msg); send_notification(cfg, "Collegedunia Phase 2 complete", msg, log)
+    except Exception as err:  # noqa: BLE001
+        db.update_job(job_id, status="error", message=str(err)[:300],
+                      finished_at=time.time(), db_path=db_path)
+        log(f"ERROR: {err}")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: per-college enrichment (JSON-LD: website/email/phone/rating/pros/cons/address)
+# ---------------------------------------------------------------------------
+def run_enrichment(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
+                   log: Optional[Callable[[str], None]] = None) -> None:
+    import queue as _queue
+    log = log or (lambda m: print(m, flush=True))
+    pm = ProxyManager.from_config(cfg)
+    stats = Stats()
+    adaptive = AdaptiveDelay(float(cfg.get("delay", 1.0)), enabled=bool(cfg.get("adaptive", True)))
+    concurrency = max(1, int(cfg.get("concurrency", 1)))
+    budget_bytes = int(float(cfg.get("budget_mb", 0)) * 1024 * 1024)
+    budget_requests = int(cfg.get("budget_requests", 0))
+
+    colleges = db.list_colleges_to_enrich(
+        db_path=db_path, where=cfg.get("college_where", ""),
+        params=tuple(cfg.get("college_where_params", [])),
+        include_done=bool(cfg.get("force_rescrape")), limit=cfg.get("limit"))
+    total = len(colleges)
+    db.update_job(job_id, status="running", total_units=total,
+                  message=f"{total} colleges to enrich", db_path=db_path)
+    log(f"Phase 3: enriching {total} colleges, concurrency={concurrency}")
+
+    stop_event = threading.Event()
+    db_lock = threading.Lock()
+    prog_lock = threading.Lock()
+    state = {"done": 0, "ok": 0, "incomplete": False, "msg": ""}
+
+    def budget_hit():
+        reqs, byts, _ = stats.snapshot()
+        if budget_requests and reqs >= budget_requests:
+            return f"request budget reached ({reqs})"
+        if budget_bytes and byts >= budget_bytes:
+            return f"bandwidth budget reached ({byts/1048576:.1f} MB)"
+        return None
+
+    def push():
+        reqs, byts, _ = stats.snapshot()
+        with prog_lock:
+            d, ok = state["done"], state["ok"]
+        with db_lock:
+            db.update_job(job_id, done_units=d, items_written=ok, req_count=reqs,
+                          bytes_count=byts,
+                          message=f"{d}/{total} colleges · {ok} enriched · {byts/1048576:.1f} MB",
+                          db_path=db_path)
+
+    q: "_queue.Queue" = _queue.Queue()
+    for cobj in colleges:
+        q.put(cobj)
+
+    def worker():
+        client = Client(pm, log=log, max_retries=int(cfg.get("max_retries", 5)),
+                        backoff=float(cfg.get("backoff", 4)), stats=stats, adaptive=adaptive)
+        while not stop_event.is_set():
+            try:
+                cobj = q.get_nowait()
+            except _queue.Empty:
+                return
+            if db.stop_requested(job_id, db_path=db_path):
+                stop_event.set(); return
+            bh = budget_hit()
+            if bh:
+                with prog_lock:
+                    state["incomplete"] = True; state["msg"] = bh
+                stop_event.set(); return
+            ok = False
+            try:
+                html = client.get_text(cobj["link"])
+                fields = parse_college_ld(html)
+                with db_lock:
+                    db.update_college_details(cobj["college_id"], fields, db_path=db_path)
+                ok = bool(fields)
+            except Exception as err:  # noqa: BLE001
+                log(f"  college {cobj['college_id']} err: {str(err)[:60]}")
+            with prog_lock:
+                state["done"] += 1
+                if ok:
+                    state["ok"] += 1
+                d = state["done"]
+            if d % 5 == 0:
+                push()
+            time.sleep(adaptive.value())
+
+    try:
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(concurrency)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        reqs, byts, _ = stats.snapshot()
+        if state["incomplete"]:
+            msg = (f"INCOMPLETE — {state['msg']} ({state['done']}/{total}, "
+                   f"{byts/1048576:.1f} MB). Resume to continue.")
+            status = "stopped"
+        elif db.stop_requested(job_id, db_path=db_path):
+            msg = f"stopped by user after {state['done']} colleges"
+            status = "stopped"
+        else:
+            msg = f"done: {state['ok']}/{total} colleges enriched, {byts/1048576:.1f} MB"
+            status = "completed"
+        db.update_job(job_id, status=status, message=msg, finished_at=time.time(),
+                      req_count=reqs, bytes_count=byts, db_path=db_path)
+        log(msg)
+        if status == "completed":
+            send_notification(cfg, "Collegedunia Phase 3 complete", msg, log)
     except Exception as err:  # noqa: BLE001
         db.update_job(job_id, status="error", message=str(err)[:300],
                       finished_at=time.time(), db_path=db_path)
