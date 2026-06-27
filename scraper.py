@@ -78,6 +78,96 @@ class BlockedError(Exception):
     """Raised when the site appears to be blocking us (403/429/HTML challenge)."""
 
 
+class BudgetExceeded(Exception):
+    """Raised when a configured request/bandwidth budget is hit."""
+
+
+class Stats:
+    """Thread-safe counters shared across concurrent workers."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.requests = 0
+        self.bytes = 0
+        self.blocks = 0
+
+    def add(self, requests: int = 0, byts: int = 0, blocks: int = 0) -> None:
+        with self._lock:
+            self.requests += requests
+            self.bytes += byts
+            self.blocks += blocks
+
+    def snapshot(self):
+        with self._lock:
+            return self.requests, self.bytes, self.blocks
+
+
+class AdaptiveDelay:
+    """Auto-tunes the inter-request delay: slows down when blocks happen,
+    eases back toward the base delay during clean stretches."""
+
+    def __init__(self, base: float, enabled: bool = True,
+                 max_delay: float = 30.0) -> None:
+        self.base = base
+        self.current = base
+        self.enabled = enabled
+        self.max_delay = max_delay
+        self._clean = 0
+        self._lock = threading.Lock()
+
+    def on_block(self) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self.current = min(self.max_delay, max(self.current * 1.8, self.base * 2))
+            self._clean = 0
+
+    def on_success(self) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self._clean += 1
+            if self._clean >= 20 and self.current > self.base:
+                self.current = max(self.base, self.current * 0.8)
+                self._clean = 0
+
+    def value(self) -> float:
+        with self._lock:
+            return self.current
+
+
+def send_notification(cfg: Dict[str, Any], subject: str, body: str,
+                      log: Optional[Callable[[str], None]] = None) -> None:
+    """Best-effort notification via webhook and/or email (SMTP). Never raises."""
+    log = log or (lambda m: None)
+    # Webhook (e.g. Slack/Discord/generic): POST {"text": ...}
+    hook = cfg.get("webhook_url")
+    if hook:
+        try:
+            requests.post(hook, json={"text": f"*{subject}*\n{body}"}, timeout=15)
+        except Exception as err:  # noqa: BLE001
+            log(f"webhook notify failed: {err}")
+    # Email via SMTP
+    smtp = cfg.get("smtp") or {}
+    if smtp.get("host") and smtp.get("to"):
+        try:
+            import smtplib
+            from email.mime.text import MIMEText
+            msg = MIMEText(body)
+            msg["Subject"] = subject
+            msg["From"] = smtp.get("from", smtp.get("user", "scraper@local"))
+            msg["To"] = smtp["to"]
+            server = smtplib.SMTP(smtp["host"], int(smtp.get("port", 587)), timeout=20)
+            if smtp.get("starttls", True):
+                server.starttls()
+            if smtp.get("user"):
+                server.login(smtp["user"], smtp.get("password", ""))
+            server.sendmail(msg["From"], [smtp["to"]], msg.as_string())
+            server.quit()
+        except Exception as err:  # noqa: BLE001
+            log(f"email notify failed: {err}")
+
+
 # ---------------------------------------------------------------------------
 # Proxy management
 # ---------------------------------------------------------------------------
@@ -180,13 +270,17 @@ def test_proxy(url: str, timeout: float = 15.0) -> Dict[str, Any]:
 class Client:
     def __init__(self, proxy_manager: ProxyManager, timeout: float = 30.0,
                  max_retries: int = 5, backoff: float = 4.0,
-                 log: Optional[Callable[[str], None]] = None) -> None:
+                 log: Optional[Callable[[str], None]] = None,
+                 stats: Optional[Stats] = None,
+                 adaptive: Optional[AdaptiveDelay] = None) -> None:
         self.pm = proxy_manager
         self.timeout = timeout
         self.max_retries = max_retries
         self.backoff = backoff
         self.session = requests.Session()
         self.log = log or (lambda m: None)
+        self.stats = stats or Stats()
+        self.adaptive = adaptive
 
     def fetch(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         params = {"data": encode_payload(payload)}
@@ -198,6 +292,7 @@ class Client:
                     API_URL, params=params, headers=base_headers(),
                     proxies=proxy.as_dict() if proxy else None, timeout=self.timeout,
                 )
+                self.stats.add(requests=1, byts=len(resp.content or b""))
                 if resp.status_code in (403, 429, 503):
                     raise BlockedError(f"HTTP {resp.status_code}")
                 resp.raise_for_status()
@@ -206,10 +301,15 @@ class Client:
                     raise BlockedError("non-JSON response (challenge page?)")
                 data = resp.json()
                 self.pm.report_success(proxy)
+                if self.adaptive:
+                    self.adaptive.on_success()
                 return data
             except (BlockedError, requests.RequestException, ValueError) as err:
                 last_err = err
+                self.stats.add(blocks=1)
                 self.pm.report_failure(proxy)
+                if self.adaptive:
+                    self.adaptive.on_block()
                 wait = self.backoff * attempt + random.uniform(0, 2)
                 via = proxy.url if proxy else "direct"
                 self.log(f"  ! attempt {attempt}/{self.max_retries} via {via} failed: "
@@ -456,99 +556,183 @@ def run_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
 # ---------------------------------------------------------------------------
 def run_offerings(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
                   log: Optional[Callable[[str], None]] = None) -> None:
+    """Phase 2 with: parallel proxy-pool fetching, request/bandwidth budgets,
+    adaptive throttle + long cooldown, mid-course resume, skip-empty, ordering,
+    scoping filters, and completion/block notifications."""
+    import queue as _queue
     log = log or (lambda m: print(m, flush=True))
     pm = ProxyManager.from_config(cfg)
-    client = Client(pm, log=log, max_retries=int(cfg.get("max_retries", 5)),
-                    backoff=float(cfg.get("backoff", 4)))
-    delay = float(cfg.get("delay", 1.0))
+    stats = Stats()
+    base_delay = float(cfg.get("delay", 1.0))
+    adaptive = AdaptiveDelay(base_delay, enabled=bool(cfg.get("adaptive", True)))
+    max_retries = int(cfg.get("max_retries", 5))
+    backoff = float(cfg.get("backoff", 4))
     max_pages_per_course = cfg.get("max_pages_per_course")
+    soft_retries = int(cfg.get("soft_block_retries", 4))
+    long_cooldown = float(cfg.get("long_cooldown_seconds", 0))   # 0 = use short backoff
+    concurrency = max(1, int(cfg.get("concurrency", 1)))
+    skip_empty = bool(cfg.get("skip_empty", True))
+    scope_filters = cfg.get("scope_filters") or {}
+    budget_requests = int(cfg.get("budget_requests", 0))         # 0 = unlimited
+    budget_mb = float(cfg.get("budget_mb", 0))                   # 0 = unlimited
+    budget_bytes = int(budget_mb * 1024 * 1024)
 
-    # Which courses to process?
+    # ---- choose & order the courses to process ----
     course_ids: List[int] = cfg.get("course_ids") or []
     if not course_ids:
         where = cfg.get("course_where", "")
         params = tuple(cfg.get("course_where_params", []))
-        course_ids = db.list_course_ids(db_path=db_path, where=where, params=params)
-
+        course_ids = db.list_course_ids(db_path=db_path, where=where, params=params,
+                                        order=cfg.get("order", "colleges_desc"))
+    if skip_empty:
+        nonzero = set(db.list_course_ids(db_path=db_path, where="colleges_count > 0"))
+        if nonzero:
+            course_ids = [c for c in course_ids if c in nonzero]
     if not cfg.get("force_rescrape"):
         done = db.get_done_course_ids(db_path=db_path)
-        course_ids = [cid for cid in course_ids if cid not in done]
+        course_ids = [c for c in course_ids if c not in done]
 
-    db.update_job(job_id, status="running", total_units=len(course_ids),
-                  message=f"{len(course_ids)} courses to process", db_path=db_path)
-    log(f"Phase 2: {len(course_ids)} courses to process.")
+    total_courses = len(course_ids)
+    db.update_job(job_id, status="running", total_units=total_courses,
+                  message=f"{total_courses} courses, concurrency={concurrency}", db_path=db_path)
+    log(f"Phase 2: {total_courses} courses | concurrency={concurrency} | "
+        f"budget {budget_requests or '∞'} reqs / {budget_mb or '∞'} MB | "
+        f"adaptive={adaptive.enabled}")
 
-    processed = 0
-    offerings_written = 0
-    try:
-        for cid in course_ids:
+    stop_event = threading.Event()
+    db_lock = threading.Lock()
+    prog_lock = threading.Lock()
+    state = {"processed": 0, "offerings": 0, "incomplete": False, "msg": ""}
+
+    def budget_hit() -> Optional[str]:
+        reqs, byts, _ = stats.snapshot()
+        if budget_requests and reqs >= budget_requests:
+            return f"request budget reached ({reqs} ≥ {budget_requests})"
+        if budget_bytes and byts >= budget_bytes:
+            return f"bandwidth budget reached ({byts/1048576:.1f} ≥ {budget_mb} MB)"
+        return None
+
+    def push_progress() -> None:
+        reqs, byts, blocks = stats.snapshot()
+        with prog_lock:
+            p, o = state["processed"], state["offerings"]
+        with db_lock:
+            db.update_job(job_id, done_units=p, items_written=o,
+                          req_count=reqs, bytes_count=byts,
+                          message=f"{p}/{total_courses} courses · {o} offerings · "
+                                  f"{byts/1048576:.1f} MB · {blocks} blocks · "
+                                  f"delay {adaptive.value():.1f}s", db_path=db_path)
+
+    def scrape_course(cid: int, client: Client) -> int:
+        prog = db.get_offering_progress(cid, db_path=db_path)
+        start_page = 1
+        course_total = prog.get("total_count") if prog else None
+        if prog and prog.get("status") == "partial" and not cfg.get("force_rescrape"):
+            start_page = max(1, int(prog.get("pages_done") or 0) + 1)
+        page = start_page
+        seen = (start_page - 1) * PAGE_SIZE
+        local_off = 0
+        while not stop_event.is_set():
             if db.stop_requested(job_id, db_path=db_path):
-                db.update_job(job_id, status="stopped",
-                              message=f"stopped after {processed} courses",
-                              finished_at=time.time(), db_path=db_path)
-                log("Stopped by user.")
-                return
-            page = 1
-            course_total = None
-            seen = 0
-            soft_retries = int(cfg.get("soft_block_retries", 4))
-            while True:
-                if db.stop_requested(job_id, db_path=db_path):
-                    break
-                data = client.fetch({"page": page, "course_id": cid})
-                rows = data.get("courses") or []
-                if course_total is None:
-                    course_total = data.get("count")
-
-                capped = bool(max_pages_per_course and page >= int(max_pages_per_course))
-                reached_end = (course_total is not None and seen >= (course_total - PAGE_SIZE))
-                if not rows and not reached_end and not capped:
-                    # Soft block mid-course: retry this page before giving up.
-                    ok = False
-                    for attempt in range(1, soft_retries + 1):
-                        wait = 10 * attempt
-                        log(f"  ! course {cid} page {page} empty ({seen}/{course_total}) "
-                            f"— soft block? retry {attempt}/{soft_retries} in {wait}s")
-                        time.sleep(wait)
-                        data = client.fetch({"page": page, "course_id": cid})
-                        rows = data.get("courses") or []
-                        if rows:
-                            ok = True
-                            break
-                    if not ok:
-                        # Leave this course as 'partial' so it resumes later, then stop.
+                stop_event.set(); return local_off
+            bh = budget_hit()
+            if bh:
+                with prog_lock:
+                    state["incomplete"] = True; state["msg"] = bh
+                stop_event.set(); return local_off
+            payload = {"page": page, "course_id": cid}
+            payload.update(scope_filters)
+            data = client.fetch(payload)
+            rows = data.get("courses") or []
+            if course_total is None:
+                course_total = data.get("count")
+            capped = bool(max_pages_per_course and page >= int(max_pages_per_course))
+            reached_end = (course_total is not None and seen >= (course_total - PAGE_SIZE))
+            if not rows and not reached_end and not capped:
+                ok = False
+                for attempt in range(1, soft_retries + 1):
+                    if stop_event.is_set():
+                        return local_off
+                    wait = long_cooldown if long_cooldown else 10 * attempt
+                    log(f"  ! course {cid} p{page} empty ({seen}/{course_total}) — "
+                        f"retry {attempt}/{soft_retries} in {wait:.0f}s")
+                    time.sleep(wait)
+                    data = client.fetch(payload)
+                    rows = data.get("courses") or []
+                    if rows:
+                        ok = True; break
+                if not ok:
+                    with db_lock:
                         db.set_offering_progress(cid, "partial", page - 1, course_total, db_path=db_path)
-                        msg = (f"INCOMPLETE — blocked on course {cid} page {page} "
-                               f"({processed} courses done). Increase delay / add proxies, then resume.")
-                        db.update_job(job_id, status="stopped", message=msg,
-                                      finished_at=time.time(), db_path=db_path)
-                        log(msg)
-                        return
-                if not rows:
-                    break
-                colleges = [pc for pc in (parse_college(r) for r in rows) if pc]
-                offerings = [parse_offering(cid, r) for r in rows]
+                    with prog_lock:
+                        state["incomplete"] = True
+                        state["msg"] = f"blocked on course {cid} page {page}"
+                    stop_event.set(); return local_off
+            if not rows:
+                break
+            colleges = [pc for pc in (parse_college(r) for r in rows) if pc]
+            offerings = [parse_offering(cid, r) for r in rows]
+            with db_lock:
                 db.upsert_colleges(colleges, db_path=db_path)
-                offerings_written += db.upsert_offerings(offerings, db_path=db_path)
-                seen += len(rows)
+                local_off += db.upsert_offerings(offerings, db_path=db_path)
                 db.set_offering_progress(cid, "partial", page, course_total, db_path=db_path)
-                page += 1
-                if max_pages_per_course and page > int(max_pages_per_course):
-                    break
-                if not data.get("hasNext", False):
-                    break
-                time.sleep(delay)
+            seen += len(rows); page += 1
+            if max_pages_per_course and page > int(max_pages_per_course):
+                break
+            if not data.get("hasNext", False):
+                break
+            time.sleep(adaptive.value())
+        with db_lock:
             db.set_offering_progress(cid, "done", page - 1, course_total, db_path=db_path)
-            processed += 1
-            db.update_job(job_id, done_units=processed, items_written=offerings_written,
-                          message=f"{processed}/{len(course_ids)} courses, "
-                                  f"{offerings_written} offerings", db_path=db_path)
-            log(f"  course {cid}: ~{course_total} colleges "
-                f"({processed}/{len(course_ids)} done)")
-        db.update_job(job_id, status="completed",
-                      message=f"done: {processed} courses, {offerings_written} offerings",
-                      finished_at=time.time(), db_path=db_path)
-        log(f"Done. {processed} courses, {offerings_written} offerings.")
+        return local_off
+
+    q: "_queue.Queue" = _queue.Queue()
+    for cid in course_ids:
+        q.put(cid)
+
+    def worker() -> None:
+        client = Client(pm, log=log, max_retries=max_retries, backoff=backoff,
+                        stats=stats, adaptive=adaptive)
+        while not stop_event.is_set():
+            try:
+                cid = q.get_nowait()
+            except _queue.Empty:
+                return
+            try:
+                off = scrape_course(cid, client)
+            except Exception as err:  # noqa: BLE001
+                log(f"  course {cid} ERROR: {err}")
+                off = 0
+            with prog_lock:
+                state["processed"] += 1
+                state["offerings"] += off
+            push_progress()
+
+    try:
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(concurrency)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        reqs, byts, blocks = stats.snapshot()
+        if state["incomplete"]:
+            msg = (f"INCOMPLETE — {state['msg']} ({state['processed']}/{total_courses} courses, "
+                   f"{byts/1048576:.1f} MB). Resume to continue.")
+            db.update_job(job_id, status="stopped", message=msg, finished_at=time.time(),
+                          req_count=reqs, bytes_count=byts, db_path=db_path)
+            log(msg); send_notification(cfg, "Collegedunia Phase 2 stopped", msg, log)
+        elif db.stop_requested(job_id, db_path=db_path):
+            msg = f"stopped by user after {state['processed']} courses"
+            db.update_job(job_id, status="stopped", message=msg, finished_at=time.time(),
+                          req_count=reqs, bytes_count=byts, db_path=db_path)
+            log(msg)
+        else:
+            msg = (f"done: {state['processed']} courses, {state['offerings']} offerings, "
+                   f"{byts/1048576:.1f} MB")
+            db.update_job(job_id, status="completed", message=msg, finished_at=time.time(),
+                          req_count=reqs, bytes_count=byts, db_path=db_path)
+            log(msg); send_notification(cfg, "Collegedunia Phase 2 complete", msg, log)
     except Exception as err:  # noqa: BLE001
         db.update_job(job_id, status="error", message=str(err)[:300],
                       finished_at=time.time(), db_path=db_path)

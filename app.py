@@ -108,7 +108,18 @@ def proxy_config_from_ui() -> dict:
         "delay": st.session_state.get("delay", 1.0),
         "max_retries": st.session_state.get("max_retries", 5),
         "backoff": st.session_state.get("backoff", 4.0),
+        "adaptive": st.session_state.get("adaptive", True),
+        "long_cooldown_seconds": st.session_state.get("long_cooldown", 0),
+        "webhook_url": db.get_setting("webhook_url", "") or None,
+        "smtp": db.get_setting("smtp", {}) or {},
     }
+
+
+def human_mb(byts) -> str:
+    try:
+        return f"{(byts or 0)/1048576:.1f} MB"
+    except Exception:
+        return "0 MB"
 
 
 def fmt_eta(done: int, total: int, started: float) -> str:
@@ -137,6 +148,12 @@ st.session_state["delay"] = st.sidebar.number_input(
     help="Higher = politer and less likely to be blocked.")
 st.session_state["max_retries"] = st.sidebar.number_input("Max retries per request", 1, 15, 5)
 st.session_state["backoff"] = st.sidebar.number_input("Backoff base (sec)", 1.0, 30.0, 4.0, step=1.0)
+st.session_state["adaptive"] = st.sidebar.checkbox(
+    "Adaptive throttle", value=True,
+    help="Auto-slow when blocks happen, speed back up when clean.")
+st.session_state["long_cooldown"] = st.sidebar.number_input(
+    "Long cooldown on block (sec, 0=off)", 0, 1800, 0, step=30,
+    help="On a soft block, wait this long before retrying (rides out rate-limit windows). 0 = short backoff.")
 
 st.sidebar.subheader("🔀 Proxies / IP switching")
 st.session_state["proxy_mode"] = st.sidebar.selectbox(
@@ -158,6 +175,25 @@ elif st.session_state["proxy_mode"] == "gateway":
     st.session_state["proxy_gateway"] = st.sidebar.text_input(
         "Gateway URL", value=db.get_setting("proxy_gateway", ""),
         placeholder="http://user:pass@gateway.provider.com:7777")
+
+with st.sidebar.expander("🔔 Notifications"):
+    wh = st.text_input("Webhook URL (Slack/Discord/generic)",
+                       value=db.get_setting("webhook_url", ""),
+                       placeholder="https://hooks.slack.com/services/...")
+    st.caption("Email (optional)")
+    smtp = db.get_setting("smtp", {}) or {}
+    s_host = st.text_input("SMTP host", value=smtp.get("host", ""))
+    c1, c2 = st.columns(2)
+    s_port = c1.text_input("Port", value=str(smtp.get("port", 587)))
+    s_to = c2.text_input("Send to", value=smtp.get("to", ""))
+    s_user = st.text_input("SMTP user", value=smtp.get("user", ""))
+    s_pass = st.text_input("SMTP password", type="password", value=smtp.get("password", ""))
+    if st.button("Save notifications"):
+        db.set_setting("webhook_url", wh.strip())
+        db.set_setting("smtp", {"host": s_host.strip(), "port": s_port.strip(),
+                                "to": s_to.strip(), "user": s_user.strip(),
+                                "password": s_pass, "from": s_user.strip()})
+        st.success("Notification settings saved.")
 
 if st.sidebar.button("💾 Save settings"):
     db.set_setting("delay", st.session_state["delay"])
@@ -195,7 +231,8 @@ m2.metric("Unique colleges", f"{c['colleges']:,}")
 m3.metric("Offerings (course×college)", f"{c['offerings']:,}")
 m4.metric("Courses done (phase 2)", f"{c['courses_done_phase2']:,}")
 
-tab_run, tab_data, tab_history = st.tabs(["▶️ Run", "📊 Data & export", "🕓 History"])
+tab_run, tab_report, tab_index, tab_data, tab_history = st.tabs(
+    ["▶️ Run", "📈 Reporting", "🗂️ Indexing", "📊 Data & export", "🕓 History"])
 
 
 # ---------------------------------------------------------------------------
@@ -259,12 +296,46 @@ with tab_run:
                 params += sel_type
             cfg2_extra["course_where"] = " AND ".join(wheres)
             cfg2_extra["course_where_params"] = params
+        order = st.selectbox("Process order",
+                             ["colleges_desc", "colleges_asc", "stream"],
+                             format_func={"colleges_desc": "Biggest courses first",
+                                          "colleges_asc": "Smallest first (bank quick wins)",
+                                          "stream": "Grouped by stream"}.get,
+                             key="order2")
+        cfg2_extra["order"] = order
+
+        cc1, cc2 = st.columns(2)
+        concurrency = cc1.number_input("Parallel workers", 1, 20, 1, key="conc2",
+                                       help="Concurrent requests. Use >1 only with a working proxy.")
+        skip_empty = cc2.checkbox("Skip 0-college courses", value=True, key="skip2")
+
+        st.markdown("**Budget caps** (0 = unlimited)")
+        b1, b2 = st.columns(2)
+        budget_mb = b1.number_input("Max bandwidth (MB)", 0, 100000, 0, step=50, key="bmb",
+                                    help="Stop when this much has been downloaded. Protects proxy spend.")
+        budget_req = b2.number_input("Max requests", 0, 5_000_000, 0, step=1000, key="breq")
+
+        with st.expander("Advanced: extra API filters (city/state etc.)"):
+            scope_raw = st.text_area(
+                "Extra filters (JSON merged into each request)",
+                placeholder='{"city": 4337}   # optional, advanced',
+                key="scopejson")
+
         test2 = st.checkbox("Test run (max 2 pages per course)", key="t2")
         force = st.checkbox("Force re-scrape (ignore resume)", key="f2")
         if st.button("▶️ Start college scrape", type="primary", key="run2",
                      disabled=c["courses"] == 0):
             cfg = proxy_config_from_ui()
             cfg.update(cfg2_extra)
+            cfg["concurrency"] = int(concurrency)
+            cfg["skip_empty"] = bool(skip_empty)
+            cfg["budget_mb"] = float(budget_mb)
+            cfg["budget_requests"] = int(budget_req)
+            if scope_raw.strip():
+                try:
+                    cfg["scope_filters"] = json.loads(scope_raw)
+                except json.JSONDecodeError:
+                    st.error("Extra filters must be valid JSON — ignoring."); cfg["scope_filters"] = {}
             if test2:
                 cfg["max_pages_per_course"] = 2
             cfg["force_rescrape"] = force
@@ -290,11 +361,12 @@ with tab_run:
         done = job["done_units"] or 0
         pct = (done / total) if total else 0.0
         st.progress(min(pct, 1.0), text=f"Job #{job['id']} ({job['type']}) — {job['status']}")
-        k1, k2, k3, k4 = st.columns(4)
+        k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Processed", f"{done:,}" + (f" / {total:,}" if total else ""))
         k2.metric("Items written", f"{job['items_written']:,}")
-        k3.metric("ETA", fmt_eta(done, total, job["started_at"]))
-        k4.metric("Status", job["status"])
+        k3.metric("Bandwidth", human_mb(job.get("bytes_count")))
+        k4.metric("ETA", fmt_eta(done, total, job["started_at"]))
+        k5.metric("Status", job["status"])
         st.caption(job.get("message") or "")
         if job["status"] in ("running", "queued"):
             if st.button("⏹️ Stop this job"):
@@ -306,6 +378,133 @@ with tab_run:
             st.rerun()
     else:
         st.info("No active job. Start one above.")
+
+
+# ---------------------------------------------------------------------------
+# Reporting dashboard (interactive)
+# ---------------------------------------------------------------------------
+with tab_report:
+    st.subheader("📈 Reporting")
+    rc = db.counts()
+    if rc["courses"] == 0:
+        st.info("No data yet — run a scrape first.")
+    else:
+        st.download_button("⬇️ Analytics summary (.xlsx)", data=export.to_analytics_xlsx(),
+                           file_name="collegedunia_analytics.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        with db.connect() as conn:
+            cdf = pd.read_sql_query(
+                "SELECT stream_name, course_type, level, colleges_count FROM courses", conn)
+        streams_avail = sorted([s for s in cdf["stream_name"].dropna().unique() if s])
+        pick = st.multiselect("Filter streams", streams_avail, default=streams_avail)
+        fdf = cdf[cdf["stream_name"].isin(pick)] if pick else cdf
+
+        a, b = st.columns(2)
+        with a:
+            st.markdown("**Courses by stream**")
+            st.bar_chart(fdf.groupby("stream_name").size().sort_values(ascending=False))
+        with b:
+            st.markdown("**Courses by type**")
+            st.bar_chart(fdf[fdf["course_type"] != ""].groupby("course_type").size())
+        st.markdown("**Courses by level**")
+        st.bar_chart(fdf[fdf["level"] != ""].groupby("level").size().sort_values(ascending=False))
+
+        if rc["offerings"] > 0:
+            st.divider()
+            st.markdown("### College / fee / ranking analytics (Phase 2)")
+            with db.connect() as conn:
+                off = pd.read_sql_query(
+                    "SELECT college_name, city, fees_amount, ranking_rank, ranking_agency, "
+                    "course_name, course_rating FROM offerings", conn)
+            topn = st.slider("Top N cities", 5, 50, 15)
+            city_counts = (off[off["city"] != ""].groupby("city")["college_name"]
+                           .nunique().sort_values(ascending=False).head(topn))
+            st.markdown("**Unique colleges by city**")
+            st.bar_chart(city_counts)
+
+            fees = off[off["fees_amount"].fillna(0) > 0]["fees_amount"]
+            if len(fees):
+                st.markdown("**1st-year fee distribution (₹)**")
+                buckets = pd.cut(
+                    fees, bins=[0, 25000, 50000, 75000, 100000, 200000, 500000, 10**9],
+                    labels=["0-25k", "25-50k", "50-75k", "75k-1L", "1-2L", "2-5L", "5L+"])
+                st.bar_chart(buckets.value_counts().sort_index())
+
+            tr = off[off["ranking_rank"].fillna(0) > 0].sort_values("ranking_rank").head(50)
+            if len(tr):
+                st.markdown("**Top-ranked offerings**")
+                st.dataframe(tr[["college_name", "course_name", "ranking_rank",
+                                 "ranking_agency", "city", "fees_amount", "course_rating"]],
+                             use_container_width=True, height=320)
+        else:
+            st.caption("Run Phase 2 to unlock college / fee / ranking analytics.")
+
+
+# ---------------------------------------------------------------------------
+# Indexing & coverage dashboard (interactive)
+# ---------------------------------------------------------------------------
+with tab_index:
+    st.subheader("🗂️ Indexing & coverage")
+    ic = db.counts()
+    with db.connect() as conn:
+        done = conn.execute("SELECT COUNT(*) FROM offering_progress WHERE status='done'").fetchone()[0]
+        partial = conn.execute("SELECT COUNT(*) FROM offering_progress WHERE status='partial'").fetchone()[0]
+    total_courses = ic["courses"]
+    pending = max(0, total_courses - done - partial)
+    i1, i2, i3, i4 = st.columns(4)
+    i1.metric("Courses indexed", f"{total_courses:,}")
+    i2.metric("Phase-2 done", f"{done:,}")
+    i3.metric("Partial", f"{partial:,}")
+    i4.metric("Pending", f"{pending:,}")
+    if total_courses:
+        st.progress(done / total_courses, text=f"Phase-2 coverage: {done:,}/{total_courses:,} courses")
+
+    if total_courses:
+        with db.connect() as conn:
+            cov = pd.read_sql_query(
+                "SELECT c.stream_name AS stream, COUNT(*) AS courses, "
+                "SUM(CASE WHEN op.status='done' THEN 1 ELSE 0 END) AS done "
+                "FROM courses c LEFT JOIN offering_progress op ON c.course_id=op.course_id "
+                "WHERE c.stream_name IS NOT NULL AND c.stream_name<>'' "
+                "GROUP BY c.stream_name ORDER BY courses DESC", conn)
+        if not cov.empty:
+            cov["done"] = cov["done"].fillna(0).astype(int)
+            cov["% done"] = (cov["done"] / cov["courses"] * 100).round(1)
+            st.markdown("**Phase-2 coverage by stream**")
+            st.dataframe(cov, use_container_width=True, height=300)
+
+    st.divider()
+    st.markdown("### 🔎 Browse index")
+    which = st.radio("Index", ["courses", "colleges"], horizontal=True)
+    term = st.text_input("Search by name", key="idxsearch")
+    with db.connect() as conn:
+        if which == "courses":
+            sql = ("SELECT course_id, name, stream_name, course_type, level, colleges_count "
+                   "FROM courses")
+            params = []
+            if term:
+                sql += " WHERE name LIKE ?"; params = [f"%{term}%"]
+            sql += " ORDER BY colleges_count DESC LIMIT 500"
+        else:
+            sql = "SELECT college_id, name, short_form, city, state_id FROM colleges"
+            params = []
+            if term:
+                sql += " WHERE name LIKE ? OR city LIKE ?"; params = [f"%{term}%", f"%{term}%"]
+            sql += " ORDER BY name LIMIT 500"
+        idf = pd.read_sql_query(sql, conn, params=params)
+    st.caption(f"{len(idf):,} shown (max 500)")
+    st.dataframe(idf, use_container_width=True, height=340)
+
+    if total_courses:
+        st.divider()
+        st.markdown("**Pending courses (not yet Phase-2 done)** — biggest first")
+        with db.connect() as conn:
+            pend = pd.read_sql_query(
+                "SELECT c.course_id, c.name, c.stream_name, c.colleges_count "
+                "FROM courses c LEFT JOIN offering_progress op ON c.course_id=op.course_id "
+                "WHERE op.course_id IS NULL OR op.status<>'done' "
+                "ORDER BY c.colleges_count DESC LIMIT 200", conn)
+        st.dataframe(pend, use_container_width=True, height=300)
 
 
 # ---------------------------------------------------------------------------

@@ -162,6 +162,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     total_units    INTEGER DEFAULT 0,
     done_units     INTEGER DEFAULT 0,
     items_written  INTEGER DEFAULT 0,
+    req_count      INTEGER DEFAULT 0,
+    bytes_count    INTEGER DEFAULT 0,
     message        TEXT,
     stop_requested INTEGER DEFAULT 0,
     pid            INTEGER,
@@ -193,6 +195,12 @@ def init_db(db_path: str = DB_PATH) -> None:
                 "(stream_name IS NULL OR stream_name='')",
                 (name, str(sid)),
             )
+        # Migration: job bandwidth/request counters.
+        jcols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+        if "req_count" not in jcols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN req_count INTEGER DEFAULT 0")
+        if "bytes_count" not in jcols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN bytes_count INTEGER DEFAULT 0")
 
 
 # ---------------------------------------------------------------------------
@@ -311,11 +319,27 @@ def get_done_course_ids(db_path: str = DB_PATH) -> set:
     return {r["course_id"] for r in rows}
 
 
-def list_course_ids(db_path: str = DB_PATH, where: str = "", params: tuple = ()) -> List[int]:
+def get_offering_progress(course_id: int, db_path: str = DB_PATH) -> Optional[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM offering_progress WHERE course_id=?", (course_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+_ORDER_SQL = {
+    "colleges_desc": "colleges_count DESC",
+    "colleges_asc": "colleges_count ASC",
+    "stream": "stream_id, colleges_count DESC",
+}
+
+
+def list_course_ids(db_path: str = DB_PATH, where: str = "", params: tuple = (),
+                    order: str = "colleges_desc") -> List[int]:
     sql = "SELECT course_id FROM courses"
     if where:
         sql += f" WHERE {where}"
-    sql += " ORDER BY colleges_count DESC"
+    sql += " ORDER BY " + _ORDER_SQL.get(order, "colleges_count DESC")
     with connect(db_path) as conn:
         return [r["course_id"] for r in conn.execute(sql, params).fetchall()]
 

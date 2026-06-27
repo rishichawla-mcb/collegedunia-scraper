@@ -71,6 +71,43 @@ def to_json(table: str, db_path: str = db.DB_PATH) -> bytes:
     return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
 
 
+def to_analytics_xlsx(db_path: str = db.DB_PATH) -> bytes:
+    """A summary workbook: pivots/aggregations for quick analysis."""
+    import pandas as pd
+    sheets = {}
+    with db.connect(db_path) as conn:
+        sheets["Courses by stream"] = pd.read_sql_query(
+            "SELECT stream_name AS stream, COUNT(*) AS courses, "
+            "SUM(colleges_count) AS total_college_slots "
+            "FROM courses WHERE stream_name<>'' GROUP BY stream_name "
+            "ORDER BY courses DESC", conn)
+        sheets["Courses by type"] = pd.read_sql_query(
+            "SELECT course_type, level, COUNT(*) AS courses FROM courses "
+            "GROUP BY course_type, level ORDER BY courses DESC", conn)
+        try:
+            sheets["Colleges by city"] = pd.read_sql_query(
+                "SELECT city, COUNT(DISTINCT college_id) AS colleges, "
+                "COUNT(*) AS offerings FROM offerings WHERE city<>'' "
+                "GROUP BY city ORDER BY colleges DESC", conn)
+            sheets["Offerings by stream"] = pd.read_sql_query(
+                "SELECT c.stream_name AS stream, COUNT(*) AS offerings, "
+                "ROUND(AVG(NULLIF(o.fees_amount,0)),0) AS avg_first_year_fee "
+                "FROM offerings o JOIN courses c ON o.course_id=c.course_id "
+                "GROUP BY c.stream_name ORDER BY offerings DESC", conn)
+        except Exception:
+            pass
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
+        wrote = False
+        for name, df in sheets.items():
+            if df is not None and not df.empty:
+                df.to_excel(xl, sheet_name=name[:31], index=False)
+                wrote = True
+        if not wrote:
+            pd.DataFrame({"info": ["no data yet"]}).to_excel(xl, sheet_name="empty", index=False)
+    return buf.getvalue()
+
+
 if __name__ == "__main__":
     import sys
     out = sys.argv[1] if len(sys.argv) > 1 else "collegedunia_export.xlsx"
