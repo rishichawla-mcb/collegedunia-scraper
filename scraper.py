@@ -596,20 +596,42 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
                       message=f"{written}/{grand_total['v']} courses · {leaves_done['v']} chunks · "
                               f"{byts/1048576:.1f} MB", db_path=db_path)
 
-    def page_through(filters: Dict[str, Any], first: Optional[Dict[str, Any]]) -> None:
+    def page_through(filters: Dict[str, Any], first: Optional[Dict[str, Any]],
+                     expected: int = 0) -> None:
+        """Page a chunk fully. An empty page or hasNext=false BEFORE we've reached
+        the chunk's known `count` is treated as a transient hiccup (flaky proxy /
+        soft block) and retried, so chunks don't terminate early."""
         page = 1
         data = first
+        seen = 0
+        soft = 0
         while not stopped():
             if data is None:
                 data = fetch_page(filters, page)
             rows = data.get("courses") or []
-            if not rows:
+            below = expected and seen < (expected - PAGE_SIZE)
+            if (not rows or not data.get("hasNext", False)):
+                if rows:
+                    parsed = [parse_course(c) for c in rows
+                              if (c.get("lead_params") or {}).get("course_id")]
+                    db.upsert_courses(parsed, db_path=db_path)
+                    seen += len(rows)
+                    below = expected and seen < (expected - PAGE_SIZE)
+                if below and soft < soft_retries:
+                    soft += 1
+                    wait = long_cooldown if long_cooldown else 8 * soft
+                    log(f"   ~ chunk page {page} short ({seen}/{expected}) — "
+                        f"retry {soft}/{soft_retries} in {wait:.0f}s")
+                    time.sleep(wait)
+                    page += 1
+                    data = None
+                    continue
                 break
+            soft = 0
             parsed = [parse_course(c) for c in rows
                       if (c.get("lead_params") or {}).get("course_id")]
             db.upsert_courses(parsed, db_path=db_path)
-            if not data.get("hasNext", False):
-                break
+            seen += len(rows)
             page += 1
             data = None
             if page % 5 == 0:
@@ -667,13 +689,31 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
         db.update_job(job_id, status=status, message=msg, finished_at=time.time(),
                       req_count=reqs, bytes_count=byts, db_path=db_path)
         log(msg)
-        if status == "completed":
+        if status == "completed" and not cfg.get("_pipeline"):
             send_notification(cfg, "Collegedunia Phase 1 complete", msg, log)
     except Exception as err:  # noqa: BLE001
         db.update_job(job_id, status="error", message=str(err)[:300],
                       finished_at=time.time(), db_path=db_path)
         log(f"ERROR: {err}")
         raise
+
+
+def run_pipeline(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
+                 log: Optional[Callable[[str], None]] = None) -> None:
+    """One-click full pipeline: complete partitioned Phase 1, then Phase 2 over
+    every course — on a single job."""
+    log = log or (lambda m: print(m, flush=True))
+    log("=== PIPELINE: Phase 1 (courses) ===")
+    _run_courses_partitioned(job_id, {**cfg, "partition": True, "_pipeline": True}, db_path, log)
+    if db.stop_requested(job_id, db_path=db_path):
+        return
+    job = db.get_job(job_id, db_path=db_path)
+    if job and job["status"] == "error":
+        return
+    log("=== PIPELINE: Phase 2 (colleges per course) ===")
+    db.update_job(job_id, status="running", message="phase 1 done — starting phase 2",
+                  db_path=db_path)
+    run_offerings(job_id, {**cfg, "_pipeline": True}, db_path, log)
 
 
 # ---------------------------------------------------------------------------

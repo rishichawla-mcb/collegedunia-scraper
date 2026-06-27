@@ -395,6 +395,31 @@ def request_stop(job_id: int, db_path: str = DB_PATH) -> None:
     update_job(job_id, stop_requested=1)
 
 
+def mark_stale_jobs_interrupted(idle_sec: int = 300, db_path: str = DB_PATH) -> int:
+    """A 'running' job whose updated_at is older than idle_sec means its worker
+    died (container restart, crash). Flag it so the UI can offer a resume."""
+    cutoff = time.time() - idle_sec
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id FROM jobs WHERE status IN ('running','queued') AND updated_at < ?",
+            (cutoff,),
+        ).fetchall()
+        for r in rows:
+            conn.execute(
+                "UPDATE jobs SET status='stopped', "
+                "message='interrupted (worker died) — resume to continue', "
+                "finished_at=? WHERE id=?",
+                (time.time(), r["id"]),
+            )
+    return len(rows)
+
+
+def resume_job(job_id: int, db_path: str = DB_PATH) -> None:
+    """Re-queue an existing job so a worker picks it up and continues from its
+    saved progress (offering_progress / courses_resume_page / dedupe)."""
+    update_job(job_id, status="queued", stop_requested=0, finished_at=None, db_path=db_path)
+
+
 def stop_requested(job_id: int, db_path: str = DB_PATH) -> bool:
     with connect(db_path) as conn:
         row = conn.execute("SELECT stop_requested FROM jobs WHERE id=?", (job_id,)).fetchone()

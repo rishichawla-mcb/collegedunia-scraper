@@ -58,6 +58,8 @@ def run_job(job_id: int) -> None:
         scraper.run_courses(job_id, cfg, log=log)
     elif job["type"] == "offerings":
         scraper.run_offerings(job_id, cfg, log=log)
+    elif job["type"] == "pipeline":
+        scraper.run_pipeline(job_id, cfg, log=log)
     else:
         db.update_job(job_id, status="error", message=f"unknown job type {job['type']}")
         log(f"Unknown job type: {job['type']}")

@@ -90,6 +90,25 @@ def require_login() -> None:
 require_login()
 
 
+def _pid_alive(pid) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+# Recover jobs whose worker died (container restart / crash) — once per session.
+if not st.session_state.get("_recovered"):
+    st.session_state["_recovered"] = True
+    for _j in db.list_jobs(20):
+        if _j["status"] in ("running", "queued") and not _pid_alive(_j.get("pid")):
+            db.update_job(_j["id"], status="stopped",
+                          message="interrupted (worker not running) — resume to continue")
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -298,14 +317,25 @@ m2.metric("Unique colleges", f"{c['colleges']:,}")
 m3.metric("Offerings (course×college)", f"{c['offerings']:,}")
 m4.metric("Courses done (phase 2)", f"{c['courses_done_phase2']:,}")
 
-tab_run, tab_report, tab_index, tab_data, tab_history = st.tabs(
-    ["▶️ Run", "📈 Reporting", "🗂️ Indexing", "📊 Data & export", "🕓 History"])
+tab_run, tab_query, tab_report, tab_index, tab_data, tab_history = st.tabs(
+    ["▶️ Run", "🔎 Query", "📈 Reporting", "🗂️ Indexing", "📊 Data & export", "🕓 History"])
 
 
 # ---------------------------------------------------------------------------
 # Run tab
 # ---------------------------------------------------------------------------
 with tab_run:
+    st.markdown("#### 🚀 One-click full scrape")
+    st.caption("Runs the complete partitioned Phase 1, then Phase 2 over every "
+               "course — using your current proxy/budget settings. Proxy must be on.")
+    if st.button("🚀 Run full pipeline (courses → colleges)", type="primary", key="runpipe"):
+        cfg = proxy_config_from_ui()
+        jid = db.create_job("pipeline", cfg)
+        launch_worker(jid)
+        st.session_state["watch_job"] = jid
+        st.success(f"Started full pipeline — job #{jid}")
+    st.divider()
+
     colA, colB = st.columns(2)
 
     # ---- Phase 1 ----
@@ -384,6 +414,31 @@ with tab_run:
                              key="order2")
         cfg2_extra["order"] = order
 
+        # ---- Bandwidth forecast for the selected scope ----
+        try:
+            if scope == "Top N courses by college count":
+                ids = cfg2_extra.get("course_ids") or []
+                qmark = ",".join("?" * len(ids))
+                with db.connect() as conn:
+                    slots = conn.execute(
+                        f"SELECT COALESCE(SUM(colleges_count),0) FROM courses "
+                        f"WHERE course_id IN ({qmark})", ids).fetchone()[0] if ids else 0
+            else:
+                w = cfg2_extra.get("course_where", "")
+                p = cfg2_extra.get("course_where_params", [])
+                sql = "SELECT COALESCE(SUM(colleges_count),0) FROM courses"
+                if w:
+                    sql += f" WHERE {w}"
+                with db.connect() as conn:
+                    slots = conn.execute(sql, p).fetchone()[0]
+            est_pages = (slots + 9) // 10
+            est_mb = est_pages * 30 / 1024  # ~30 KB/page
+            st.info(f"📊 Forecast: ~{slots:,} college-slots → ~{est_pages:,} requests "
+                    f"→ ~**{est_mb:.0f} MB** ({est_mb/1024:.2f} GB). "
+                    f"Set a budget cap below if this nears your proxy quota.")
+        except Exception:
+            pass
+
         cc1, cc2 = st.columns(2)
         concurrency = cc1.number_input("Parallel workers", 1, 20, 1, key="conc2",
                                        help="Concurrent requests. Use >1 only with a working proxy.")
@@ -452,12 +507,104 @@ with tab_run:
             if st.button("⏹️ Stop this job"):
                 db.request_stop(job["id"])
                 st.warning("Stop requested — the worker will finish its current page and exit.")
+        if job["status"] in ("stopped", "error"):
+            if st.button("▶️ Resume this job"):
+                db.resume_job(job["id"])
+                launch_worker(job["id"])
+                st.session_state["watch_job"] = job["id"]
+                st.success("Resumed — continues from saved progress.")
+                st.rerun()
         st.code(read_log(job["id"]) or "(waiting for log…)", language="text")
         if job["status"] in ("running", "queued"):
             time.sleep(3)
             st.rerun()
     else:
         st.info("No active job. Start one above.")
+
+    # Resume any interrupted/failed job from history
+    resumable = [j for j in db.list_jobs(20)
+                 if j["status"] in ("stopped", "error")]
+    if resumable:
+        with st.expander("⏯️ Resume an interrupted job"):
+            opt = st.selectbox(
+                "Pick a job", resumable,
+                format_func=lambda j: f"#{j['id']} {j['type']} — {j['status']} — "
+                                      f"{(j.get('message') or '')[:50]}")
+            if st.button("▶️ Resume selected"):
+                db.resume_job(opt["id"])
+                launch_worker(opt["id"])
+                st.session_state["watch_job"] = opt["id"]
+                st.success(f"Resumed job #{opt['id']}.")
+                st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Query builder (interactive filters + export)
+# ---------------------------------------------------------------------------
+with tab_query:
+    st.subheader("🔎 Query builder")
+    st.caption("Filter the data with live controls, preview, and export the exact slice.")
+    base = st.radio("Dataset", ["Offerings (course × college)", "Courses", "Colleges"],
+                    horizontal=True, key="qbase")
+    where: list = []
+    params: list = []
+
+    if base.startswith("Offerings"):
+        table = "offerings"
+        cols = ("course_name, college_name, city, fees_amount, course_rating, "
+                "ranking_rank, ranking_agency, exam_name, university_link")
+        x1, x2, x3 = st.columns(3)
+        fc = x1.text_input("Course contains", key="qf_c")
+        fl = x2.text_input("College contains", key="qf_l")
+        fcity = x3.text_input("City contains", key="qf_city")
+        y1, y2, y3 = st.columns(3)
+        fee_max = y1.number_input("Max 1st-yr fee ₹ (0=any)", 0, 100_000_000, 0, step=50000, key="qf_fee")
+        rate_min = y2.number_input("Min rating", 0.0, 5.0, 0.0, step=0.5, key="qf_rate")
+        rank_max = y3.number_input("Max rank (0=any)", 0, 100000, 0, step=10, key="qf_rank")
+        if fc: where.append("course_name LIKE ?"); params.append(f"%{fc}%")
+        if fl: where.append("college_name LIKE ?"); params.append(f"%{fl}%")
+        if fcity: where.append("city LIKE ?"); params.append(f"%{fcity}%")
+        if fee_max: where.append("fees_amount>0 AND fees_amount<=?"); params.append(int(fee_max))
+        if rate_min: where.append("course_rating>=?"); params.append(float(rate_min))
+        if rank_max: where.append("ranking_rank>0 AND ranking_rank<=?"); params.append(int(rank_max))
+    elif base == "Courses":
+        table = "courses"
+        cols = "course_id, name, stream_name, course_type, level, eligibility, exam_name, colleges_count"
+        fn = st.text_input("Name contains", key="qc_n")
+        z1, z2 = st.columns(2)
+        sids = z1.multiselect("Streams", [str(s) for s in sorted(db.STREAMS, key=lambda s: db.STREAMS[s])],
+                              format_func=lambda s: db.stream_name(s), key="qc_s")
+        ctype = z2.multiselect("Course type", ["Degree", "Diploma", "Certification"], key="qc_t")
+        if fn: where.append("name LIKE ?"); params.append(f"%{fn}%")
+        if sids:
+            where.append(f"stream_id IN ({','.join('?'*len(sids))})"); params += sids
+        if ctype:
+            where.append(f"course_type IN ({','.join('?'*len(ctype))})"); params += ctype
+    else:
+        table = "colleges"
+        cols = "college_id, name, short_form, city, state_id, link"
+        fn = st.text_input("Name contains", key="qco_n")
+        fcy = st.text_input("City contains", key="qco_c")
+        if fn: where.append("name LIKE ?"); params.append(f"%{fn}%")
+        if fcy: where.append("city LIKE ?"); params.append(f"%{fcy}%")
+
+    wsql = (" WHERE " + " AND ".join(where)) if where else ""
+    with db.connect() as conn:
+        total = conn.execute(f"SELECT COUNT(*) FROM {table}{wsql}", params).fetchone()[0]
+        qdf = pd.read_sql_query(f"SELECT {cols} FROM {table}{wsql} LIMIT 1000", conn, params=params)
+    st.caption(f"**{total:,}** match — showing up to 1,000")
+    st.dataframe(qdf, use_container_width=True, height=440)
+
+    if st.button("🛠️ Prepare filtered CSV", key="qprep"):
+        with st.spinner("Building…"), db.connect() as conn:
+            full = pd.read_sql_query(
+                f"SELECT {cols} FROM {table}{wsql} LIMIT 200000", conn, params=params)
+        st.session_state["qexp"] = full.to_csv(index=False).encode("utf-8")
+        if total > 200000:
+            st.warning("Capped at 200,000 rows for the download.")
+    if st.session_state.get("qexp"):
+        st.download_button("⬇️ Download filtered.csv", data=st.session_state["qexp"],
+                           file_name="collegedunia_filtered.csv", mime="text/csv")
 
 
 # ---------------------------------------------------------------------------
