@@ -446,9 +446,23 @@ def _to_float(v: Any) -> Optional[float]:
 # ---------------------------------------------------------------------------
 # Phase 1: courses
 # ---------------------------------------------------------------------------
+# Facets used to partition the course list under the API's ~1,700-result
+# pagination ceiling. Order matters: broad → narrow.
+COURSE_TYPE_VALUES = ["Degree", "Diploma", "Certification"]
+LEVEL_VALUES = ["Graduation", "Post Graduation", "10+2", "Doctorate/M.Phil", "10th"]
+PARTITION_FACETS = [
+    ("stream", [str(i) for i in range(1, 21)]),
+    ("course_type", COURSE_TYPE_VALUES),
+    ("level", LEVEL_VALUES),
+]
+PAGINATION_CAP = 1500  # stay safely under the ~1,700 ceiling
+
+
 def run_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
                 log: Optional[Callable[[str], None]] = None) -> None:
     log = log or (lambda m: print(m, flush=True))
+    if cfg.get("partition"):
+        return _run_courses_partitioned(job_id, cfg, db_path, log)
     pm = ProxyManager.from_config(cfg)
     client = Client(pm, log=log, max_retries=int(cfg.get("max_retries", 5)),
                     backoff=float(cfg.get("backoff", 4)))
@@ -546,6 +560,117 @@ def run_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
         db.set_setting("courses_resume_page", page, db_path=db_path)
         db.update_job(job_id, status="error",
                       message=f"{str(err)[:240]} (resume from page {page})",
+                      finished_at=time.time(), db_path=db_path)
+        log(f"ERROR: {err}")
+        raise
+
+
+def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
+                             log: Callable[[str], None]) -> None:
+    """Complete Phase-1 scrape that defeats the API's ~1,700-result pagination
+    ceiling by recursively splitting the query (stream -> type -> level) until
+    each chunk is small enough to page through fully. course_id is the primary
+    key, so overlaps dedupe automatically."""
+    pm = ProxyManager.from_config(cfg)
+    stats = Stats()
+    adaptive = AdaptiveDelay(float(cfg.get("delay", 1.0)), enabled=bool(cfg.get("adaptive", True)))
+    client = Client(pm, log=log, max_retries=int(cfg.get("max_retries", 5)),
+                    backoff=float(cfg.get("backoff", 4)), stats=stats, adaptive=adaptive)
+    soft_retries = int(cfg.get("soft_block_retries", 4))
+    long_cooldown = float(cfg.get("long_cooldown_seconds", 0))
+
+    grand_total = {"v": None}
+    leaves_done = {"v": 0}
+
+    def stopped() -> bool:
+        return db.stop_requested(job_id, db_path=db_path)
+
+    def fetch_page(filters: Dict[str, Any], page: int) -> Dict[str, Any]:
+        return client.fetch({"page": page, **filters})
+
+    def push() -> None:
+        reqs, byts, blocks = stats.snapshot()
+        written = db.counts(db_path=db_path).get("courses", 0)
+        db.update_job(job_id, done_units=written, items_written=written,
+                      total_units=(grand_total["v"] or 0), req_count=reqs, bytes_count=byts,
+                      message=f"{written}/{grand_total['v']} courses · {leaves_done['v']} chunks · "
+                              f"{byts/1048576:.1f} MB", db_path=db_path)
+
+    def page_through(filters: Dict[str, Any], first: Optional[Dict[str, Any]]) -> None:
+        page = 1
+        data = first
+        while not stopped():
+            if data is None:
+                data = fetch_page(filters, page)
+            rows = data.get("courses") or []
+            if not rows:
+                break
+            parsed = [parse_course(c) for c in rows
+                      if (c.get("lead_params") or {}).get("course_id")]
+            db.upsert_courses(parsed, db_path=db_path)
+            if not data.get("hasNext", False):
+                break
+            page += 1
+            data = None
+            if page % 5 == 0:
+                push()
+            time.sleep(adaptive.value())
+        leaves_done["v"] += 1
+        push()
+
+    def recurse(filters: Dict[str, Any], idx: int, label: str) -> None:
+        if stopped():
+            return
+        # probe the size of this slice
+        data = None
+        for attempt in range(1, soft_retries + 1):
+            data = fetch_page(filters, 1)
+            if (data.get("courses") or []) or data.get("count", 0) == 0:
+                break
+            wait = long_cooldown if long_cooldown else 8 * attempt
+            log(f"  ! probe '{label}' empty — retry {attempt}/{soft_retries} in {wait:.0f}s")
+            time.sleep(wait)
+        count = data.get("count") or 0
+        if grand_total["v"] is None:
+            grand_total["v"] = count  # root count = full universe
+        if count == 0:
+            return
+        if count <= PAGINATION_CAP or idx >= len(PARTITION_FACETS):
+            if count > PAGINATION_CAP:
+                log(f"  ~ '{label}' has {count} (> cap) and no finer facet — "
+                    f"paging as deep as the API allows.")
+            log(f"  → scraping chunk '{label}' (~{count})")
+            page_through(filters, first=data)
+            return
+        key, values = PARTITION_FACETS[idx]
+        if key in filters:
+            recurse(filters, idx + 1, label)
+            return
+        for v in values:
+            if stopped():
+                return
+            recurse({**filters, key: v}, idx + 1, f"{label} {key}={v}")
+
+    db.update_job(job_id, status="running", message="partitioned course scrape starting",
+                  db_path=db_path)
+    log("Phase 1 (complete/partitioned): splitting the catalog to beat the pagination cap.")
+    try:
+        recurse({}, 0, "all")
+        written = db.counts(db_path=db_path).get("courses", 0)
+        reqs, byts, _ = stats.snapshot()
+        if stopped():
+            msg = f"stopped by user — {written}/{grand_total['v']} courses so far"
+            status = "stopped"
+        else:
+            msg = f"done: {written}/{grand_total['v']} courses, {byts/1048576:.1f} MB"
+            status = "completed"
+        db.update_job(job_id, status=status, message=msg, finished_at=time.time(),
+                      req_count=reqs, bytes_count=byts, db_path=db_path)
+        log(msg)
+        if status == "completed":
+            send_notification(cfg, "Collegedunia Phase 1 complete", msg, log)
+    except Exception as err:  # noqa: BLE001
+        db.update_job(job_id, status="error", message=str(err)[:300],
                       finished_at=time.time(), db_path=db_path)
         log(f"ERROR: {err}")
         raise

@@ -265,6 +265,19 @@ with tab_run:
             st.session_state["watch_job"] = jid
             st.success(f"Started job #{jid}")
 
+        st.markdown("---")
+        st.markdown("**Complete scrape (recommended)**")
+        st.caption("The plain scrape above hits the site's ~1,700-result page limit "
+                   "(~1,200 courses). This splits the catalog by stream/type/level to "
+                   "pull **all ~21,500**. Needs the proxy on; takes longer.")
+        if st.button("🧩 Scrape ALL courses (partitioned)", key="run1full"):
+            cfg = proxy_config_from_ui()
+            cfg["partition"] = True
+            jid = db.create_job("courses", cfg)
+            launch_worker(jid)
+            st.session_state["watch_job"] = jid
+            st.success(f"Started complete scrape — job #{jid}")
+
     # ---- Phase 2 ----
     with colB:
         st.subheader("Phase 2 — Colleges per course")
