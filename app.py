@@ -183,6 +183,14 @@ def proxy_config_from_ui() -> dict:
         "long_cooldown_seconds": st.session_state.get("long_cooldown", 0),
         "webhook_url": db.get_setting("webhook_url", "") or None,
         "smtp": db.get_setting("smtp", {}) or {},
+        # governance: stage -> validate -> promote
+        "staging": st.session_state.get("staging", True),
+        "auto_promote": st.session_state.get("auto_promote", True),
+        "validation_rules": {
+            "min_rows": int(st.session_state.get("v_min_rows", 1)),
+            "max_missing_fee_pct": float(st.session_state.get("v_max_missing", 100)),
+            "pass_score": float(st.session_state.get("v_pass_score", 70)),
+        },
     }
 
 
@@ -292,6 +300,18 @@ st.session_state["long_cooldown"] = st.sidebar.number_input(
     "Long cooldown on block (sec, 0=off)", 0, 1800, 0, step=30,
     help="On a soft block, wait this long before retrying (rides out rate-limit windows). 0 = short backoff.")
 
+st.sidebar.subheader("🛡️ Data governance")
+st.session_state["staging"] = st.sidebar.checkbox(
+    "Stage → validate → promote", value=True,
+    help="Jobs write to a per-job staging area; data reaches master only after a "
+         "quality check. Uncheck to write straight to master (legacy).")
+st.session_state["auto_promote"] = st.sidebar.checkbox(
+    "Auto-promote when QC passes", value=True,
+    help="Clean jobs merge to master automatically; failed ones wait for your approval.")
+st.session_state["v_pass_score"] = st.sidebar.number_input("QC pass score (0-100)", 0, 100, 70)
+st.session_state["v_min_rows"] = st.sidebar.number_input("QC: min rows", 0, 100000, 1)
+st.session_state["v_max_missing"] = st.sidebar.number_input("QC: max missing-fee %", 0, 100, 100)
+
 st.sidebar.subheader("🔀 Proxies / IP switching")
 st.session_state["proxy_mode"] = st.sidebar.selectbox(
     "Mode", ["none", "list", "gateway"],
@@ -379,17 +399,28 @@ tab_run, tab_query, tab_report, tab_index, tab_data, tab_quality, tab_history = 
 # Run tab
 # ---------------------------------------------------------------------------
 with tab_run:
-    st.markdown("#### 🚀 One-click full scrape")
-    st.caption("Runs the complete partitioned Phase 1, then Phase 2 over every "
-               "course — using your current proxy/budget settings. Proxy must be on.")
-    if st.button("🚀 Run full pipeline (courses → colleges)", type="primary", key="runpipe"):
-        cfg = proxy_config_from_ui()
-        jid = db.create_job("pipeline", cfg)
-        launch_worker(jid)
-        st.session_state["watch_job"] = jid
-        st.success(f"Started full pipeline — job #{jid}")
-    st.divider()
+    st.markdown(
+        "<div style='padding:16px 20px;border-radius:14px;"
+        "background:linear-gradient(100deg,#0f172a,#1e293b 55%,#312e81);"
+        "color:#e2e8f0;margin-bottom:14px;box-shadow:0 2px 14px rgba(0,0,0,.18)'>"
+        "<div style='font-size:18px;font-weight:700'>🛰️ Scraper Control</div>"
+        "<div style='font-size:13px;opacity:.85;margin-top:4px'>"
+        "Flow&nbsp;&nbsp;①&nbsp;Courses&nbsp;→&nbsp;②&nbsp;Colleges/course&nbsp;→&nbsp;"
+        "③&nbsp;Enrichment&nbsp;→&nbsp;④&nbsp;Courses&nbsp;&amp;&nbsp;fees"
+        "&nbsp;&nbsp;·&nbsp;&nbsp;every run <b>stages → validates → promotes</b> to master."
+        "</div></div>", unsafe_allow_html=True)
 
+    with st.expander("🚀  One-click full pipeline  (Phase 1 → Phase 2)", expanded=False):
+        st.caption("Runs partitioned Phase 1 then Phase 2 with your current settings. "
+                   "Proxy must be on.")
+        if st.button("🚀 Run full pipeline", type="primary", key="runpipe"):
+            cfg = proxy_config_from_ui()
+            jid = db.create_job("pipeline", cfg)
+            launch_worker(jid)
+            st.session_state["watch_job"] = jid
+            st.success(f"Started full pipeline — job #{jid}")
+
+    st.markdown("##### 🧩 Individual phases")
     colA, colB = st.columns(2)
 
     # ---- Phase 1 ----
@@ -664,6 +695,46 @@ with tab_run:
         k4.metric("ETA", fmt_eta(done, total, job["started_at"]))
         k5.metric("Status", job["status"])
         st.caption(job.get("message") or "")
+
+        # ---- Governance: quality, staged data (live), diff, approve/reject ----
+        if job["type"] != "enrichment":
+            gj1, gj2 = st.columns(2)
+            qscore = job.get("quality_score")
+            gj1.metric("Quality score", f"{qscore:.0f}/100" if qscore is not None else "—")
+            gj2.metric("Promotion", job.get("promote_status")
+                       or ("staging…" if job["status"] in ("running", "queued") else "—"))
+            staged = db.staged_summary(job["id"])
+            if staged:
+                jid_ = job["id"]
+                with st.expander(f"🔬 Staged data for job #{jid_} (live) — "
+                                 f"{sum(staged.values()):,} rows",
+                                 expanded=(job.get("promote_status") == "pending")):
+                    st.write({k: f"{v:,}" for k, v in staged.items()})
+                    stbl = st.selectbox("Table", list(staged.keys()), key=f"stbl{jid_}")
+                    srows = db.get_staged_rows(jid_, stbl, limit=500)
+                    if srows:
+                        st.dataframe(pd.DataFrame(srows), use_container_width=True, height=300)
+                        st.download_button(
+                            f"⬇️ Download staged {stbl} (CSV)",
+                            data=pd.DataFrame(db.get_staged_rows(jid_, stbl, limit=100000))
+                                 .to_csv(index=False).encode("utf-8"),
+                            file_name=f"job{jid_}_{stbl}_staged.csv", mime="text/csv",
+                            key=f"dl{jid_}{stbl}")
+                    if st.button("🔍 Diff vs master", key=f"diffb{jid_}"):
+                        st.session_state[f"diff{jid_}"] = db.diff_job(jid_)
+                    if st.session_state.get(f"diff{jid_}"):
+                        st.json(st.session_state[f"diff{jid_}"])
+                    if job.get("promote_status") in ("pending", "rejected"):
+                        ap1, ap2 = st.columns(2)
+                        if ap1.button("✅ Approve & promote", key=f"appr{jid_}"):
+                            summ = db.promote_job(jid_)
+                            st.success(f"Promoted {sum(summ.values()):,} rows to master.")
+                            st.rerun()
+                        if ap2.button("🗑️ Reject (discard staged)", key=f"rej{jid_}"):
+                            db.discard_staging(jid_)
+                            db.update_job(jid_, promote_status="rejected")
+                            st.warning("Staged data discarded.")
+                            st.rerun()
         if job["status"] in ("running", "queued"):
             if st.button("⏹️ Stop this job"):
                 db.request_stop(job["id"])

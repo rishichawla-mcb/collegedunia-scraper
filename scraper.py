@@ -642,7 +642,7 @@ def run_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
     total = None
     try:
         # Seed the running total from what's already in the DB (for resume).
-        written = db.counts(db_path=db_path).get("courses", 0)
+        written = (db.staged_summary(job_id, db_path=db_path).get("courses", 0) if cfg.get("staging", True) else db.counts(db_path=db_path).get("courses", 0))
         while True:
             if db.stop_requested(job_id, db_path=db_path):
                 db.set_setting("courses_resume_page", page, db_path=db_path)
@@ -691,8 +691,8 @@ def run_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
                 break  # genuine end (we're at/near the known total)
 
             parsed = [parse_course(c) for c in courses if (c.get("lead_params") or {}).get("course_id")]
-            db.upsert_courses(parsed, db_path=db_path)
-            written = db.counts(db_path=db_path).get("courses", 0)
+            _write_rows(job_id, cfg, "courses", parsed, db_path)
+            written = (db.staged_summary(job_id, db_path=db_path).get("courses", 0) if cfg.get("staging", True) else db.counts(db_path=db_path).get("courses", 0))
             pages_done += 1
             page += 1
             db.set_setting("courses_resume_page", page, db_path=db_path)
@@ -744,7 +744,7 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
 
     def push() -> None:
         reqs, byts, blocks = stats.snapshot()
-        written = db.counts(db_path=db_path).get("courses", 0)
+        written = (db.staged_summary(job_id, db_path=db_path).get("courses", 0) if cfg.get("staging", True) else db.counts(db_path=db_path).get("courses", 0))
         db.update_job(job_id, done_units=written, items_written=written,
                       total_units=(grand_total["v"] or 0), req_count=reqs, bytes_count=byts,
                       message=f"{written}/{grand_total['v']} courses · {leaves_done['v']} chunks · "
@@ -766,7 +766,7 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
                 consec_empty = 0
                 parsed = [parse_course(c) for c in rows
                           if (c.get("lead_params") or {}).get("course_id")]
-                db.upsert_courses(parsed, db_path=db_path)
+                _write_rows(job_id, cfg, "courses", parsed, db_path)
             else:
                 consec_empty += 1
                 if consec_empty >= MAX_EMPTY_PAGES:
@@ -832,7 +832,7 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
     facets = [("course_tag_id", tag_ids)] + SUB_FACETS
     try:
         recurse({}, 0, "all")
-        written = db.counts(db_path=db_path).get("courses", 0)
+        written = (db.staged_summary(job_id, db_path=db_path).get("courses", 0) if cfg.get("staging", True) else db.counts(db_path=db_path).get("courses", 0))
         reqs, byts, _ = stats.snapshot()
         if stopped():
             msg = f"stopped by user — {written}/{grand_total['v']} courses so far"
@@ -993,8 +993,8 @@ def run_offerings(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
             colleges = [pc for pc in (parse_college(r) for r in rows) if pc]
             offerings = [parse_offering(cid, r) for r in rows]
             with db_lock:
-                db.upsert_colleges(colleges, db_path=db_path)
-                local_off += db.upsert_offerings(offerings, db_path=db_path)
+                _write_rows(job_id, cfg, "colleges", colleges, db_path)
+                local_off += _write_rows(job_id, cfg, "offerings", offerings, db_path)
                 db.set_offering_progress(cid, "partial", page, course_total, db_path=db_path)
             seen += len(rows); page += 1
             if max_pages_per_course and page > int(max_pages_per_course):
@@ -1330,7 +1330,7 @@ def run_college_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_P
                          "source_url": url, "scraped_at": time.time()}
                         for r in parsed.get("courses", [])]
                 with db_lock:
-                    n = db.upsert_college_courses(rows, db_path=db_path)
+                    n = _write_rows(job_id, cfg, "college_courses", rows, db_path)
                     db.set_cc_progress(cid, "done" if n else "empty", n, db_path=db_path)
             except Exception as err:  # noqa: BLE001
                 with db_lock:

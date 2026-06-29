@@ -77,6 +77,16 @@ def run_job(job_id: int) -> None:
     else:
         db.update_job(job_id, status="error", message=f"unknown job type {job['type']}")
         log(f"Unknown job type: {job['type']}")
+        return
+
+    # Governance gate: validate the job's staged data and auto-promote (or hold
+    # for manual approval). Enrichment writes master directly, so it's exempt.
+    if job["type"] != "enrichment" and cfg.get("staging", True):
+        fin = db.get_job(job_id)
+        if fin and fin["status"] == "completed" and not fin.get("promote_status"):
+            scraper._finalize_job(job_id, cfg, log,
+                                  base_msg=(fin.get("message") or "scrape complete"),
+                                  db_path=db.DB_PATH)
 
 
 def main() -> None:
