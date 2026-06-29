@@ -706,9 +706,9 @@ with tab_run:
             staged = db.staged_summary(job["id"])
             if staged:
                 jid_ = job["id"]
-                with st.expander(f"🔬 Staged data for job #{jid_} (live) — "
-                                 f"{sum(staged.values()):,} rows",
-                                 expanded=(job.get("promote_status") == "pending")):
+                st.markdown(f"##### 🔬 Staged data for job #{jid_} (live) — "
+                            f"{sum(staged.values()):,} rows")
+                with st.container(border=True):
                     st.write({k: f"{v:,}" for k, v in staged.items()})
                     stbl = st.selectbox("Table", list(staged.keys()), key=f"stbl{jid_}")
                     srows = db.get_staged_rows(jid_, stbl, limit=500)
@@ -1131,3 +1131,49 @@ with tab_history:
         d3.download_button("⬇️ Download this job's logs",
                            data="\n".join(l["message"] for l in reversed(hlogs)).encode(),
                            file_name=f"job_{sel}_logs.txt", mime="text/plain")
+
+        st.divider()
+        st.markdown("### 📦 Download data by job")
+        st.caption("Pull the exact rows a job produced — its staged set (before promotion) "
+                   "or the rows it wrote to master (matched on source_job_id).")
+        dj = st.selectbox("Job", jopts, format_func=lambda i: f"#{i}", key="dljob")
+        dstaged = db.staged_summary(dj)
+        promoted = {}
+        with db.connect() as conn:
+            for _t in ("courses", "colleges", "offerings", "college_courses"):
+                try:
+                    promoted[_t] = conn.execute(
+                        f"SELECT COUNT(*) FROM {_t} WHERE source_job_id=?", (dj,)).fetchone()[0]
+                except Exception:
+                    promoted[_t] = 0
+        promoted = {k: v for k, v in promoted.items() if v}
+        if not dstaged and not promoted:
+            st.info("No data recorded for this job yet (it may still be running, have written "
+                    "straight to master before provenance tracking, or produced no rows).")
+        else:
+            src_opts = (["Staged (this job)"] if dstaged else []) + \
+                       (["Promoted to master"] if promoted else [])
+            src = st.radio("Source", src_opts, horizontal=True, key="dlsrc")
+            if src.startswith("Staged"):
+                dtbl = st.selectbox("Table", list(dstaged.keys()), key="dlstbl")
+                st.caption(f"{dstaged[dtbl]:,} staged rows")
+                if st.button("🛠️ Prepare CSV", key="dlsprep"):
+                    with st.spinner("Building…"):
+                        rows = db.get_staged_rows(dj, dtbl, limit=500000)
+                        st.session_state["jobdl"] = (
+                            pd.DataFrame(rows).to_csv(index=False).encode("utf-8"),
+                            f"job{dj}_{dtbl}_staged.csv")
+            else:
+                dtbl = st.selectbox("Table", list(promoted.keys()), key="dlptbl")
+                st.caption(f"{promoted[dtbl]:,} rows in master from this job")
+                if st.button("🛠️ Prepare CSV", key="dlpprep"):
+                    with st.spinner("Building…"), db.connect() as conn:
+                        jdf = pd.read_sql_query(
+                            f"SELECT * FROM {dtbl} WHERE source_job_id=? LIMIT 500000",
+                            conn, params=[dj])
+                    st.session_state["jobdl"] = (
+                        jdf.to_csv(index=False).encode("utf-8"), f"job{dj}_{dtbl}.csv")
+            if st.session_state.get("jobdl"):
+                _data, _fn = st.session_state["jobdl"]
+                st.download_button(f"⬇️ Download {_fn}", data=_data, file_name=_fn,
+                                   mime="text/csv", key="jobdlbtn")
