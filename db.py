@@ -207,9 +207,17 @@ CREATE TABLE IF NOT EXISTS cc_progress (
     updated_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS logs (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id  INTEGER,
+    ts      REAL,
+    message TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_offerings_course ON offerings(course_id);
 CREATE INDEX IF NOT EXISTS idx_offerings_college ON offerings(college_id);
 CREATE INDEX IF NOT EXISTS idx_cc_college ON college_courses(college_id);
+CREATE INDEX IF NOT EXISTS idx_logs_job ON logs(job_id, id);
 """
 
 
@@ -496,6 +504,45 @@ def list_jobs(limit: int = 30, db_path: str = DB_PATH) -> List[Dict[str, Any]]:
 
 def request_stop(job_id: int, db_path: str = DB_PATH) -> None:
     update_job(job_id, stop_requested=1)
+
+
+# ---------------------------------------------------------------------------
+# Live logs (persisted)
+# ---------------------------------------------------------------------------
+def add_log(job_id: int, message: str, db_path: str = DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute("INSERT INTO logs(job_id, ts, message) VALUES(?,?,?)",
+                     (job_id, time.time(), (message or "")[:600]))
+
+
+def get_logs(job_id: Optional[int] = None, limit: int = 200, after_id: int = 0,
+             db_path: str = DB_PATH) -> List[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        if job_id:
+            rows = conn.execute(
+                "SELECT id, ts, message FROM logs WHERE job_id=? AND id>? "
+                "ORDER BY id DESC LIMIT ?", (job_id, after_id, limit)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, ts, job_id, message FROM logs WHERE id>? "
+                "ORDER BY id DESC LIMIT ?", (after_id, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def clear_logs(job_id: Optional[int] = None, db_path: str = DB_PATH) -> int:
+    with connect(db_path) as conn:
+        if job_id:
+            cur = conn.execute("DELETE FROM logs WHERE job_id=?", (job_id,))
+        else:
+            cur = conn.execute("DELETE FROM logs")
+        return cur.rowcount
+
+
+def prune_logs(keep: int = 8000, db_path: str = DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "DELETE FROM logs WHERE id NOT IN "
+            "(SELECT id FROM logs ORDER BY id DESC LIMIT ?)", (keep,))
 
 
 def mark_stale_jobs_interrupted(idle_sec: int = 300, db_path: str = DB_PATH) -> int:

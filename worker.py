@@ -32,6 +32,8 @@ def _log_factory(job_id: int):
     os.makedirs(log_dir, exist_ok=True)
     path = os.path.join(log_dir, f"job_{job_id}.log")
 
+    counter = {"n": 0}
+
     def log(msg: str) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
         print(line, flush=True)
@@ -39,6 +41,14 @@ def _log_factory(job_id: int):
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
         except OSError:
+            pass
+        # Persist to DB (survives restarts; shown live in the UI).
+        try:
+            db.add_log(job_id, line)
+            counter["n"] += 1
+            if counter["n"] % 250 == 0:
+                db.prune_logs()
+        except Exception:
             pass
 
     return log

@@ -621,7 +621,15 @@ with tab_run:
                 st.session_state["watch_job"] = job["id"]
                 st.success("Resumed — continues from saved progress.")
                 st.rerun()
-        st.code(read_log(job["id"]) or "(waiting for log…)", language="text")
+        nlines = st.slider("Live log lines", 30, 500, 150, key="loglines")
+        logs = db.get_logs(job["id"], limit=int(nlines))   # newest-first
+        log_text = "\n".join(l["message"] for l in reversed(logs)) or "(waiting for logs…)"
+        st.code(log_text, language="text")
+        lc1, lc2 = st.columns(2)
+        if lc1.button("🗑️ Clear this job's logs"):
+            db.clear_logs(job["id"])
+            st.rerun()
+        lc2.caption(f"{len(logs)} lines shown · auto-refreshes while running")
         if job["status"] in ("running", "queued"):
             time.sleep(3)
             st.rerun()
@@ -892,6 +900,23 @@ with tab_history:
                 "started": time.strftime("%Y-%m-%d %H:%M", time.localtime(j["started_at"])) if j["started_at"] else "",
                 "message": (j.get("message") or "")[:80],
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, height=460)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, height=300)
         if st.button("🔄 Refresh"):
             st.rerun()
+
+        st.divider()
+        st.markdown("### 📜 Logs")
+        jopts = [j["id"] for j in jobs]
+        sel = st.selectbox("View logs for job", jopts,
+                           format_func=lambda i: f"#{i}", key="loghist")
+        n2 = st.slider("Lines", 50, 1000, 300, key="loghistn")
+        hlogs = db.get_logs(sel, limit=int(n2))
+        st.code("\n".join(l["message"] for l in reversed(hlogs)) or "(no logs)", language="text")
+        d1, d2, d3 = st.columns(3)
+        if d1.button("🗑️ Clear this job's logs", key="clr1"):
+            db.clear_logs(sel); st.rerun()
+        if d2.button("🗑️ Clear ALL logs", key="clrall"):
+            db.clear_logs(); st.success("All logs cleared."); st.rerun()
+        d3.download_button("⬇️ Download this job's logs",
+                           data="\n".join(l["message"] for l in reversed(hlogs)).encode(),
+                           file_name=f"job_{sel}_logs.txt", mime="text/plain")

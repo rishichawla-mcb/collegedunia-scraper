@@ -306,6 +306,7 @@ class Client:
         self.stats = stats or Stats()
         self.adaptive = adaptive
         self.session_id: Optional[str] = None  # set for sticky-IP pagination
+        self.verbose = True                    # per-request live logging (bounded by log prune)
 
     def fetch(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         params = {"data": encode_payload(payload)}
@@ -328,6 +329,11 @@ class Client:
                 self.pm.report_success(proxy)
                 if self.adaptive:
                     self.adaptive.on_success()
+                if self.verbose:
+                    self.log(f"   · page {payload.get('page')} → "
+                             f"{len(data.get('courses') or [])} rows, "
+                             f"{len(resp.content or b'')//1024} KB "
+                             f"(filters: {[k for k in payload if k != 'page']})")
                 return data
             except (BlockedError, requests.RequestException, ValueError) as err:
                 last_err = err
@@ -359,6 +365,8 @@ class Client:
                 self.pm.report_success(proxy)
                 if self.adaptive:
                     self.adaptive.on_success()
+                if self.verbose:
+                    self.log(f"   · GET …{url[-46:]} → {len(resp.content or b'')//1024} KB")
                 return resp.text
             except (BlockedError, requests.RequestException) as err:
                 last_err = err
@@ -1125,6 +1133,19 @@ def _clean_html(s: str) -> str:
     return re.sub(r"\s+", " ", _html.unescape(s)).strip()
 
 
+def _clean_fee(s: str) -> str:
+    """Normalise a fee cell like '894(1st Year Fees)' -> '₹894 (1st Year Fees)'
+    and '₹ 2.65 Lakhs' -> '₹2.65 Lakhs'."""
+    s = (s or "").strip()
+    if not s or s in ("-", "—", "N/A", "NA"):
+        return ""
+    s = re.sub(r"(\d)\(", r"\1 (", s)          # space before a glued '('
+    s = re.sub(r"\s+", " ", s).strip()
+    if re.match(r"^[\d,]", s):                  # bare number -> prefix ₹
+        s = "₹" + s
+    return s
+
+
 def parse_courses_fees(page_html: str) -> Dict[str, Any]:
     """Parse the courses-&-fees table(s) from a college page's server HTML.
     Returns {'college_name': str, 'courses': [ {course_name, eligibility,
@@ -1172,7 +1193,8 @@ def parse_courses_fees(page_html: str) -> Dict[str, Any]:
                 continue
             seen.add(cn.lower())
             courses.append({"course_name": cn, "eligibility": g(ci_elig),
-                            "total_fees": g(ci_total), "hostel_fees": g(ci_hostel)})
+                            "total_fees": _clean_fee(g(ci_total)),
+                            "hostel_fees": _clean_fee(g(ci_hostel))})
     return {"college_name": name, "courses": courses}
 
 
