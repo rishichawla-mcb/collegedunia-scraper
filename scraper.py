@@ -1203,8 +1203,6 @@ def parse_courses_fees(page_html: str) -> Dict[str, Any]:
     Returns {'college_name': str, 'courses': [ {course_name, eligibility,
     total_fees, hostel_fees}, ... ]}."""
     name = ""
-    m = re.search(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
-                  page_html or "", re.S | re.I)
     # college name from <title> as a cheap fallback
     mt = re.search(r"<title>(.*?)</title>", page_html or "", re.S | re.I)
     if mt:
