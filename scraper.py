@@ -560,6 +560,58 @@ MAX_EMPTY_PAGES = 6     # stop a chunk after this many consecutive empty pages
 MAX_CHUNK_PAGES = 400   # hard safety cap on pages per chunk
 
 
+_UPSERT_MAP = {
+    "courses": "upsert_courses", "colleges": "upsert_colleges",
+    "offerings": "upsert_offerings", "college_courses": "upsert_college_courses",
+}
+
+
+def _write_rows(job_id: int, cfg: Dict[str, Any], table: str,
+                rows: List[Dict[str, Any]], db_path: str) -> int:
+    """Route a runner's output: to per-job staging (default) or straight to
+    master (fallback when cfg['staging'] is False)."""
+    if not rows:
+        return 0
+    if cfg.get("staging", True):
+        return db.stage_records(job_id, table, rows, db_path=db_path)
+    return getattr(db, _UPSERT_MAP[table])(rows, db_path=db_path)
+
+
+def _staged_or_master_count(job_id: int, cfg: Dict[str, Any], db_path: str) -> int:
+    if cfg.get("staging", True):
+        return sum(db.staged_summary(job_id, db_path=db_path).values())
+    return sum(db.counts(db_path=db_path).values())
+
+
+def _finalize_job(job_id: int, cfg: Dict[str, Any], log: Callable[[str], None],
+                  base_msg: str, db_path: str) -> None:
+    """Validate a job's staged data; auto-promote if it passes, else leave it
+    staged and pending manual approval. No-op (just mark completed) when staging
+    is off."""
+    if not cfg.get("staging", True):
+        db.update_job(job_id, status="completed", message=base_msg,
+                      finished_at=time.time(), db_path=db_path)
+        return
+    v = db.validate_job(job_id, cfg.get("validation_rules") or {}, db_path=db_path)
+    staged = sum(db.staged_summary(job_id, db_path=db_path).values())
+    db.update_job(job_id, quality_score=v["score"], staged_rows=staged, db_path=db_path)
+    auto = cfg.get("auto_promote", True)
+    if v["passed"] and auto:
+        summ = db.promote_job(job_id, db_path=db_path)
+        msg = f"{base_msg} · QC {v['score']:.0f}/100 ✓ promoted ({sum(summ.values())} rows)"
+        db.update_job(job_id, status="completed", promote_status="promoted",
+                      message=msg, finished_at=time.time(), db_path=db_path)
+        log(msg)
+        send_notification(cfg, "Collegedunia job promoted", msg, log)
+    else:
+        why = "failed QC" if not v["passed"] else "auto-promote off"
+        msg = f"{base_msg} · QC {v['score']:.0f}/100 — staged, awaiting approval ({why})"
+        db.update_job(job_id, status="completed", promote_status="pending",
+                      message=msg, finished_at=time.time(), db_path=db_path)
+        log(msg)
+        send_notification(cfg, "Collegedunia job needs review", msg, log)
+
+
 def run_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
                 log: Optional[Callable[[str], None]] = None) -> None:
     log = log or (lambda m: print(m, flush=True))

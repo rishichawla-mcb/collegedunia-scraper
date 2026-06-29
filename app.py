@@ -127,6 +127,41 @@ def launch_worker(job_id: int) -> None:
     )
 
 
+@st.cache_resource
+def _start_scheduler():
+    """Singleton daemon (one per server) that fires scheduled refreshes when due."""
+    import threading as _th
+    import time as _t
+
+    def loop():
+        while True:
+            try:
+                s = db.get_setting("schedule", {}) or {}
+                if s.get("enabled") and _t.time() >= float(s.get("next_run") or 0):
+                    base = {
+                        "proxy_mode": db.get_setting("proxy_mode", "none"),
+                        "proxy_gateway": db.get_setting("proxy_gateway", ""),
+                        "proxy_list": [p.strip() for p in
+                                       db.get_setting("proxy_list_text", "").splitlines() if p.strip()],
+                        "delay": db.get_setting("delay", 1.0),
+                    }
+                    jt = s.get("job_type", "courses")
+                    if jt == "courses":
+                        base["partition"] = True
+                    jid = db.create_job(jt, base)
+                    launch_worker(jid)
+                    db.add_snapshot(f"scheduled {jt}")
+                    s["next_run"] = _t.time() + int(s.get("interval_sec", 604800))
+                    db.set_setting("schedule", s)
+            except Exception:
+                pass
+            _t.sleep(60)
+
+    th = _th.Thread(target=loop, daemon=True)
+    th.start()
+    return th
+
+
 def read_log(job_id: int, lines: int = 25) -> str:
     path = os.path.join(HERE, "logs", f"job_{job_id}.log")
     if not os.path.exists(path):
@@ -195,6 +230,22 @@ def agg_top_ranked() -> pd.DataFrame:
             "SELECT college_name, course_name, ranking_rank, ranking_agency, city, "
             "fees_amount, course_rating FROM offerings WHERE ranking_rank>0 "
             "ORDER BY ranking_rank LIMIT 50", conn)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def agg_colleges_by_city(n: int) -> pd.DataFrame:
+    with db.connect() as conn:
+        return pd.read_sql_query(
+            "SELECT city AS k, COUNT(*) AS n FROM colleges WHERE city<>'' "
+            "GROUP BY city ORDER BY n DESC LIMIT ?", conn, params=[int(n)])
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def agg_colleges_by_state() -> pd.DataFrame:
+    with db.connect() as conn:
+        return pd.read_sql_query(
+            "SELECT CAST(state_id AS TEXT) AS k, COUNT(*) AS n FROM colleges "
+            "WHERE state_id IS NOT NULL GROUP BY state_id ORDER BY n DESC LIMIT 40", conn)
 
 
 @st.cache_data(ttl=20, show_spinner=False)
@@ -309,6 +360,8 @@ if st.sidebar.button("🧪 Test proxies"):
 # ---------------------------------------------------------------------------
 # Header + live counts
 # ---------------------------------------------------------------------------
+_start_scheduler()  # start the scheduled-refresh daemon once per server
+
 st.title("🎓 Collegedunia Course & College Scraper")
 c = db.counts()
 m1, m2, m3, m4 = st.columns(4)
@@ -317,8 +370,9 @@ m2.metric("Unique colleges", f"{c['colleges']:,}")
 m3.metric("Offerings (course×college)", f"{c['offerings']:,}")
 m4.metric("Courses done (phase 2)", f"{c['courses_done_phase2']:,}")
 
-tab_run, tab_query, tab_report, tab_index, tab_data, tab_history = st.tabs(
-    ["▶️ Run", "🔎 Query", "📈 Reporting", "🗂️ Indexing", "📊 Data & export", "🕓 History"])
+tab_run, tab_query, tab_report, tab_index, tab_data, tab_quality, tab_history = st.tabs(
+    ["▶️ Run", "🔎 Query", "📈 Reporting", "🗂️ Indexing", "📊 Data & export",
+     "🩺 Quality", "🕓 History"])
 
 
 # ---------------------------------------------------------------------------
@@ -767,6 +821,20 @@ with tab_report:
         else:
             st.caption("Run Phase 2 to unlock college / fee / ranking analytics.")
 
+        if rc["colleges"] > 0:
+            st.divider()
+            st.markdown("### 🗺️ Geography")
+            topc = st.slider("Top N cities", 5, 60, 20, key="geocities")
+            gc = agg_colleges_by_city(topc)
+            st.markdown("**Colleges by city**")
+            st.bar_chart(gc.set_index("k")["n"])
+            gs = agg_colleges_by_state()
+            if not gs.empty:
+                st.markdown("**Colleges by state (state_id)**")
+                st.bar_chart(gs.set_index("k")["n"])
+                st.caption("State IDs are Collegedunia's internal codes; tell me if "
+                           "you want them mapped to state names.")
+
 
 # ---------------------------------------------------------------------------
 # Indexing & coverage dashboard (interactive)
@@ -886,6 +954,78 @@ with tab_data:
 # ---------------------------------------------------------------------------
 # History tab
 # ---------------------------------------------------------------------------
+with tab_quality:
+    st.subheader("🩺 Data quality & maintenance")
+
+    st.markdown("**Fee normalization** — parse mixed fee strings into numeric INR.")
+    qn1, qn2 = st.columns([1, 2])
+    if qn1.button("🔢 Normalize fees now"):
+        n = db.normalize_fees()
+        st.success(f"Normalized {n} college-course fees into numeric INR (fees_inr).")
+    qn2.caption("Offerings already store numeric fees (fees_amount). This fills "
+                "college_courses.fees_inr from the text fees.")
+
+    st.divider()
+    st.markdown("**Health checks**")
+    qa = db.qa_report()
+    labels = {
+        "courses_zero_colleges": "Courses with 0 colleges",
+        "offerings_no_fee": "Offerings missing fee",
+        "offerings_no_rating": "Offerings missing rating",
+        "colleges_no_city": "Colleges missing city",
+        "colleges_unenriched": "Colleges not enriched",
+        "dup_college_names": "Duplicate college names",
+        "cc_unparsed_fees": "College-courses w/ unparsed fee",
+    }
+    qcols = st.columns(4)
+    for i, (k, lab) in enumerate(labels.items()):
+        qcols[i % 4].metric(lab, f"{qa.get(k, 0):,}")
+
+    st.divider()
+    st.markdown("**Master export** — one sheet: offerings joined with college details.")
+    if st.button("🛠️ Prepare master export"):
+        with st.spinner("Building…"):
+            st.session_state["masterdata"] = export.to_master_xlsx()
+    if st.session_state.get("masterdata"):
+        st.download_button("⬇️ Master analytical sheet (.xlsx)",
+                           data=st.session_state["masterdata"],
+                           file_name="collegedunia_master.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    st.divider()
+    st.markdown("**📈 Change log** — snapshots of dataset size over time.")
+    if st.button("📸 Take snapshot now"):
+        db.add_snapshot("manual")
+        st.success("Snapshot saved.")
+    snaps = db.get_snapshots(50)
+    if snaps:
+        sdf = pd.DataFrame([{
+            "when": time.strftime("%Y-%m-%d %H:%M", time.localtime(s["ts"])),
+            "courses": s["courses"], "colleges": s["colleges"],
+            "offerings": s["offerings"], "college_courses": s["college_courses"],
+            "note": s.get("note") or "",
+        } for s in snaps])
+        st.dataframe(sdf, use_container_width=True, height=240)
+
+    st.divider()
+    st.markdown("**⏰ Scheduled refresh** — auto re-run on a cadence (always-on host only).")
+    sched = db.get_setting("schedule", {}) or {}
+    se = st.checkbox("Enable scheduled refresh", value=bool(sched.get("enabled")))
+    sc1, sc2 = st.columns(2)
+    every_days = sc1.number_input("Every N days", 1, 90, int(sched.get("days", 7)))
+    job_type = sc2.selectbox("What to run", ["courses", "pipeline", "enrichment"],
+                             index=["courses", "pipeline", "enrichment"].index(sched.get("job_type", "courses")))
+    if st.button("💾 Save schedule"):
+        nxt = time.time() + (0 if se else 10**12)
+        db.set_setting("schedule", {"enabled": bool(se), "days": int(every_days),
+                                    "job_type": job_type,
+                                    "interval_sec": int(every_days) * 86400,
+                                    "next_run": (time.time() + int(every_days) * 86400) if se else 0})
+        st.success("Schedule saved." if se else "Scheduling disabled.")
+    if sched.get("enabled") and sched.get("next_run"):
+        st.caption(f"Next run ≈ {time.strftime('%Y-%m-%d %H:%M', time.localtime(sched['next_run']))}")
+
+
 with tab_history:
     jobs = db.list_jobs(50)
     if not jobs:
