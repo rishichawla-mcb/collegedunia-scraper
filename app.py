@@ -1194,17 +1194,27 @@ with tab_quality:
         st.caption(f"Next run ≈ {time.strftime('%Y-%m-%d %H:%M', time.localtime(sched['next_run']))}")
 
     st.divider()
-    st.markdown("**🧹 Reset data** — keep only scraped courses & unique colleges; clear the rest.")
+    st.markdown("**🧹 Reset data** — start fresh while keeping your scraped baseline.")
     with db.connect() as conn:
         keep_c = conn.execute("SELECT COUNT(*) FROM courses").fetchone()[0]
         keep_k = conn.execute("SELECT COUNT(*) FROM colleges").fetchone()[0]
-    st.caption(f"Will KEEP **{keep_c:,} courses** and **{keep_k:,} colleges** (incl. their "
-               "enrichment) and your proxy/settings. Will CLEAR offerings, college-courses, "
-               "all progress, staging, logs, job history and snapshots. This cannot be undone.")
-    wipe_ok = st.checkbox("Yes — permanently delete everything except courses & colleges",
-                          key="wipeok")
+    wipe_scope = st.radio(
+        "What to keep",
+        ["Phase 1 only — courses", "Courses + colleges"],
+        key="wipescope",
+        help="'Phase 1 only' also clears the colleges table so Phases 2–4 start completely fresh.")
+    keep_colleges = wipe_scope.startswith("Courses +")
+    if keep_colleges:
+        st.caption(f"Will KEEP **{keep_c:,} courses** and **{keep_k:,} colleges** (incl. enrichment) "
+                   "and your proxy/settings. Will CLEAR offerings, college-courses, all progress, "
+                   "staging, logs, job history and snapshots. Cannot be undone.")
+    else:
+        st.caption(f"Will KEEP **{keep_c:,} courses** (Phase 1) and your proxy/settings only. "
+                   f"Will CLEAR the **{keep_k:,} colleges**, offerings, college-courses, all "
+                   "progress, staging, logs, job history and snapshots. Cannot be undone.")
+    wipe_ok = st.checkbox("Yes — permanently delete the above", key="wipeok")
     if st.button("🧹 Reset now", disabled=not wipe_ok, key="wipebtn"):
-        d = db.wipe_except_courses_colleges()
+        d = db.wipe_data(keep_colleges=keep_colleges)
         cleared = ", ".join(f"{k}={v:,}" for k, v in d.items() if v)
         st.success("Reset complete. " + (f"Cleared: {cleared}." if cleared
                                          else "Nothing else needed clearing."))

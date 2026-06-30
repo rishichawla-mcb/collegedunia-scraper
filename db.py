@@ -779,15 +779,23 @@ def discard_staging(job_id: int, db_path: str = DB_PATH) -> int:
         return cur.rowcount
 
 
-def wipe_except_courses_colleges(db_path: str = DB_PATH) -> Dict[str, int]:
-    """Reset to a clean slate: keep the courses and colleges master tables (and
-    saved settings/proxy config), clear everything else — offerings,
-    college_courses, all progress, staging, logs, job history, snapshots.
+def wipe_data(keep_colleges: bool = True, db_path: str = DB_PATH) -> Dict[str, int]:
+    """Reset to a clean slate, always keeping the Phase-1 `courses` table and
+    saved settings/proxy config.
+
+    keep_colleges=True  -> keep courses + colleges (clear Phase 2 offerings,
+                           Phase 4 college_courses, all progress, staging, logs,
+                           jobs, snapshots).
+    keep_colleges=False -> keep ONLY courses (Phase 1); also clears the colleges
+                           table, so Phases 2-4 start completely fresh.
     Returns rows deleted per table."""
+    tables = ["offerings", "college_courses", "offering_progress",
+              "cc_progress", "staging", "logs", "jobs", "snapshots"]
+    if not keep_colleges:
+        tables.insert(0, "colleges")
     deleted: Dict[str, int] = {}
     with connect(db_path) as conn:
-        for tbl in ("offerings", "college_courses", "offering_progress",
-                    "cc_progress", "staging", "logs", "jobs", "snapshots"):
+        for tbl in tables:
             try:
                 cur = conn.execute(f"DELETE FROM {tbl}")
                 deleted[tbl] = cur.rowcount
@@ -796,6 +804,11 @@ def wipe_except_courses_colleges(db_path: str = DB_PATH) -> Dict[str, int]:
         # drop the phase-1 resume pointer so the next run starts fresh
         conn.execute("DELETE FROM settings WHERE key='courses_resume_page'")
     return deleted
+
+
+def wipe_except_courses_colleges(db_path: str = DB_PATH) -> Dict[str, int]:
+    """Back-compat wrapper: keep courses + colleges, clear the rest."""
+    return wipe_data(keep_colleges=True, db_path=db_path)
 
 
 # ---------------------------------------------------------------------------
