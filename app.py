@@ -390,6 +390,106 @@ m2.metric("Unique colleges", f"{c['colleges']:,}")
 m3.metric("Offerings (course×college)", f"{c['offerings']:,}")
 m4.metric("Courses done (phase 2)", f"{c['courses_done_phase2']:,}")
 
+
+def render_job_monitor(job_types, key: str, govern: bool = True) -> None:
+    """Per-phase live monitor: progress, staged data (live), logs, controls —
+    scoped to this phase's job (its watch id, else the latest job of job_types)."""
+    watch_id = st.session_state.get(f"watch_{key}")
+    job = db.get_job(watch_id) if watch_id else None
+    if not job:
+        for j in db.list_jobs(30):
+            if j["type"] in job_types:
+                job = j
+                break
+    st.divider()
+    st.markdown("##### 📡 Live progress & logs")
+    if not job:
+        st.info("No run yet for this phase. Start one above.")
+        return
+    total = job["total_units"] or 0
+    done = job["done_units"] or 0
+    pct = (done / total) if total else 0.0
+    st.progress(min(pct, 1.0), text=f"Job #{job['id']} ({job['type']}) — {job['status']}")
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Processed", f"{done:,}" + (f" / {total:,}" if total else ""))
+    k2.metric("Items written", f"{job['items_written']:,}")
+    k3.metric("Bandwidth", human_mb(job.get("bytes_count")))
+    k4.metric("ETA", fmt_eta(done, total, job["started_at"]))
+    k5.metric("Status", job["status"])
+    st.caption(job.get("message") or "")
+
+    if govern and job["type"] != "enrichment":
+        gj1, gj2 = st.columns(2)
+        qscore = job.get("quality_score")
+        gj1.metric("Quality score", f"{qscore:.0f}/100" if qscore is not None else "—")
+        gj2.metric("Promotion", job.get("promote_status")
+                   or ("staging…" if job["status"] in ("running", "queued") else "—"))
+        staged = db.staged_summary(job["id"])
+        if staged:
+            jid_ = job["id"]
+            st.markdown(f"###### 🔬 Staged data (live) — {sum(staged.values()):,} rows")
+            with st.container(border=True):
+                st.write({k: f"{v:,}" for k, v in staged.items()})
+                stbl = st.selectbox("Table", list(staged.keys()), key=f"stbl{key}{jid_}")
+                srows = db.get_staged_rows(jid_, stbl, limit=500)
+                if srows:
+                    st.dataframe(pd.DataFrame(srows), use_container_width=True, height=300)
+                    st.download_button(
+                        f"⬇️ Download staged {stbl} (CSV)",
+                        data=pd.DataFrame(db.get_staged_rows(jid_, stbl, limit=100000))
+                             .to_csv(index=False).encode("utf-8"),
+                        file_name=f"job{jid_}_{stbl}_staged.csv", mime="text/csv",
+                        key=f"dl{key}{jid_}{stbl}")
+                if st.button("🔍 Diff vs master", key=f"diffb{key}{jid_}"):
+                    st.session_state[f"diff{jid_}"] = db.diff_job(jid_)
+                if st.session_state.get(f"diff{jid_}"):
+                    st.json(st.session_state[f"diff{jid_}"])
+                if job.get("promote_status") in ("pending", "rejected"):
+                    ap1, ap2 = st.columns(2)
+                    if ap1.button("✅ Approve & promote", key=f"appr{key}{jid_}"):
+                        summ = db.promote_job(jid_)
+                        st.success(f"Promoted {sum(summ.values()):,} rows to master.")
+                        st.rerun()
+                    if ap2.button("🗑️ Reject (discard staged)", key=f"rej{key}{jid_}"):
+                        db.discard_staging(jid_)
+                        db.update_job(jid_, promote_status="rejected")
+                        st.warning("Staged data discarded.")
+                        st.rerun()
+
+    if job["type"] == "enrichment":
+        st.markdown("###### 🔬 Recently enriched (live)")
+        with st.container(border=True), db.connect() as conn:
+            edf = pd.read_sql_query(
+                "SELECT college_id, name, city, website, email, phone, rating_value "
+                "FROM colleges WHERE enriched_at IS NOT NULL "
+                "ORDER BY enriched_at DESC LIMIT 200", conn)
+        st.dataframe(edf, use_container_width=True, height=280)
+
+    if job["status"] in ("running", "queued"):
+        if st.button("⏹️ Stop this job", key=f"stop{key}"):
+            db.request_stop(job["id"])
+            st.warning("Stop requested — the worker will finish its current page and exit.")
+    if job["status"] in ("stopped", "error"):
+        if st.button("▶️ Resume this job", key=f"resume{key}"):
+            db.resume_job(job["id"])
+            launch_worker(job["id"])
+            st.session_state[f"watch_{key}"] = job["id"]
+            st.success("Resumed — continues from saved progress.")
+            st.rerun()
+    nlines = st.slider("Live log lines", 30, 500, 150, key=f"loglines{key}")
+    logs = db.get_logs(job["id"], limit=int(nlines))
+    log_text = "\n".join(l["message"] for l in reversed(logs)) or "(waiting for logs…)"
+    st.code(log_text, language="text")
+    lc1, lc2 = st.columns(2)
+    if lc1.button("🗑️ Clear this job's logs", key=f"clr{key}"):
+        db.clear_logs(job["id"])
+        st.rerun()
+    lc2.caption(f"{len(logs)} lines shown · auto-refreshes while running")
+    if job["status"] in ("running", "queued"):
+        time.sleep(3)
+        st.rerun()
+
+
 (tab_run, tab_query, tab_live, tab_report, tab_index, tab_data,
  tab_quality, tab_history) = st.tabs(
     ["▶️ Run", "🔎 Query", "🧪 Live scraper", "📈 Reporting", "🗂️ Indexing",
@@ -400,35 +500,30 @@ m4.metric("Courses done (phase 2)", f"{c['courses_done_phase2']:,}")
 # Run tab
 # ---------------------------------------------------------------------------
 with tab_run:
-    st.markdown(
-        "<div style='padding:16px 20px;border-radius:14px;"
-        "background:linear-gradient(100deg,#0f172a,#1e293b 55%,#312e81);"
-        "color:#e2e8f0;margin-bottom:14px;box-shadow:0 2px 14px rgba(0,0,0,.18)'>"
-        "<div style='font-size:18px;font-weight:700'>🛰️ Scraper Control</div>"
-        "<div style='font-size:13px;opacity:.85;margin-top:4px'>"
-        "Flow&nbsp;&nbsp;①&nbsp;Courses&nbsp;→&nbsp;②&nbsp;Colleges/course&nbsp;→&nbsp;"
-        "③&nbsp;Enrichment&nbsp;→&nbsp;④&nbsp;Courses&nbsp;&amp;&nbsp;fees"
-        "&nbsp;&nbsp;·&nbsp;&nbsp;every run <b>stages → validates → promotes</b> to master."
-        "</div></div>", unsafe_allow_html=True)
+    st.caption("Each phase has its own screen, live progress, staged-data view and logs. "
+               "Flow: ① Courses → ② Colleges/course → ③ Enrichment → ④ Courses & fees · "
+               "every run stages → validates → promotes to master.")
+    p1, p2, p3, p4 = st.tabs(
+        ["①  Courses", "②  Colleges / course", "③  Enrichment", "④  Courses & Fees"])
 
-    with st.expander("🚀  One-click full pipeline  (Phase 1 → Phase 2)", expanded=False):
-        st.caption("Runs partitioned Phase 1 then Phase 2 with your current settings. "
-                   "Proxy must be on.")
-        if st.button("🚀 Run full pipeline", type="primary", key="runpipe"):
-            cfg = proxy_config_from_ui()
-            jid = db.create_job("pipeline", cfg)
-            launch_worker(jid)
-            st.session_state["watch_job"] = jid
-            st.success(f"Started full pipeline — job #{jid}")
-
-    st.markdown("##### 🧩 Individual phases")
-    colA, colB = st.columns(2)
-
-    # ---- Phase 1 ----
-    with colA:
+    # ============================ Phase 1 ============================
+    with p1:
         st.subheader("Phase 1 — Courses")
+        st.info("**Use case:** build the master list of every course Collegedunia lists. "
+                "Run **Scrape ALL courses (partitioned)** once to pull the full ~21,500-course "
+                "catalogue — it's the foundation Phases 2–4 build on. Outputs the `courses` table.")
         st.caption("Scrapes every course (~21,500). Fast on a clean IP; "
                    "datacenter IPs (incl. Streamlit Cloud) get rate-limited.")
+        with st.expander("🚀  One-click full pipeline  (Phase 1 → Phase 2)", expanded=False):
+            st.caption("Runs partitioned Phase 1 then Phase 2 with your current settings. "
+                       "Proxy must be on.")
+            if st.button("🚀 Run full pipeline", type="primary", key="runpipe"):
+                cfg = proxy_config_from_ui()
+                jid = db.create_job("pipeline", cfg)
+                launch_worker(jid)
+                st.session_state["watch_p1"] = jid
+                st.session_state["watch_p2"] = jid
+                st.success(f"Started full pipeline — job #{jid}")
         resume_page = int(db.get_setting("courses_resume_page", 1))
         if resume_page > 1:
             st.info(f"⏯️ A previous run stopped early. Starting will **resume from "
@@ -445,9 +540,8 @@ with tab_run:
             cfg["force_restart"] = restart1
             jid = db.create_job("courses", cfg)
             launch_worker(jid)
-            st.session_state["watch_job"] = jid
+            st.session_state["watch_p1"] = jid
             st.success(f"Started job #{jid}")
-
         st.markdown("---")
         st.markdown("**Complete scrape (recommended)**")
         st.caption("The plain scrape above hits the site's ~1,700-result page limit "
@@ -458,14 +552,19 @@ with tab_run:
             cfg["partition"] = True
             jid = db.create_job("courses", cfg)
             launch_worker(jid)
-            st.session_state["watch_job"] = jid
+            st.session_state["watch_p1"] = jid
             st.success(f"Started complete scrape — job #{jid}")
+        render_job_monitor(["courses", "pipeline"], "p1")
 
-    # ---- Phase 2 ----
-    with colB:
+    # ============================ Phase 2 ============================
+    with p2:
         st.subheader("Phase 2 — Colleges per course")
-        st.caption("For each course, scrapes all colleges offering it. "
-                   "Huge: can be hundreds of thousands of requests. Scope it!")
+        st.info("**Use case:** for every course, find all colleges that offer it — with fees, "
+                "ranking, rating, cutoff and admission dates. Builds the `offerings` and unique "
+                "`colleges` tables. The heavy phase: scope it (Top-N or by stream) and keep workers low.")
+        st.caption("For each course, scrapes all colleges offering it. Huge: can be hundreds "
+                   "of thousands of requests. Scope it! Keep parallel workers at 3–5 to avoid "
+                   "proxy rate-limits (403s); one stuck course no longer aborts the run.")
         if c["courses"] == 0:
             st.info("Run Phase 1 first so there are courses to expand.")
         scope = st.radio("Scope", ["Top N courses by college count", "Filter by stream/type", "All courses"],
@@ -499,8 +598,6 @@ with tab_run:
                                           "stream": "Grouped by stream"}.get,
                              key="order2")
         cfg2_extra["order"] = order
-
-        # ---- Bandwidth forecast for the selected scope ----
         try:
             if scope == "Top N courses by college count":
                 ids = cfg2_extra.get("course_ids") or []
@@ -524,24 +621,20 @@ with tab_run:
                     f"Set a budget cap below if this nears your proxy quota.")
         except Exception:
             pass
-
         cc1, cc2 = st.columns(2)
-        concurrency = cc1.number_input("Parallel workers", 1, 20, 1, key="conc2",
-                                       help="Concurrent requests. Use >1 only with a working proxy.")
+        concurrency = cc1.number_input("Parallel workers", 1, 20, 3, key="conc2",
+                                       help="Concurrent requests. 3–5 is a good range; higher risks 403 rate-limits.")
         skip_empty = cc2.checkbox("Skip 0-college courses", value=True, key="skip2")
-
         st.markdown("**Budget caps** (0 = unlimited)")
         b1, b2 = st.columns(2)
         budget_mb = b1.number_input("Max bandwidth (MB)", 0, 100000, 0, step=50, key="bmb",
                                     help="Stop when this much has been downloaded. Protects proxy spend.")
         budget_req = b2.number_input("Max requests", 0, 5_000_000, 0, step=1000, key="breq")
-
         with st.expander("Advanced: extra API filters (city/state etc.)"):
             scope_raw = st.text_area(
                 "Extra filters (JSON merged into each request)",
                 placeholder='{"city": 4337}   # optional, advanced',
                 key="scopejson")
-
         test2 = st.checkbox("Test run (max 2 pages per course)", key="t2")
         force = st.checkbox("Force re-scrape (ignore resume)", key="f2")
         if st.button("▶️ Start college scrape", type="primary", key="run2",
@@ -562,221 +655,126 @@ with tab_run:
             cfg["force_rescrape"] = force
             jid = db.create_job("offerings", cfg)
             launch_worker(jid)
-            st.session_state["watch_job"] = jid
+            st.session_state["watch_p2"] = jid
             st.success(f"Started job #{jid}")
+        render_job_monitor(["offerings", "pipeline"], "p2")
 
-    st.divider()
-    st.markdown("#### 🏫 Phase 3 — College enrichment")
-    st.caption("Fetches each college's page for official website, email, phone, rating, "
-               "pros/cons, and address (no reviews). Pages are ~300 KB each.")
-    with db.connect() as conn:
-        n_total = conn.execute("SELECT COUNT(*) FROM colleges").fetchone()[0]
-        n_done = conn.execute(
-            "SELECT COUNT(*) FROM colleges WHERE enriched_at IS NOT NULL").fetchone()[0]
-    pending = n_total - n_done
-    e1, e2, e3 = st.columns(3)
-    e1.metric("Colleges", f"{n_total:,}")
-    e2.metric("Enriched", f"{n_done:,}")
-    e3.metric("Pending", f"{pending:,}")
-    if n_total == 0:
-        st.info("Run Phase 2 first so there are colleges to enrich.")
-    escope = st.radio("Scope", ["All not-yet-enriched", "Filter by city", "Test (50)"],
-                      horizontal=True, key="escope")
-    ecfg: dict = {}
-    if escope == "Filter by city":
-        ecity = st.text_input("City contains", key="ecity")
-        if ecity:
-            ecfg["college_where"] = "city LIKE ?"
-            ecfg["college_where_params"] = [f"%{ecity}%"]
-    elif escope == "Test (50)":
-        ecfg["limit"] = 50
-    target = ecfg.get("limit") or (pending if escope != "Filter by city" else pending)
-    est_mb = target * 300 / 1024
-    st.info(f"📊 ~{target:,} colleges → ~**{est_mb:.0f} MB** "
-            f"({est_mb/1024:.2f} GB) at ~300 KB each. Mind your proxy quota.")
-    ec1, ec2 = st.columns(2)
-    e_conc = ec1.number_input("Parallel workers", 1, 20, 3, key="econc")
-    e_bud = ec2.number_input("Max bandwidth MB (0=∞)", 0, 100000, 0, step=100, key="ebud")
-    e_force = st.checkbox("Re-enrich already-done", key="eforce")
-    if st.button("🏫 Start college enrichment", key="rune", disabled=n_total == 0):
-        cfg = proxy_config_from_ui()
-        cfg.update(ecfg)
-        cfg["concurrency"] = int(e_conc)
-        cfg["budget_mb"] = float(e_bud)
-        cfg["force_rescrape"] = e_force
-        jid = db.create_job("enrichment", cfg)
-        launch_worker(jid)
-        st.session_state["watch_job"] = jid
-        st.success(f"Started enrichment — job #{jid}")
+    # ============================ Phase 3 ============================
+    with p3:
+        st.subheader("Phase 3 — College enrichment")
+        st.info("**Use case:** fill in each known college's official details — website, email, "
+                "phone, rating, pros/cons and address — from its college page. Run after Phase 2; "
+                "updates the `colleges` table in place (no staging).")
+        st.caption("Fetches each college's page for official website, email, phone, rating, "
+                   "pros/cons, and address (no reviews). Pages are ~300 KB each. "
+                   "Writes straight to master (no staging step).")
+        with db.connect() as conn:
+            n_total = conn.execute("SELECT COUNT(*) FROM colleges").fetchone()[0]
+            n_done = conn.execute(
+                "SELECT COUNT(*) FROM colleges WHERE enriched_at IS NOT NULL").fetchone()[0]
+        pending = n_total - n_done
+        e1, e2, e3 = st.columns(3)
+        e1.metric("Colleges", f"{n_total:,}")
+        e2.metric("Enriched", f"{n_done:,}")
+        e3.metric("Pending", f"{pending:,}")
+        if n_total == 0:
+            st.info("Run Phase 2 first so there are colleges to enrich.")
+        escope = st.radio("Scope", ["All not-yet-enriched", "Filter by city", "Test (50)"],
+                          horizontal=True, key="escope")
+        ecfg: dict = {}
+        if escope == "Filter by city":
+            ecity = st.text_input("City contains", key="ecity")
+            if ecity:
+                ecfg["college_where"] = "city LIKE ?"
+                ecfg["college_where_params"] = [f"%{ecity}%"]
+        elif escope == "Test (50)":
+            ecfg["limit"] = 50
+        target = ecfg.get("limit") or (pending if escope != "Filter by city" else pending)
+        est_mb = target * 300 / 1024
+        st.info(f"📊 ~{target:,} colleges → ~**{est_mb:.0f} MB** "
+                f"({est_mb/1024:.2f} GB) at ~300 KB each. Mind your proxy quota.")
+        ec1, ec2 = st.columns(2)
+        e_conc = ec1.number_input("Parallel workers", 1, 20, 3, key="econc")
+        e_bud = ec2.number_input("Max bandwidth MB (0=∞)", 0, 100000, 0, step=100, key="ebud")
+        e_force = st.checkbox("Re-enrich already-done", key="eforce")
+        if st.button("🏫 Start college enrichment", key="rune", disabled=n_total == 0):
+            cfg = proxy_config_from_ui()
+            cfg.update(ecfg)
+            cfg["concurrency"] = int(e_conc)
+            cfg["budget_mb"] = float(e_bud)
+            cfg["force_rescrape"] = e_force
+            jid = db.create_job("enrichment", cfg)
+            launch_worker(jid)
+            st.session_state["watch_p3"] = jid
+            st.success(f"Started enrichment — job #{jid}")
+        render_job_monitor(["enrichment"], "p3", govern=False)
 
-    st.divider()
-    st.markdown("#### 🏫 Phase 4 — College courses & fees (college-side)")
-    st.caption("Fetches each college's /courses-fees page → its courses + total/hostel fees. "
-               "ID-addressable (the id alone resolves), so this is the most complete path. "
-               "~0.3–0.9 MB per college.")
-    with db.connect() as conn:
-        cc_known = conn.execute("SELECT COUNT(*) FROM colleges").fetchone()[0]
-        cc_done = conn.execute(
-            "SELECT COUNT(*) FROM cc_progress WHERE status IN ('done','empty')").fetchone()[0]
-        cc_rows = conn.execute("SELECT COUNT(*) FROM college_courses").fetchone()[0]
-    g1, g2, g3 = st.columns(3)
-    g1.metric("Known colleges", f"{cc_known:,}")
-    g2.metric("Processed", f"{cc_done:,}")
-    g3.metric("Course-rows", f"{cc_rows:,}")
-    cscope = st.radio("Source", ["Known colleges (from Phase 2)", "College ID range"],
-                      horizontal=True, key="ccscope")
-    ccfg: dict = {}
-    n_target = max(0, cc_known - cc_done)
-    if cscope == "College ID range":
-        r1, r2 = st.columns(2)
-        ccfg["id_start"] = r1.number_input("ID start", 1, 100000, 1, key="ccs")
-        ccfg["id_end"] = r2.number_input("ID end", 1, 100000, 2000, key="cce")
-        ccfg["use_known"] = False
-        n_target = int(ccfg["id_end"]) - int(ccfg["id_start"]) + 1
-    est_mb = n_target * 500 / 1024
-    st.info(f"📊 ~{n_target:,} colleges → ~**{est_mb:.0f} MB** ({est_mb/1024:.2f} GB) "
-            f"at ~0.5 MB each. Set a budget cap for big ranges.")
-    ct1, ct2 = st.columns(2)
-    cc_conc = ct1.number_input("Parallel workers", 1, 20, 3, key="cconc")
-    cc_bud = ct2.number_input("Max bandwidth MB (0=∞)", 0, 200000, 0, step=200, key="ccbud")
-    test4 = st.checkbox("Test run (first 25 known colleges)", key="t4")
-    cforce = st.checkbox("Re-scrape already-done", key="ccf")
-    if st.button("🏫 Start courses-fees scrape", key="run4",
-                 disabled=(cc_known == 0 and cscope.startswith("Known"))):
-        cfg = proxy_config_from_ui()
-        cfg.update(ccfg)
-        if test4:
-            cfg["college_ids"] = db.list_known_college_ids()[:25]
-            cfg["use_known"] = False
-        cfg["concurrency"] = int(cc_conc)
-        cfg["budget_mb"] = float(cc_bud)
-        cfg["force_rescrape"] = cforce
-        jid = db.create_job("college_courses", cfg)
-        launch_worker(jid)
-        st.session_state["watch_job"] = jid
-        st.success(f"Started courses-fees scrape — job #{jid}")
-
-    if cc_rows > 0:
-        with st.expander("🔀 Reconcile: college-side vs course-side"):
-            with db.connect() as conn:
-                cc_colleges = conn.execute(
-                    "SELECT COUNT(DISTINCT college_id) FROM college_courses").fetchone()[0]
-                off_colleges = conn.execute(
-                    "SELECT COUNT(DISTINCT college_id) FROM offerings").fetchone()[0]
-                only_cc = conn.execute(
-                    "SELECT COUNT(*) FROM (SELECT DISTINCT college_id FROM college_courses "
-                    "WHERE college_id NOT IN (SELECT DISTINCT college_id FROM offerings))").fetchone()[0]
-            rc1, rc2, rc3 = st.columns(3)
-            rc1.metric("Colleges (Phase 4)", f"{cc_colleges:,}")
-            rc2.metric("Colleges (Phase 2)", f"{off_colleges:,}")
-            rc3.metric("In Phase 4 only", f"{only_cc:,}",
-                       help="Colleges the course-finder never surfaced — the gap this fills.")
-
-    st.divider()
-
-    # ---- Live monitor ----
-    st.subheader("Live progress")
-    running = [j for j in db.list_jobs(10) if j["status"] in ("queued", "running")]
-    watch_id = st.session_state.get("watch_job")
-    job = None
-    if watch_id:
-        job = db.get_job(watch_id)
-    elif running:
-        job = running[0]
-
-    if job:
-        total = job["total_units"] or 0
-        done = job["done_units"] or 0
-        pct = (done / total) if total else 0.0
-        st.progress(min(pct, 1.0), text=f"Job #{job['id']} ({job['type']}) — {job['status']}")
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Processed", f"{done:,}" + (f" / {total:,}" if total else ""))
-        k2.metric("Items written", f"{job['items_written']:,}")
-        k3.metric("Bandwidth", human_mb(job.get("bytes_count")))
-        k4.metric("ETA", fmt_eta(done, total, job["started_at"]))
-        k5.metric("Status", job["status"])
-        st.caption(job.get("message") or "")
-
-        # ---- Governance: quality, staged data (live), diff, approve/reject ----
-        if job["type"] != "enrichment":
-            gj1, gj2 = st.columns(2)
-            qscore = job.get("quality_score")
-            gj1.metric("Quality score", f"{qscore:.0f}/100" if qscore is not None else "—")
-            gj2.metric("Promotion", job.get("promote_status")
-                       or ("staging…" if job["status"] in ("running", "queued") else "—"))
-            staged = db.staged_summary(job["id"])
-            if staged:
-                jid_ = job["id"]
-                st.markdown(f"##### 🔬 Staged data for job #{jid_} (live) — "
-                            f"{sum(staged.values()):,} rows")
-                with st.container(border=True):
-                    st.write({k: f"{v:,}" for k, v in staged.items()})
-                    stbl = st.selectbox("Table", list(staged.keys()), key=f"stbl{jid_}")
-                    srows = db.get_staged_rows(jid_, stbl, limit=500)
-                    if srows:
-                        st.dataframe(pd.DataFrame(srows), use_container_width=True, height=300)
-                        st.download_button(
-                            f"⬇️ Download staged {stbl} (CSV)",
-                            data=pd.DataFrame(db.get_staged_rows(jid_, stbl, limit=100000))
-                                 .to_csv(index=False).encode("utf-8"),
-                            file_name=f"job{jid_}_{stbl}_staged.csv", mime="text/csv",
-                            key=f"dl{jid_}{stbl}")
-                    if st.button("🔍 Diff vs master", key=f"diffb{jid_}"):
-                        st.session_state[f"diff{jid_}"] = db.diff_job(jid_)
-                    if st.session_state.get(f"diff{jid_}"):
-                        st.json(st.session_state[f"diff{jid_}"])
-                    if job.get("promote_status") in ("pending", "rejected"):
-                        ap1, ap2 = st.columns(2)
-                        if ap1.button("✅ Approve & promote", key=f"appr{jid_}"):
-                            summ = db.promote_job(jid_)
-                            st.success(f"Promoted {sum(summ.values()):,} rows to master.")
-                            st.rerun()
-                        if ap2.button("🗑️ Reject (discard staged)", key=f"rej{jid_}"):
-                            db.discard_staging(jid_)
-                            db.update_job(jid_, promote_status="rejected")
-                            st.warning("Staged data discarded.")
-                            st.rerun()
-        if job["status"] in ("running", "queued"):
-            if st.button("⏹️ Stop this job"):
-                db.request_stop(job["id"])
-                st.warning("Stop requested — the worker will finish its current page and exit.")
-        if job["status"] in ("stopped", "error"):
-            if st.button("▶️ Resume this job"):
-                db.resume_job(job["id"])
-                launch_worker(job["id"])
-                st.session_state["watch_job"] = job["id"]
-                st.success("Resumed — continues from saved progress.")
-                st.rerun()
-        nlines = st.slider("Live log lines", 30, 500, 150, key="loglines")
-        logs = db.get_logs(job["id"], limit=int(nlines))   # newest-first
-        log_text = "\n".join(l["message"] for l in reversed(logs)) or "(waiting for logs…)"
-        st.code(log_text, language="text")
-        lc1, lc2 = st.columns(2)
-        if lc1.button("🗑️ Clear this job's logs"):
-            db.clear_logs(job["id"])
-            st.rerun()
-        lc2.caption(f"{len(logs)} lines shown · auto-refreshes while running")
-        if job["status"] in ("running", "queued"):
-            time.sleep(3)
-            st.rerun()
-    else:
-        st.info("No active job. Start one above.")
-
-    # Resume any interrupted/failed job from history
-    resumable = [j for j in db.list_jobs(20)
-                 if j["status"] in ("stopped", "error")]
-    if resumable:
-        with st.expander("⏯️ Resume an interrupted job"):
-            opt = st.selectbox(
-                "Pick a job", resumable,
-                format_func=lambda j: f"#{j['id']} {j['type']} — {j['status']} — "
-                                      f"{(j.get('message') or '')[:50]}")
-            if st.button("▶️ Resume selected"):
-                db.resume_job(opt["id"])
-                launch_worker(opt["id"])
-                st.session_state["watch_job"] = opt["id"]
-                st.success(f"Resumed job #{opt['id']}.")
-                st.rerun()
+    # ============================ Phase 4 ============================
+    with p4:
+        st.subheader("Phase 4 — College courses & fees (college-side)")
+        st.info("**Use case:** the most detailed per-college fee view — each college's own "
+                "courses-&-fees page: total + hostel fees, eligibility, duration, mode, level, "
+                "ratings, application dates and specializations. Fills gaps the course-finder misses.")
+        st.caption("Reads each college's /courses-fees page structured data → courses + "
+                   "total/hostel fees, duration, eligibility, ratings and application dates. "
+                   "~0.3–0.9 MB per college.")
+        with db.connect() as conn:
+            cc_known = conn.execute("SELECT COUNT(*) FROM colleges").fetchone()[0]
+            cc_done = conn.execute(
+                "SELECT COUNT(*) FROM cc_progress WHERE status IN ('done','empty')").fetchone()[0]
+            cc_rows = conn.execute("SELECT COUNT(*) FROM college_courses").fetchone()[0]
+        g1, g2, g3 = st.columns(3)
+        g1.metric("Known colleges", f"{cc_known:,}")
+        g2.metric("Processed", f"{cc_done:,}")
+        g3.metric("Course-rows", f"{cc_rows:,}")
+        cscope = st.radio("Source", ["Known colleges (from Phase 2)", "College ID range"],
+                          horizontal=True, key="ccscope")
+        ccfg: dict = {}
+        n_target = max(0, cc_known - cc_done)
+        if cscope == "College ID range":
+            r1, r2 = st.columns(2)
+            ccfg["id_start"] = r1.number_input("ID start", 1, 100000, 1, key="ccs")
+            ccfg["id_end"] = r2.number_input("ID end", 1, 100000, 2000, key="cce")
+            ccfg["use_known"] = False
+            n_target = int(ccfg["id_end"]) - int(ccfg["id_start"]) + 1
+        est_mb = n_target * 500 / 1024
+        st.info(f"📊 ~{n_target:,} colleges → ~**{est_mb:.0f} MB** ({est_mb/1024:.2f} GB) "
+                f"at ~0.5 MB each. Set a budget cap for big ranges.")
+        ct1, ct2 = st.columns(2)
+        cc_conc = ct1.number_input("Parallel workers", 1, 20, 3, key="cconc")
+        cc_bud = ct2.number_input("Max bandwidth MB (0=∞)", 0, 200000, 0, step=200, key="ccbud")
+        test4 = st.checkbox("Test run (first 25 known colleges)", key="t4")
+        cforce = st.checkbox("Re-scrape already-done", key="ccf")
+        if st.button("🏫 Start courses-fees scrape", key="run4",
+                     disabled=(cc_known == 0 and cscope.startswith("Known"))):
+            cfg = proxy_config_from_ui()
+            cfg.update(ccfg)
+            if test4:
+                cfg["college_ids"] = db.list_known_college_ids()[:25]
+                cfg["use_known"] = False
+            cfg["concurrency"] = int(cc_conc)
+            cfg["budget_mb"] = float(cc_bud)
+            cfg["force_rescrape"] = cforce
+            jid = db.create_job("college_courses", cfg)
+            launch_worker(jid)
+            st.session_state["watch_p4"] = jid
+            st.success(f"Started courses-fees scrape — job #{jid}")
+        if cc_rows > 0:
+            with st.expander("🔀 Reconcile: college-side vs course-side"):
+                with db.connect() as conn:
+                    cc_colleges = conn.execute(
+                        "SELECT COUNT(DISTINCT college_id) FROM college_courses").fetchone()[0]
+                    off_colleges = conn.execute(
+                        "SELECT COUNT(DISTINCT college_id) FROM offerings").fetchone()[0]
+                    only_cc = conn.execute(
+                        "SELECT COUNT(*) FROM (SELECT DISTINCT college_id FROM college_courses "
+                        "WHERE college_id NOT IN (SELECT DISTINCT college_id FROM offerings))").fetchone()[0]
+                rc1, rc2, rc3 = st.columns(3)
+                rc1.metric("Colleges (Phase 4)", f"{cc_colleges:,}")
+                rc2.metric("Colleges (Phase 2)", f"{off_colleges:,}")
+                rc3.metric("In Phase 4 only", f"{only_cc:,}",
+                           help="Colleges the course-finder never surfaced — the gap this fills.")
+        render_job_monitor(["college_courses"], "p4")
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +782,9 @@ with tab_run:
 # ---------------------------------------------------------------------------
 with tab_query:
     st.subheader("🔎 Query builder")
+    st.info("**Use case:** answer specific questions by filtering offerings / courses / colleges "
+            "with live controls (course, college, city, max fee, min rating, max rank), preview "
+            "up to 1,000 rows, and export the exact slice as CSV — e.g. *BBA colleges in Pune under ₹2L*.")
     st.caption("Filter the data with live controls, preview, and export the exact slice.")
     base = st.radio("Dataset", ["Offerings (course × college)", "Courses", "Colleges"],
                     horizontal=True, key="qbase")
@@ -854,6 +855,9 @@ with tab_query:
 # ---------------------------------------------------------------------------
 with tab_live:
     st.subheader("🧪 Live scraper — extract anything by CSS")
+    st.info("**Use case:** scrape any page the fixed phases don't cover. Paste a URL, analyze "
+            "its structure, pick CSS classes (or type a selector), choose text / text+links / HTML, "
+            "and export the result to CSV — a quick general-purpose scraper for one-off pages.")
     st.caption("Enter a page URL, analyze its structure, then pick classes (or type a CSS "
                "selector) and pull the data. Useful for one-off pages the fixed phases don't cover.")
     lc1, lc2 = st.columns([3, 1])
@@ -932,6 +936,9 @@ with tab_live:
 # ---------------------------------------------------------------------------
 with tab_report:
     st.subheader("📈 Reporting")
+    st.info("**Use case:** at-a-glance analytics — courses by stream / type / level, unique colleges "
+            "by city, 1st-year fee distribution, top-ranked offerings and geography — plus a one-click "
+            "analytics Excel export. Read-only; reflects whatever has been scraped so far.")
     rc = db.counts()
     if rc["courses"] == 0:
         st.info("No data yet — run a scrape first.")
@@ -991,6 +998,9 @@ with tab_report:
 # ---------------------------------------------------------------------------
 with tab_index:
     st.subheader("🗂️ Indexing & coverage")
+    st.info("**Use case:** track progress and completeness — how many courses are Phase-2 done vs "
+            "partial vs pending, per-stream coverage, a searchable index of courses & colleges, and "
+            "the biggest still-pending courses to prioritise next.")
     ic = db.counts()
     with db.connect() as conn:
         done = conn.execute("SELECT COUNT(*) FROM offering_progress WHERE status='done'").fetchone()[0]
@@ -1051,6 +1061,10 @@ with tab_index:
 # Data tab
 # ---------------------------------------------------------------------------
 with tab_data:
+    st.subheader("📊 Data & export")
+    st.info("**Use case:** browse the raw master tables (`courses`, `colleges`, `offerings`, "
+            "`college_courses`), quick-filter by name/city, and export the whole table to "
+            "CSV / JSON / Excel (single table or all tables in one workbook).")
     table = st.selectbox("Table", ["courses", "colleges", "offerings", "college_courses"])
     with db.connect() as conn:
         ncols = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -1106,6 +1120,10 @@ with tab_data:
 # ---------------------------------------------------------------------------
 with tab_quality:
     st.subheader("🩺 Data quality & maintenance")
+    st.info("**Use case:** keep the dataset healthy — normalize text fees to numeric INR, run "
+            "health checks (missing fees/ratings/cities, duplicates), export a master analytical "
+            "sheet, snapshot dataset size over time, schedule auto-refresh, and reset data "
+            "(keep only courses & colleges).")
 
     st.markdown("**Fee normalization** — parse mixed fee strings into numeric INR.")
     qn1, qn2 = st.columns([1, 2])
@@ -1190,11 +1208,16 @@ with tab_quality:
         cleared = ", ".join(f"{k}={v:,}" for k, v in d.items() if v)
         st.success("Reset complete. " + (f"Cleared: {cleared}." if cleared
                                          else "Nothing else needed clearing."))
-        st.session_state.pop("watch_job", None)
+        for _k in ("watch_p1", "watch_p2", "watch_p3", "watch_p4"):
+            st.session_state.pop(_k, None)
         st.rerun()
 
 
 with tab_history:
+    st.subheader("🕓 History")
+    st.info("**Use case:** every run's status and counters, full logs per job (view / clear / "
+            "download), and **job-wise data download** — pull the exact rows a job produced, "
+            "either its staged set or what it promoted to master (matched on source_job_id).")
     jobs = db.list_jobs(50)
     if not jobs:
         st.info("No runs yet.")
