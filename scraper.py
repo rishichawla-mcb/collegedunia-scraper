@@ -40,7 +40,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 import requests
-from bs4 import BeautifulSoup
 
 import db
 
@@ -549,10 +548,23 @@ def _to_float(v: Any) -> Optional[float]:
 # Live / generic extraction — point at any URL, inspect its structure, and
 # pull elements by CSS class or a custom selector. Powers the "Live scraper" UI.
 # ---------------------------------------------------------------------------
+def _make_soup(html: str):
+    """Lazily import BeautifulSoup so the app still boots if the optional
+    'beautifulsoup4' dependency isn't installed — only the live scraper needs it."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "The live scraper needs the 'beautifulsoup4' package, which isn't "
+            "installed. Add 'beautifulsoup4' to requirements.txt and redeploy."
+        ) from exc
+    return BeautifulSoup(html or "", "html.parser")
+
+
 def analyze_page(html: str, top: int = 500) -> Dict[str, Any]:
     """Inventory a page so the user can decide what to extract. Returns
     {'title', 'classes': [{class, count, tags, sample}], 'tags': {tag: count}}."""
-    soup = BeautifulSoup(html or "", "html.parser")
+    soup = _make_soup(html)
     title = ""
     if soup.title and soup.title.string:
         title = soup.title.string.strip()
@@ -597,7 +609,7 @@ def _el_to_row(el, mode: str) -> Dict[str, Any]:
 def extract_by_selector(html: str, selector: str, mode: str = "text",
                         limit: int = 5000) -> List[Dict[str, Any]]:
     """Extract elements matching a CSS selector. mode: 'text' | 'links' | 'html'."""
-    soup = BeautifulSoup(html or "", "html.parser")
+    soup = _make_soup(html)
     return [_el_to_row(el, mode) for el in soup.select(selector)[:limit]]
 
 
@@ -605,7 +617,7 @@ def extract_by_classes(html: str, classes: List[str], mode: str = "text",
                        limit: int = 5000) -> List[Dict[str, Any]]:
     """Extract every element carrying any of the given classes (robust to odd
     class names that a raw CSS selector would choke on)."""
-    soup = BeautifulSoup(html or "", "html.parser")
+    soup = _make_soup(html)
     want = set(classes)
     out: List[Dict[str, Any]] = []
     for el in soup.find_all(True):
