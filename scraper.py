@@ -1006,7 +1006,7 @@ def run_offerings(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
     stop_event = threading.Event()
     db_lock = threading.Lock()
     prog_lock = threading.Lock()
-    state = {"processed": 0, "offerings": 0, "incomplete": False, "msg": ""}
+    state = {"processed": 0, "offerings": 0, "blocked": 0, "incomplete": False, "msg": ""}
 
     def budget_hit() -> Optional[str]:
         reqs, byts, _ = stats.snapshot()
@@ -1067,12 +1067,22 @@ def run_offerings(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
                     if rows:
                         ok = True; break
                 if not ok:
+                    # One stubbornly-empty/blocked course shouldn't kill the whole
+                    # run. Mark it 'partial' (so a later resume / next non-force run
+                    # retries just this course) and move on. Only abort the entire
+                    # job if MANY courses block while nothing is coming through —
+                    # that signals a global IP throttle, not a single bad course.
                     with db_lock:
                         db.set_offering_progress(cid, "partial", page - 1, course_total, db_path=db_path)
                     with prog_lock:
-                        state["incomplete"] = True
-                        state["msg"] = f"blocked on course {cid} page {page}"
-                    stop_event.set(); return local_off
+                        state["blocked"] += 1
+                        global_block = state["blocked"] >= 8 and state["offerings"] == 0
+                        if global_block:
+                            state["incomplete"] = True
+                            state["msg"] = f"repeated blocks (e.g. course {cid}) — likely IP-throttled"
+                    if global_block:
+                        stop_event.set()
+                    return local_off
             if not rows:
                 break
             colleges = [pc for pc in (parse_college(r) for r in rows) if pc]
@@ -1133,8 +1143,10 @@ def run_offerings(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
                           req_count=reqs, bytes_count=byts, db_path=db_path)
             log(msg)
         else:
+            blocked = state.get("blocked", 0)
+            extra = f" · {blocked} course(s) blocked, will retry on next run/resume" if blocked else ""
             msg = (f"done: {state['processed']} courses, {state['offerings']} offerings, "
-                   f"{byts/1048576:.1f} MB")
+                   f"{byts/1048576:.1f} MB{extra}")
             db.update_job(job_id, status="completed", message=msg, finished_at=time.time(),
                           req_count=reqs, bytes_count=byts, db_path=db_path)
             log(msg); send_notification(cfg, "Collegedunia Phase 2 complete", msg, log)
