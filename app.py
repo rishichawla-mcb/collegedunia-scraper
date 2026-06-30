@@ -390,9 +390,10 @@ m2.metric("Unique colleges", f"{c['colleges']:,}")
 m3.metric("Offerings (course×college)", f"{c['offerings']:,}")
 m4.metric("Courses done (phase 2)", f"{c['courses_done_phase2']:,}")
 
-tab_run, tab_query, tab_report, tab_index, tab_data, tab_quality, tab_history = st.tabs(
-    ["▶️ Run", "🔎 Query", "📈 Reporting", "🗂️ Indexing", "📊 Data & export",
-     "🩺 Quality", "🕓 History"])
+(tab_run, tab_query, tab_live, tab_report, tab_index, tab_data,
+ tab_quality, tab_history) = st.tabs(
+    ["▶️ Run", "🔎 Query", "🧪 Live scraper", "📈 Reporting", "🗂️ Indexing",
+     "📊 Data & export", "🩺 Quality", "🕓 History"])
 
 
 # ---------------------------------------------------------------------------
@@ -849,6 +850,84 @@ with tab_query:
 
 
 # ---------------------------------------------------------------------------
+# Live scraper — point at any URL, inspect classes, extract by selection
+# ---------------------------------------------------------------------------
+with tab_live:
+    st.subheader("🧪 Live scraper — extract anything by CSS")
+    st.caption("Enter a page URL, analyze its structure, then pick classes (or type a CSS "
+               "selector) and pull the data. Useful for one-off pages the fixed phases don't cover.")
+    lc1, lc2 = st.columns([3, 1])
+    lurl = lc1.text_input("Page URL", placeholder="https://collegedunia.com/college/...",
+                          key="lurl", label_visibility="collapsed")
+    use_proxy = lc2.checkbox("Use proxy", value=False, key="luseproxy",
+                             help="Fetch via the sidebar proxy/gateway. Off = direct from this server.")
+    if st.button("🔍 Analyze page", key="lanalyze", type="primary"):
+        if not lurl.strip():
+            st.warning("Enter a URL first.")
+        else:
+            try:
+                with st.spinner("Fetching…"):
+                    lcfg = proxy_config_from_ui() if use_proxy else {"proxy_mode": "none"}
+                    lpm = scraper.ProxyManager.from_config(lcfg)
+                    lclient = scraper.Client(lpm, max_retries=int(lcfg.get("max_retries", 3)))
+                    lclient.verbose = False
+                    lhtml = lclient.get_text(lurl.strip())
+                st.session_state["lhtml"] = lhtml
+                st.session_state["linfo"] = scraper.analyze_page(lhtml)
+                st.session_state.pop("ldf", None)
+                st.success(f"Fetched {len(lhtml)//1024} KB · "
+                           f"{len(st.session_state['linfo']['classes'])} classes found.")
+            except Exception as err:  # noqa: BLE001
+                st.error(f"Fetch failed: {str(err)[:200]}")
+
+    info = st.session_state.get("linfo")
+    if info:
+        if info.get("title"):
+            st.caption(f"Page title: {info['title'][:140]}")
+        cls = info["classes"]
+        if not cls:
+            st.info("No CSS classes found on this page. Try a custom selector below.")
+        else:
+            st.markdown("**Classes found** (most common first — class · count · tags · sample)")
+            st.dataframe(pd.DataFrame(cls)[["class", "count", "tags", "sample"]],
+                         use_container_width=True, height=260)
+        pick = st.multiselect("Pick classes to extract",
+                              [c["class"] for c in cls], key="lpick")
+        custom = st.text_input("…or a custom CSS selector (overrides the picks above)",
+                               placeholder="e.g.  a.college_name   or   div.card h3",
+                               key="lcustom")
+        mode_label = st.radio("Extract", ["Text only", "Text + links", "Full inner HTML"],
+                              horizontal=True, key="lmode")
+        mode = {"Text only": "text", "Text + links": "links",
+                "Full inner HTML": "html"}[mode_label]
+        can_extract = bool(custom.strip() or pick)
+        if st.button("📤 Extract", key="lextract", disabled=not can_extract):
+            try:
+                if custom.strip():
+                    rows = scraper.extract_by_selector(
+                        st.session_state["lhtml"], custom.strip(), mode=mode)
+                else:
+                    rows = scraper.extract_by_classes(
+                        st.session_state["lhtml"], pick, mode=mode)
+                if not rows:
+                    st.warning("Nothing matched. Check the class/selector.")
+                    st.session_state.pop("ldf", None)
+                else:
+                    st.session_state["ldf"] = pd.DataFrame(rows)
+                    st.success(f"Extracted {len(rows):,} elements.")
+            except Exception as err:  # noqa: BLE001
+                st.error(f"Extraction failed (bad selector?): {str(err)[:160]}")
+        if st.session_state.get("ldf") is not None:
+            st.dataframe(st.session_state["ldf"], use_container_width=True, height=360)
+            st.download_button(
+                "⬇️ Download extracted CSV",
+                data=st.session_state["ldf"].to_csv(index=False).encode("utf-8"),
+                file_name="live_extract.csv", mime="text/csv", key="ldl")
+    else:
+        st.info("Enter a URL and click **Analyze page** to begin.")
+
+
+# ---------------------------------------------------------------------------
 # Reporting dashboard (interactive)
 # ---------------------------------------------------------------------------
 with tab_report:
@@ -1095,6 +1174,24 @@ with tab_quality:
         st.success("Schedule saved." if se else "Scheduling disabled.")
     if sched.get("enabled") and sched.get("next_run"):
         st.caption(f"Next run ≈ {time.strftime('%Y-%m-%d %H:%M', time.localtime(sched['next_run']))}")
+
+    st.divider()
+    st.markdown("**🧹 Reset data** — keep only scraped courses & unique colleges; clear the rest.")
+    with db.connect() as conn:
+        keep_c = conn.execute("SELECT COUNT(*) FROM courses").fetchone()[0]
+        keep_k = conn.execute("SELECT COUNT(*) FROM colleges").fetchone()[0]
+    st.caption(f"Will KEEP **{keep_c:,} courses** and **{keep_k:,} colleges** (incl. their "
+               "enrichment) and your proxy/settings. Will CLEAR offerings, college-courses, "
+               "all progress, staging, logs, job history and snapshots. This cannot be undone.")
+    wipe_ok = st.checkbox("Yes — permanently delete everything except courses & colleges",
+                          key="wipeok")
+    if st.button("🧹 Reset now", disabled=not wipe_ok, key="wipebtn"):
+        d = db.wipe_except_courses_colleges()
+        cleared = ", ".join(f"{k}={v:,}" for k, v in d.items() if v)
+        st.success("Reset complete. " + (f"Cleared: {cleared}." if cleared
+                                         else "Nothing else needed clearing."))
+        st.session_state.pop("watch_job", None)
+        st.rerun()
 
 
 with tab_history:

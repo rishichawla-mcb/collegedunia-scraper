@@ -771,6 +771,25 @@ def discard_staging(job_id: int, db_path: str = DB_PATH) -> int:
         return cur.rowcount
 
 
+def wipe_except_courses_colleges(db_path: str = DB_PATH) -> Dict[str, int]:
+    """Reset to a clean slate: keep the courses and colleges master tables (and
+    saved settings/proxy config), clear everything else — offerings,
+    college_courses, all progress, staging, logs, job history, snapshots.
+    Returns rows deleted per table."""
+    deleted: Dict[str, int] = {}
+    with connect(db_path) as conn:
+        for tbl in ("offerings", "college_courses", "offering_progress",
+                    "cc_progress", "staging", "logs", "jobs", "snapshots"):
+            try:
+                cur = conn.execute(f"DELETE FROM {tbl}")
+                deleted[tbl] = cur.rowcount
+            except Exception:
+                deleted[tbl] = 0
+        # drop the phase-1 resume pointer so the next run starts fresh
+        conn.execute("DELETE FROM settings WHERE key='courses_resume_page'")
+    return deleted
+
+
 # ---------------------------------------------------------------------------
 # Live logs (persisted)
 # ---------------------------------------------------------------------------

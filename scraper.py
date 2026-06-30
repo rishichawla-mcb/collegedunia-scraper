@@ -27,6 +27,7 @@ does NOT solve CAPTCHAs or spoof browser fingerprints.
 from __future__ import annotations
 
 import base64
+from collections import Counter
 import html as _html
 import itertools
 import json
@@ -39,6 +40,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 import requests
+from bs4 import BeautifulSoup
 
 import db
 
@@ -541,6 +543,77 @@ def _to_float(v: Any) -> Optional[float]:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Live / generic extraction — point at any URL, inspect its structure, and
+# pull elements by CSS class or a custom selector. Powers the "Live scraper" UI.
+# ---------------------------------------------------------------------------
+def analyze_page(html: str, top: int = 500) -> Dict[str, Any]:
+    """Inventory a page so the user can decide what to extract. Returns
+    {'title', 'classes': [{class, count, tags, sample}], 'tags': {tag: count}}."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    title = ""
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+    class_info: Dict[str, Dict[str, Any]] = {}
+    tag_counts: "Counter" = Counter()
+    for el in soup.find_all(True):
+        tag_counts[el.name] += 1
+        for cls in (el.get("class") or []):
+            info = class_info.setdefault(
+                cls, {"class": cls, "count": 0, "tags": set(), "sample": ""})
+            info["count"] += 1
+            info["tags"].add(el.name)
+            if not info["sample"]:
+                txt = el.get_text(" ", strip=True)
+                if txt:
+                    info["sample"] = txt[:140]
+    classes = sorted(class_info.values(), key=lambda d: d["count"], reverse=True)[:top]
+    for c in classes:
+        c["tags"] = ", ".join(sorted(c["tags"]))
+    return {"title": title, "classes": classes, "tags": dict(tag_counts.most_common(80))}
+
+
+def _el_to_row(el, mode: str) -> Dict[str, Any]:
+    """Flatten one matched element into a row, per the chosen extraction mode."""
+    row: Dict[str, Any] = {"tag": el.name, "text": el.get_text(" ", strip=True)}
+    if mode == "links":
+        href = el.get("href", "")
+        if not href:
+            a = el.find("a", href=True)
+            href = a.get("href", "") if a else ""
+        src = el.get("src", "")
+        if not src:
+            img = el.find("img", src=True)
+            src = img.get("src", "") if img else ""
+        row["href"] = abs_url(href) if href else ""
+        row["src"] = src or ""
+    elif mode == "html":
+        row["html"] = el.decode_contents()
+    return row
+
+
+def extract_by_selector(html: str, selector: str, mode: str = "text",
+                        limit: int = 5000) -> List[Dict[str, Any]]:
+    """Extract elements matching a CSS selector. mode: 'text' | 'links' | 'html'."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    return [_el_to_row(el, mode) for el in soup.select(selector)[:limit]]
+
+
+def extract_by_classes(html: str, classes: List[str], mode: str = "text",
+                       limit: int = 5000) -> List[Dict[str, Any]]:
+    """Extract every element carrying any of the given classes (robust to odd
+    class names that a raw CSS selector would choke on)."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    want = set(classes)
+    out: List[Dict[str, Any]] = []
+    for el in soup.find_all(True):
+        if want & set(el.get("class") or []):
+            out.append(_el_to_row(el, mode))
+            if len(out) >= limit:
+                break
+    return out
 
 
 # ---------------------------------------------------------------------------
