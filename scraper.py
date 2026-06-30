@@ -1274,33 +1274,122 @@ def _clean_fee(s: str) -> str:
     """Normalise a fee cell like '894(1st Year Fees)' -> '₹894 (1st Year Fees)'
     and '₹ 2.65 Lakhs' -> '₹2.65 Lakhs'."""
     s = (s or "").strip()
-    if not s or s in ("-", "—", "N/A", "NA"):
+    if not s or s in ("-", "—", "N/A", "NA", "--"):
         return ""
-    s = re.sub(r"(\d)\(", r"\1 (", s)          # space before a glued '('
+    s = re.sub(r"\s*\(", " (", s)              # normalise space before a '('
+    s = re.sub(r"₹\s+", "₹", s)                # tighten '₹ 1.41' -> '₹1.41'
     s = re.sub(r"\s+", " ", s).strip()
     if re.match(r"^[\d,]", s):                  # bare number -> prefix ₹
         s = "₹" + s
     return s
 
 
-def parse_courses_fees(page_html: str) -> Dict[str, Any]:
-    """Parse the courses-&-fees table(s) from a college page's server HTML.
-    Returns {'college_name': str, 'courses': [ {course_name, eligibility,
-    total_fees, hostel_fees}, ... ]}."""
-    name = ""
-    # college name from <title> as a cheap fallback
-    mt = re.search(r"<title>(.*?)</title>", page_html or "", re.S | re.I)
-    if mt:
-        name = _clean_html(mt.group(1)).split(":")[0].split(" Courses")[0].strip()
+def _clean_date(d: Any) -> str:
+    d = str(d or "").strip()
+    return "" if d in ("", "0000-00-00") else d
 
-    courses: List[Dict[str, Any]] = []
-    seen = set()
+
+_NEXTDATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
+
+
+def _hostel_from_tables(page_html: str) -> str:
+    """College-level hostel fee isn't in the JSON; grab the first non-empty
+    'Hostel Fees' cell from the page's HTML tables."""
     for tbl in _TABLE_RE.findall(page_html or ""):
         rows = _TR_RE.findall(tbl)
         if not rows:
             continue
         hdr = [_clean_html(h).lower() for h in _TD_RE.findall(rows[0])]
-        if not hdr or not any("fee" in h for h in hdr):
+        hi = next((i for i, h in enumerate(hdr) if "hostel" in h), None)
+        if hi is None:
+            continue
+        for r in rows[1:]:
+            cells = [_clean_html(c) for c in _TD_RE.findall(r)]
+            if hi < len(cells):
+                v = _clean_fee(cells[hi])
+                if v:
+                    return v
+    return ""
+
+
+def parse_courses_fees(page_html: str) -> Dict[str, Any]:
+    """Phase 4 parser. Primary source is the page's embedded __NEXT_DATA__ JSON
+    (clean and rich: fee, duration, mode, level, eligibility, rating, reviews,
+    specialization, application dates). Hostel fee — which is college-level and
+    not in the JSON — is merged from the HTML table. Falls back to HTML-table
+    parsing when the JSON is absent."""
+    m = _NEXTDATA_RE.search(page_html or "")
+    if m:
+        clist = None
+        cd: Dict[str, Any] = {}
+        college_name = ""
+        try:
+            data = json.loads(m.group(1))
+            pdata = data["props"]["initialProps"]["pageProps"]["data"]
+            cd = pdata.get("course_data") or {}
+            clist = cd.get("courses") or []
+            college_name = pdata.get("college_name") or ""
+        except Exception:  # noqa: BLE001
+            clist = None
+        if clist:
+            hostel = _hostel_from_tables(page_html)
+            courses: List[Dict[str, Any]] = []
+            seen = set()
+            for c in clist:
+                base = (c.get("display_name") or c.get("short_head") or "").strip()
+                if not base:
+                    continue
+                for s in (c.get("streams") or [{}]):
+                    spec = (s.get("name") or "").strip()
+                    fd = s.get("fees_data") or {}
+                    amt_fmt = fd.get("amount_formatted") or ""
+                    adm = s.get("admission") or {}
+                    is_spec = bool(spec) and spec.lower() != "general"
+                    full = f"{base} ({spec})" if is_spec else base
+                    key = full.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    courses.append({
+                        "course_name": full,
+                        "specialization": spec if is_spec else "",
+                        "eligibility": (c.get("eligibility") or "").strip(),
+                        "total_fees": ("₹" + amt_fmt) if amt_fmt else "",
+                        "fees_inr": _to_int(fd.get("amount")),
+                        "hostel_fees": hostel,
+                        "duration": (c.get("duration") or "").strip(),
+                        "mode": c.get("type") or "",
+                        "level": c.get("level") or "",
+                        "course_type": c.get("course_type") or "",
+                        "rating": _to_float(c.get("course_rating")),
+                        "reviews_count": _to_int(c.get("reviews_count")),
+                        "application_start": _clean_date(adm.get("admission_start_date")),
+                        "application_end": _clean_date(adm.get("admission_end_date")),
+                    })
+            return {"college_name": college_name, "courses": courses,
+                    "course_count": cd.get("course_count"),
+                    "total_pages": cd.get("total_pages")}
+    return _parse_cf_tables(page_html)
+
+
+def _parse_cf_tables(page_html: str) -> Dict[str, Any]:
+    """Legacy fallback: parse the HTML 'Courses & Fees' table(s) when no
+    __NEXT_DATA__ JSON is present. Only accepts tables that have BOTH a
+    course/program column and a fee column — this skips the fee-breakdown
+    ('Fee Type | Amount'), yearly-fee, and scholarship tables that the old
+    parser mistook for course rows."""
+    name = ""
+    mt = re.search(r"<title>(.*?)</title>", page_html or "", re.S | re.I)
+    if mt:
+        name = _clean_html(mt.group(1)).split(":")[0].split(" Courses")[0].strip()
+    courses: List[Dict[str, Any]] = []
+    seen = set()
+    for tbl in _TABLE_RE.findall(page_html or ""):
+        rows = _TR_RE.findall(tbl)
+        if len(rows) < 2:
+            continue
+        hdr = [_clean_html(h).lower() for h in _TD_RE.findall(rows[0])]
+        if not hdr:
             continue
 
         def col(*keys):
@@ -1309,11 +1398,19 @@ def parse_courses_fees(page_html: str) -> Dict[str, Any]:
                     return i
             return None
 
-        ci_course = col("course")
+        def first_col(*opts):
+            for o in opts:
+                keys = o if isinstance(o, tuple) else (o,)
+                idx = col(*keys)
+                if idx is not None:
+                    return idx
+            return None
+
+        ci_course = first_col("course", "program", "specialization", "branch")
+        ci_total = first_col(("total", "fee"), ("annual", "fee"), ("1st", "fee"), "fee", "fees")
+        if ci_course is None or ci_total is None or ci_course == ci_total:
+            continue
         ci_elig = col("eligib")
-        ci_total = col("total", "fee")
-        if ci_total is None:
-            ci_total = col("fee")
         ci_hostel = col("hostel")
         for r in rows[1:]:
             cells = [_clean_html(c) for c in _TD_RE.findall(r)]
@@ -1323,11 +1420,14 @@ def parse_courses_fees(page_html: str) -> Dict[str, Any]:
             def g(i):
                 return cells[i] if (i is not None and i < len(cells)) else ""
 
-            cn = g(ci_course) or (cells[0] if cells else "")
-            if not cn or cn.lower() in seen:
+            cn = g(ci_course).strip()
+            cnl = cn.lower()
+            if (not cn or len(cn) > 150 or cnl in seen or "fee" in cnl
+                    or "college" in cnl or "university" in cnl
+                    or re.match(r"^[₹\d]", cn)):
                 continue
-            seen.add(cn.lower())
-            courses.append({"course_name": cn, "eligibility": g(ci_elig),
+            seen.add(cnl)
+            courses.append({"course_name": cn, "eligibility": g(ci_elig).strip(),
                             "total_fees": _clean_fee(g(ci_total)),
                             "hostel_fees": _clean_fee(g(ci_hostel))})
     return {"college_name": name, "courses": courses}

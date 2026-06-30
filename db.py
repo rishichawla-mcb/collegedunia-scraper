@@ -287,10 +287,15 @@ def init_db(db_path: str = DB_PATH) -> None:
                          ("enriched_at", "REAL")):
             if col not in kcols:
                 conn.execute(f"ALTER TABLE colleges ADD COLUMN {col} {typ}")
-        # Migration: numeric fee column for college_courses.
+        # Migration: numeric fee + rich Phase-4 columns for college_courses.
         cccols = {r[1] for r in conn.execute("PRAGMA table_info(college_courses)")}
-        if "fees_inr" not in cccols:
-            conn.execute("ALTER TABLE college_courses ADD COLUMN fees_inr INTEGER")
+        for col, typ in (("fees_inr", "INTEGER"), ("specialization", "TEXT"),
+                         ("duration", "TEXT"), ("mode", "TEXT"), ("level", "TEXT"),
+                         ("course_type", "TEXT"), ("rating", "REAL"),
+                         ("reviews_count", "INTEGER"), ("application_start", "TEXT"),
+                         ("application_end", "TEXT")):
+            if col not in cccols:
+                conn.execute(f"ALTER TABLE college_courses ADD COLUMN {col} {typ}")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS snapshots ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, "
@@ -509,8 +514,11 @@ def upsert_college_courses(rows: Iterable[Dict[str, Any]], db_path: str = DB_PAT
     rows = [r for r in rows if r.get("course_name")]
     if not rows:
         return 0
-    cols = ["college_id", "college_name", "course_name", "eligibility",
-            "total_fees", "hostel_fees", "source_url", "scraped_at", "source_job_id"]
+    cols = ["college_id", "college_name", "course_name", "specialization",
+            "eligibility", "total_fees", "fees_inr", "hostel_fees", "duration",
+            "mode", "level", "course_type", "rating", "reviews_count",
+            "application_start", "application_end", "source_url", "scraped_at",
+            "source_job_id"]
     ph = ",".join("?" for _ in cols)
     sql = (f"INSERT INTO college_courses ({','.join(cols)}) VALUES ({ph}) "
            f"ON CONFLICT(college_id, course_name) DO UPDATE SET "
