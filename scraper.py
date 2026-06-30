@@ -309,6 +309,20 @@ class Client:
         self.session_id: Optional[str] = None  # set for sticky-IP pagination
         self.verbose = True                    # per-request live logging (bounded by log prune)
 
+    def _maybe_rotate(self, err: Exception) -> bool:
+        """A dead proxy tunnel (502 NO_HOST_CONNECTION / 'Unable to connect to
+        proxy') won't recover by retrying the SAME sticky IP. On a proxy
+        connection error, rotate the sticky session id so the next attempt gets
+        a fresh upstream IP. Site blocks (403/429) keep the same IP."""
+        is_proxy_err = isinstance(err, requests.exceptions.ProxyError) or (
+            isinstance(err, requests.exceptions.ConnectionError)
+            and ("NO_HOST_CONNECTION" in str(err) or "Unable to connect to proxy" in str(err)))
+        if self.session_id and is_proxy_err:
+            base = self.session_id.split("~")[0]
+            self.session_id = f"{base}~{random.randint(0, 10**6)}"
+            return True
+        return False
+
     def fetch(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         params = {"data": encode_payload(payload)}
         last_err: Optional[Exception] = None
@@ -340,12 +354,16 @@ class Client:
                 last_err = err
                 self.stats.add(blocks=1)
                 self.pm.report_failure(proxy)
-                if self.adaptive:
+                rotated = self._maybe_rotate(err)
+                # Proxy-tunnel errors get a fresh IP, but must NOT ramp the
+                # adaptive throttle — that's only for real site rate-limiting.
+                if self.adaptive and not rotated:
                     self.adaptive.on_block()
                 wait = self.backoff * attempt + random.uniform(0, 2)
                 via = proxy.url if proxy else "direct"
                 self.log(f"  ! attempt {attempt}/{self.max_retries} via {via} failed: "
-                         f"{err} -> retry in {wait:.0f}s")
+                         f"{err}{' [rotating to fresh proxy IP]' if rotated else ''} "
+                         f"-> retry in {wait:.0f}s")
                 time.sleep(wait)
         raise RuntimeError(f"Failed after {self.max_retries} attempts: {last_err}")
 
@@ -373,7 +391,7 @@ class Client:
                 last_err = err
                 self.stats.add(blocks=1)
                 self.pm.report_failure(proxy)
-                if self.adaptive:
+                if not self._maybe_rotate(err) and self.adaptive:
                     self.adaptive.on_block()
                 time.sleep(self.backoff * attempt + random.uniform(0, 2))
         raise RuntimeError(f"GET failed after {self.max_retries} attempts: {last_err}")
