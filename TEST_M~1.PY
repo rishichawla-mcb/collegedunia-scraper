@@ -135,6 +135,60 @@ db.set_cc_progress(70707, "partial", 12, last_page=3, db_path=DB)
 ccp = db.get_cc_progress(70707, DB)
 check("cc_progress stores/reads last_page (resume)", ccp and ccp["last_page"] == 3 and ccp["status"] == "partial")
 
+print("MODULE 5c — Directory phase")
+# (a) payload builder (page is an int here)
+dpl = scraper.listing_payload("maharashtra-colleges", 3)
+check("listing_payload -> base64 of {url, int page}",
+      json.loads(_b64.b64decode(dpl)) == {"url": "maharashtra-colleges", "page": 3})
+# (b) parser fixture (verified college object shape)
+dc_obj = {"college_id": "2438", "college_name": "Kirori Mal College - [KMC]",
+          "college_short_form": "KMC", "state": "Delhi NCR", "state_id": "10", "city_id": "16",
+          "college_city": "New Delhi", "url": "college/2438-kirori-mal-college-kmc-new-delhi",
+          "approvals": [{"name": "UGC"}, {"name": "NAAC"}], "rating": "4.1",
+          "naac_grading": "A", "fees": ["₹ 45,000"], "courseCount": 27}
+drow = scraper.parse_directory_college(dc_obj, "delhi-ncr-colleges")
+check("parse_directory_college core fields",
+      drow["college_id"] == 2438 and drow["name"].startswith("Kirori Mal")
+      and drow["state_id"] == 10 and drow["course_count"] == 27
+      and drow["approvals"] == "UGC, NAAC" and drow["top_course_fees"] == "₹ 45,000"
+      and drow["link"].endswith("/college/2438-kirori-mal-college-kmc-new-delhi")
+      and drow["source_slug"] == "delhi-ncr-colleges")
+# (c) ceiling / edge shapes: empty page terminates, nearby_city_page triggers fallback,
+#     tiny-state HTML nests colleges 2-deep (flatten)
+check("empty page -> empty colleges list (loop terminator)", ({"colleges": []}).get("colleges") == [])
+check("nearby_city_page -> no 'colleges' key (HTML fallback trigger)",
+      ({"nearby_city_page": {}}).get("colleges") is None)
+nested = {"props": {"initialProps": {"pageProps": {"listingResponse": {"count": 4, "colleges": [
+    [{"college_id": "1", "college_name": "A"}, {"college_id": "2", "college_name": "B"}],
+    [{"college_id": "3", "college_name": "C"}, {"college_id": "4", "college_name": "D"}]]}}}}}
+html_fx = '<script id="__NEXT_DATA__" type="application/json">' + json.dumps(nested) + "</script>"
+cobjs, cnt = scraper.parse_listing_html_colleges(html_fx)
+check("tiny-state HTML flatten (nested 2-D colleges)", len(cobjs) == 4 and cnt == 4)
+# (d/e) dedupe across partitions + missing-from-Phase2 join, on an isolated DB
+DB2 = os.path.join(tempfile.gettempdir(), "cd_dir_test.db")
+if os.path.exists(DB2):
+    os.remove(DB2)
+db.init_db(DB2)
+djid = db.create_job("directory", {"staging": True}, db_path=DB2)
+pa = [scraper.parse_directory_college({"college_id": "500", "college_name": "X", "state": "S1"}, "s1"),
+      scraper.parse_directory_college({"college_id": "501", "college_name": "Y", "state": "S1"}, "s1")]
+pb = [scraper.parse_directory_college({"college_id": "501", "college_name": "Y", "state": "S2"}, "s2"),  # overlap
+      scraper.parse_directory_college({"college_id": "502", "college_name": "Z", "state": "S2"}, "s2")]
+db.stage_records(djid, "colleges_directory", pa, DB2)
+db.stage_records(djid, "colleges_directory", pb, DB2)
+db.promote_job(djid, DB2)
+with db.connect(DB2) as conn:
+    dcount = conn.execute("SELECT COUNT(*) FROM colleges_directory").fetchone()[0]
+check("dedupe across partitions on college_id (3 unique of 4)", dcount == 3, f"got {dcount}")
+db.upsert_colleges([{"college_id": 500, "name": "X", "scraped_at": 0}], DB2)   # only 500 in Phase 2
+missing_ids = {m["college_id"] for m in db.dir_missing_from_phase2(db_path=DB2)}
+check("dir_missing_from_phase2 finds the gap", missing_ids == {501, 502}, str(missing_ids))
+nq = db.queue_missing_for_phase4(DB2)
+check("queue_missing_for_phase4 queues gap into cc_progress (status=queued)",
+      nq == 2 and set(db.list_cc_queued_ids(DB2)) == {501, 502})
+cov = db.dir_coverage_summary(DB2)
+check("dir_coverage_summary totals", cov["directory_total"] == 3 and cov["overlap"] == 1)
+
 print("MODULE 6 — Live scraper helpers")
 html = ('<title>X</title><div class="card"><a class="name" href="/c/1">Alpha</a>'
         '<span class="fee">2.1 Lakhs</span></div>')

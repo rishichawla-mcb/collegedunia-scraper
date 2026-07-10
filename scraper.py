@@ -45,10 +45,14 @@ import db
 
 API_URL = "https://collegedunia.com/web-api/listing-cf"
 COURSES_LIST_API = "https://collegedunia.com/web-api/college/courses-list"
+LISTING_API = "https://collegedunia.com/web-api/listing"
 SITE = "https://collegedunia.com"
 PAGE_SIZE = 10
 CC_PAGE_SIZE = 5          # courses-list API returns 5 course groups per page
 MAX_CC_PAGES = 60         # hard safety cap on course pages per college
+DIR_PAGE_SIZE = 10        # listing API returns 10 colleges per page
+MAX_DIR_SLUG_PAGES = 400  # hard cap per state partition (~4,000 colleges)
+DIR_BASE_SWEEP_CAP = 998  # india-colleges base sweep stops before the ~999 ceiling
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -77,6 +81,12 @@ def courses_list_payload(college_id: Any, page: Any) -> str:
     """Base64 payload for the courses-list pagination API. Both fields must be
     strings: {"id": "<college_id>", "course_page": "<n>"}."""
     return encode_payload({"id": str(college_id), "course_page": str(page)})
+
+
+def listing_payload(slug: str, page: int) -> str:
+    """Base64 payload for the india-colleges directory listing API:
+    {"url": "<listing-slug>", "page": <int>} (page is an int here)."""
+    return encode_payload({"url": str(slug), "page": int(page)})
 
 
 def iter_course_pages(fetch_page: "Callable[[int], Dict[str, Any]]",
@@ -469,6 +479,51 @@ class Client:
                 time.sleep(wait)
         raise RuntimeError(f"courses-list failed after {self.max_retries} attempts: {last_err}")
 
+    def fetch_listing(self, slug: str, page: int) -> Dict[str, Any]:
+        """Fetch one page of the india-colleges directory listing API. Returns the
+        JSON dict as-is — it may contain 'colleges' (normal states) or a
+        'nearby_city_page' shape (tiny states, no 'colleges' key). Same retry /
+        proxy-rotation / adaptive handling as fetch()."""
+        params = {"data": listing_payload(slug, page)}
+        headers = {"User-Agent": random.choice(USER_AGENTS), "Accept": "application/json"}
+        last_err: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            proxy = self.pm.get(self.session_id)
+            try:
+                resp = self.session.get(
+                    LISTING_API, params=params, headers=headers,
+                    proxies=proxy.as_dict() if proxy else None, timeout=self.timeout)
+                self.stats.add(requests=1, byts=len(resp.content or b""))
+                if resp.status_code in (403, 429, 503):
+                    raise BlockedError(f"HTTP {resp.status_code}")
+                resp.raise_for_status()
+                ctype = resp.headers.get("Content-Type", "")
+                if "json" not in ctype and not resp.text.lstrip().startswith("{"):
+                    raise BlockedError("non-JSON listing response")
+                data = resp.json()
+                if data.get("status") in (301, 404):
+                    raise BlockedError(f"listing status {data.get('status')}")
+                self.pm.report_success(proxy)
+                if self.adaptive:
+                    self.adaptive.on_success()
+                if self.verbose:
+                    self.log(f"   · listing {slug} p{page} → "
+                             f"{len(data.get('colleges') or [])} colleges "
+                             f"(hasNext={data.get('hasNext')})")
+                return data
+            except (BlockedError, requests.RequestException, ValueError) as err:
+                last_err = err
+                self.stats.add(blocks=1)
+                self.pm.report_failure(proxy)
+                rotated = self._maybe_rotate(err)
+                if self.adaptive and not rotated:
+                    self.adaptive.on_block()
+                wait = self.backoff * attempt + random.uniform(0, 2)
+                self.log(f"  ! listing {slug} p{page} attempt {attempt}/{self.max_retries} "
+                         f"failed: {err}{' [rotating IP]' if rotated else ''} -> retry in {wait:.0f}s")
+                time.sleep(wait)
+        raise RuntimeError(f"listing failed after {self.max_retries} attempts: {last_err}")
+
 
 # ---------------------------------------------------------------------------
 # Phase-3: parse the CollegeOrUniversity JSON-LD from a college page (no reviews)
@@ -739,6 +794,7 @@ MAX_CHUNK_PAGES = 400   # hard safety cap on pages per chunk
 _UPSERT_MAP = {
     "courses": "upsert_courses", "colleges": "upsert_colleges",
     "offerings": "upsert_offerings", "college_courses": "upsert_college_courses",
+    "colleges_directory": "upsert_colleges_directory",
 }
 
 
@@ -1568,7 +1624,9 @@ def run_college_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_P
 
     ids: List[int] = list(cfg.get("college_ids") or [])
     if cfg.get("use_known", True) and not ids:
-        ids = db.list_known_college_ids(db_path=db_path)
+        # Known Phase-2 colleges + any colleges queued from the Directory gap.
+        ids = sorted(set(db.list_known_college_ids(db_path=db_path))
+                     | set(db.list_cc_queued_ids(db_path=db_path)))
     if cfg.get("id_start") and cfg.get("id_end"):
         ids = sorted(set(ids) | set(range(int(cfg["id_start"]), int(cfg["id_end"]) + 1)))
     if not cfg.get("force_rescrape"):
@@ -1727,3 +1785,240 @@ def run_college_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_P
                       finished_at=time.time(), db_path=db_path)
         log(f"ERROR: {err}")
         raise
+
+
+# ---------------------------------------------------------------------------
+# Directory phase: the complete india-colleges directory (coverage baseline)
+# ---------------------------------------------------------------------------
+def _nextdata_pageprops(page_html: str) -> Dict[str, Any]:
+    """Return the __NEXT_DATA__ pageProps from a listing page. Raw server HTML
+    nests it under props.initialProps.pageProps; hydrated DOM uses props.pageProps."""
+    m = _NEXTDATA_RE.search(page_html or "")
+    if not m:
+        return {}
+    try:
+        nd = json.loads(m.group(1))
+    except Exception:  # noqa: BLE001
+        return {}
+    props = nd.get("props") or {}
+    ip = (props.get("initialProps") or {}).get("pageProps")
+    return ip or props.get("pageProps") or {}
+
+
+def _flatten_colleges(x: Any, out: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """Collect every college-like dict (has college_id + college_name) from an
+    arbitrarily-nested structure — the tiny-state HTML nests colleges 2 levels deep."""
+    if out is None:
+        out = []
+    if isinstance(x, dict):
+        if "college_id" in x and "college_name" in x:
+            out.append(x)
+        else:
+            for v in x.values():
+                _flatten_colleges(v, out)
+    elif isinstance(x, list):
+        for v in x:
+            _flatten_colleges(v, out)
+    return out
+
+
+def parse_directory_college(c: Dict[str, Any], source_slug: str = "") -> Dict[str, Any]:
+    """Flatten one directory college object (identical shape from the listing API
+    and the tiny-state HTML) into a colleges_directory row."""
+    fees = c.get("fees")
+    top_fee = ""
+    if isinstance(fees, list) and fees:
+        f0 = fees[0]
+        if isinstance(f0, str):
+            top_fee = f0
+        elif isinstance(f0, dict):
+            top_fee = str(f0.get("fees") or f0.get("amount") or f0.get("value")
+                          or f0.get("total_fees") or "")
+        else:
+            top_fee = str(f0)
+    approvals = c.get("approvals")
+    if isinstance(approvals, list):
+        approvals = ", ".join(
+            str(a.get("name") if isinstance(a, dict) else a) for a in approvals if a)
+    elif not isinstance(approvals, str):
+        approvals = ""
+    return {
+        "college_id": _to_int(c.get("college_id")),
+        "name": c.get("college_name", "") or "",
+        "short_form": c.get("college_short_form", "") or "",
+        "city": c.get("college_city", "") or "",
+        "city_id": _to_int(c.get("city_id")),
+        "state": c.get("state", "") or "",
+        "state_id": _to_int(c.get("state_id")),
+        "link": abs_url(c.get("url")),
+        "rating": _to_float(c.get("rating")),
+        "naac_grading": c.get("naac_grading", "") or "",
+        "top_course_fees": top_fee,
+        "course_count": _to_int(c.get("courseCount")),
+        "approvals": approvals,
+        "source_slug": source_slug,
+        "raw_json": json.dumps(c, ensure_ascii=False),
+        "scraped_at": time.time(),
+    }
+
+
+def fetch_state_filters(client: "Client") -> List[Dict[str, Any]]:
+    """Fetch india-colleges once and return the state partitions:
+    [{text, state_id, count, slug}] (slug is the last path segment of link)."""
+    html = client.get_text(f"{SITE}/india-colleges")
+    pp = _nextdata_pageprops(html)
+    vals = ((((pp.get("filterResponse") or {}).get("filters") or {}).get("state")
+             or {}).get("values")) or []
+    states = []
+    for s in vals:
+        link = (s.get("link") or "").rstrip("/")
+        slug = link.split("/")[-1] if link else ""
+        if not slug:
+            continue
+        states.append({"text": s.get("text", ""), "state_id": _to_int(s.get("value")),
+                       "count": _to_int(s.get("count")) or 0, "slug": slug})
+    return states
+
+
+def parse_listing_html_colleges(page_html: str):
+    """Tiny-state fallback: pull colleges from the HTML listing page's
+    __NEXT_DATA__ (listingResponse.colleges is nested; flatten it)."""
+    pp = _nextdata_pageprops(page_html)
+    lr = pp.get("listingResponse") or {}
+    return _flatten_colleges(lr.get("colleges")), _to_int(lr.get("count"))
+
+
+def run_directory(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
+                  log: Optional[Callable[[str], None]] = None) -> None:
+    """Phase 'Directory': scrape the full india-colleges directory as a coverage
+    baseline. Partitions by state (defeats the ~999-page listing ceiling), with a
+    tiny-state HTML fallback and an optional india-colleges base sweep. Rows go
+    through staging → validate → promote; quality rule requires the promoted count
+    to be within 5% of the API-reported total."""
+    log = log or (lambda m: print(m, flush=True))
+    pm = ProxyManager.from_config(cfg)
+    stats = Stats()
+    adaptive = AdaptiveDelay(float(cfg.get("delay", 1.0)), enabled=bool(cfg.get("adaptive", True)))
+    budget_bytes = int(float(cfg.get("budget_mb", 0)) * 1024 * 1024)
+    budget_requests = int(cfg.get("budget_requests", 0))
+    base_sweep = bool(cfg.get("base_sweep", True))
+    client = Client(pm, log=log, max_retries=int(cfg.get("max_retries", 5)),
+                    backoff=float(cfg.get("backoff", 4)), stats=stats, adaptive=adaptive)
+
+    def budget_hit():
+        reqs, byts, _ = stats.snapshot()
+        if budget_requests and reqs >= budget_requests:
+            return f"request budget reached ({reqs})"
+        if budget_bytes and byts >= budget_bytes:
+            return f"bandwidth budget reached ({byts/1048576:.1f} MB)"
+        return None
+
+    db.update_job(job_id, status="running", message="discovering states…", db_path=db_path)
+    log("Directory phase [BUILD: dir-v1] — fetching india-colleges state filters.")
+    client.session_id = "dirstates"
+    try:
+        states = fetch_state_filters(client)
+    except Exception as err:  # noqa: BLE001
+        states = []
+        log(f"  ! state filter fetch failed: {err}")
+    expected = sum(s.get("count") or 0 for s in states) if states else 20695
+    try:
+        db.set_setting("dir_states", states, db_path=db_path)
+    except Exception:  # noqa: BLE001
+        pass
+    log(f"Discovered {len(states)} states; expected ≈ {expected:,} colleges.")
+
+    partitions: List = []
+    if base_sweep:
+        partitions.append(("india-colleges", DIR_BASE_SWEEP_CAP))
+    partitions += [(s["slug"], None) for s in states if s.get("slug")]
+    total_units = len(partitions)
+    db.update_job(job_id, total_units=total_units, db_path=db_path)
+
+    done_slugs = set() if cfg.get("force_rescrape") else db.get_dir_done_slugs(db_path=db_path)
+    processed = 0
+    incomplete = False
+    try:
+        for slug, page_cap in partitions:
+            if db.stop_requested(job_id, db_path=db_path):
+                incomplete = True
+                break
+            bh = budget_hit()
+            if bh:
+                incomplete = True
+                log(f"  {bh} — stopping.")
+                break
+            if slug in done_slugs:
+                processed += 1
+                continue
+            client.session_id = f"dir{abs(hash(slug)) % (10 ** 8)}"   # sticky IP per partition
+            prog = db.get_dir_progress(slug, db_path=db_path) or {}
+            found = int(prog.get("found") or 0)
+            start = int(prog.get("last_page") or 0) + 1
+            cap = int(page_cap or MAX_DIR_SLUG_PAGES)
+            partition_ok = True
+            try:
+                page = start
+                while page <= cap:
+                    if db.stop_requested(job_id, db_path=db_path) or budget_hit():
+                        partition_ok = False
+                        incomplete = True
+                        break
+                    data = client.fetch_listing(slug, page)
+                    colls = data.get("colleges")
+                    if colls is None:
+                        # nearby_city_page (tiny state) -> HTML listing fallback
+                        cobjs, _cnt = parse_listing_html_colleges(client.get_text(f"{SITE}/{slug}"))
+                        rows = [parse_directory_college(c, slug) for c in cobjs]
+                        found += _write_rows(job_id, cfg, "colleges_directory", rows, db_path)
+                        db.set_dir_progress(slug, "done", found, page, db_path=db_path)
+                        break
+                    if not colls:
+                        break   # empty page = genuine end / past the ceiling
+                    rows = [parse_directory_college(c, slug) for c in colls]
+                    found += _write_rows(job_id, cfg, "colleges_directory", rows, db_path)
+                    db.set_dir_progress(slug, "partial", found, page, db_path=db_path)
+                    if not data.get("hasNext", False):
+                        break
+                    page += 1
+                    time.sleep(adaptive.value())
+                if partition_ok:
+                    db.set_dir_progress(slug, "done", found, page, db_path=db_path)
+            except Exception as err:  # noqa: BLE001
+                db.set_dir_progress(slug, "partial", found,
+                                    int(prog.get("last_page") or 0), db_path=db_path)
+                log(f"  ! partition '{slug}' soft-fail: {str(err)[:70]}")
+            processed += 1
+            reqs, byts, _ = stats.snapshot()
+            staged = (sum(db.staged_summary(job_id, db_path=db_path).values())
+                      if cfg.get("staging", True) else db.counts(db_path=db_path).get("colleges", 0))
+            db.update_job(job_id, done_units=processed, items_written=staged,
+                          req_count=reqs, bytes_count=byts,
+                          message=f"{processed}/{total_units} partitions · {staged:,} colleges · "
+                                  f"{byts/1048576:.1f} MB", db_path=db_path)
+            log(f"  ✓ {slug}: +{found} colleges ({processed}/{total_units} partitions)")
+    except Exception as err:  # noqa: BLE001
+        db.update_job(job_id, status="error", message=str(err)[:300],
+                      finished_at=time.time(), db_path=db_path)
+        log(f"ERROR: {err}")
+        raise
+
+    # Quality gate: promoted rows must be within 5% of the API-reported total.
+    cfg.setdefault("validation_rules", {})
+    cfg["validation_rules"]["min_rows"] = int(0.95 * expected) if expected else 1
+    reqs, byts, _ = stats.snapshot()
+    staged = (sum(db.staged_summary(job_id, db_path=db_path).values())
+              if cfg.get("staging", True) else db.counts(db_path=db_path).get("colleges", 0))
+    if incomplete or db.stop_requested(job_id, db_path=db_path):
+        msg = (f"INCOMPLETE — {processed}/{total_units} partitions, {staged:,} directory "
+               f"colleges staged. Resume to continue.")
+        db.update_job(job_id, status="stopped", message=msg, finished_at=time.time(),
+                      req_count=reqs, bytes_count=byts, db_path=db_path)
+        log(msg)
+    else:
+        msg = (f"done: {staged:,}/{expected:,} directory colleges across "
+               f"{total_units} partitions, {byts/1048576:.1f} MB")
+        db.update_job(job_id, status="completed", message=msg, finished_at=time.time(),
+                      req_count=reqs, bytes_count=byts, db_path=db_path)
+        log(msg)
+        send_notification(cfg, "Collegedunia Directory complete", msg, log)

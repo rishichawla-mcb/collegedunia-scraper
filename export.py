@@ -17,7 +17,7 @@ from openpyxl.utils import get_column_letter
 
 import db
 
-TABLES = ("courses", "colleges", "offerings", "college_courses")
+TABLES = ("courses", "colleges", "offerings", "college_courses", "colleges_directory")
 
 
 def _fetch(table: str, db_path: str = db.DB_PATH) -> Tuple[List[str], List[tuple]]:
@@ -105,6 +105,27 @@ def to_analytics_xlsx(db_path: str = db.DB_PATH) -> bytes:
                 wrote = True
         if not wrote:
             pd.DataFrame({"info": ["no data yet"]}).to_excel(xl, sheet_name="empty", index=False)
+    return buf.getvalue()
+
+
+def to_master_xlsx(db_path: str = db.DB_PATH) -> bytes:
+    """One analytical sheet: each offering joined with college enrichment."""
+    import pandas as pd
+    with db.connect(db_path) as conn:
+        df = pd.read_sql_query(
+            "SELECT o.course_name, o.course_type, o.level, o.college_name, o.city, "
+            "o.state_id, o.fees_amount AS first_year_fee_inr, o.fees_text, o.eligibility, "
+            "o.exam_name, o.duration, o.ranking_rank, o.ranking_agency, o.course_rating, "
+            "o.reviews_count, o.cutoff_exam, o.cutoff_value, o.admission_start, "
+            "o.admission_end, c.website, c.email, c.phone, "
+            "c.rating_value AS college_rating, c.rating_count AS college_reviews, "
+            "c.address, o.university_link "
+            "FROM offerings o LEFT JOIN colleges c ON o.college_id=c.college_id "
+            "LIMIT 200000", conn)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
+        (df if not df.empty else pd.DataFrame({"info": ["no offerings yet"]})).to_excel(
+            xl, sheet_name="master", index=False)
     return buf.getvalue()
 
 

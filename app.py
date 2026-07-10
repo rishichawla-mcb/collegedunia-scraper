@@ -511,8 +511,9 @@ with tab_run:
     st.caption("Each phase has its own screen, live progress, staged-data view and logs. "
                "Flow: ① Courses → ② Colleges/course → ③ Enrichment → ④ Courses & fees · "
                "every run stages → validates → promotes to master.")
-    p1, p2, p3, p4 = st.tabs(
-        ["①  Courses", "②  Colleges / course", "③  Enrichment", "④  Courses & Fees"])
+    p1, p2, p3, p4, p5 = st.tabs(
+        ["①  Courses", "②  Colleges / course", "③  Enrichment", "④  Courses & Fees",
+         "⑤  Directory"])
 
     # ============================ Phase 1 ============================
     with p1:
@@ -788,6 +789,71 @@ with tab_run:
                 rc3.metric("In Phase 4 only", f"{only_cc:,}",
                            help="Colleges the course-finder never surfaced — the gap this fills.")
         render_job_monitor(["college_courses"], "p4")
+
+    # ============================ Directory ============================
+    with p5:
+        st.subheader("Directory — full india-colleges baseline")
+        st.info("**Use case:** scrape the complete college directory (~20,700 colleges across "
+                "35 states) as a **coverage baseline** to find colleges Phase 2 missed. "
+                "State-partitioned to beat the listing API's ~999-page ceiling; dedupes on "
+                "college_id (tiny states use an HTML fallback). Outputs `colleges_directory`.")
+        with db.connect() as conn:
+            dir_total = conn.execute("SELECT COUNT(*) FROM colleges_directory").fetchone()[0]
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Directory colleges", f"{dir_total:,}")
+        d2.metric("Phase-2 colleges", f"{c['colleges']:,}")
+        d3.metric("Target (approx)", "~20,700")
+        st.caption("📊 Budget est.: ~Σ⌈state/10⌉ + 998 base-sweep ≈ **~3,100 requests** "
+                   "(~40–60 MB) — cheap vs Phase 2.")
+        base_sweep = st.checkbox("Base sweep of india-colleges pages 1–998 (extra safety net)",
+                                 value=True, key="dirbase",
+                                 help="Redundant with the state partitions but a cheap safety "
+                                      "net. Everything dedupes on college_id.")
+        dforce = st.checkbox("Force re-scrape (ignore per-state resume)", key="dirforce")
+        if st.button("🗺️ Start directory scrape", type="primary", key="rundir"):
+            cfg = proxy_config_from_ui()
+            cfg["base_sweep"] = bool(base_sweep)
+            cfg["force_rescrape"] = bool(dforce)
+            jid = db.create_job("directory", cfg)
+            launch_worker(jid)
+            st.session_state["watch_p5"] = jid
+            st.success(f"Started directory scrape — job #{jid}")
+        render_job_monitor(["directory"], "p5")
+
+        st.divider()
+        st.markdown("#### 🎯 Coverage vs Phase 2")
+        if dir_total == 0:
+            st.info("Run the directory scrape first to compare coverage.")
+        else:
+            cov = db.dir_coverage_summary()
+            overlap_pct = (100.0 * cov["overlap"] / cov["directory_total"]) if cov["directory_total"] else 0.0
+            missing_total = cov["directory_total"] - cov["overlap"]
+            cc1, cc2, cc3 = st.columns(3)
+            cc1.metric("Directory total", f"{cov['directory_total']:,}")
+            cc2.metric("In Phase 2 (overlap)", f"{cov['overlap']:,}", f"{overlap_pct:.1f}% covered")
+            cc3.metric("Missing from Phase 2", f"{missing_total:,}")
+            if cov["by_state"]:
+                st.markdown("**By state** — directory vs in-Phase-2 vs missing")
+                st.dataframe(pd.DataFrame(cov["by_state"]), use_container_width=True, height=280)
+            st.markdown("**Missing colleges** (in directory, not in Phase 2)")
+            miss = db.dir_missing_from_phase2(limit=2000)
+            if miss:
+                st.dataframe(pd.DataFrame(miss), use_container_width=True, height=260)
+                st.download_button(
+                    "⬇️ Download ALL missing (CSV)",
+                    data=pd.DataFrame(db.dir_missing_from_phase2(limit=500000))
+                         .to_csv(index=False).encode("utf-8"),
+                    file_name="directory_missing_from_phase2.csv", mime="text/csv", key="dlmiss")
+                if st.button(f"➕ Queue {missing_total:,} missing colleges into Phase 4", key="qmiss"):
+                    nq = db.queue_missing_for_phase4()
+                    st.success(f"Queued {nq:,} colleges. Run Phase 4 → 'Known colleges' to scrape "
+                               "their courses-fees pages.")
+            else:
+                st.success("✅ No gaps — every directory college is present in Phase 2.")
+            with st.expander("🔁 In Phase 2 but NOT in directory (usually fine — flagged)"):
+                extra = db.dir_extra_not_in_directory(limit=2000)
+                st.dataframe(pd.DataFrame(extra), use_container_width=True, height=220) if extra \
+                    else st.caption("None.")
 
 
 # ---------------------------------------------------------------------------
@@ -1078,7 +1144,8 @@ with tab_data:
     st.info("**Use case:** browse the raw master tables (`courses`, `colleges`, `offerings`, "
             "`college_courses`), quick-filter by name/city, and export the whole table to "
             "CSV / JSON / Excel (single table or all tables in one workbook).")
-    table = st.selectbox("Table", ["courses", "colleges", "offerings", "college_courses"])
+    table = st.selectbox("Table", ["courses", "colleges", "offerings", "college_courses",
+                                   "colleges_directory"])
     with db.connect() as conn:
         ncols = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
     st.caption(f"{ncols:,} rows in `{table}`")

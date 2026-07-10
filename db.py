@@ -252,6 +252,35 @@ CREATE TABLE IF NOT EXISTS staging (
     UNIQUE(job_id, table_name, pk)
 );
 
+-- Directory phase: the complete india-colleges directory (coverage baseline).
+CREATE TABLE IF NOT EXISTS colleges_directory (
+    college_id      INTEGER PRIMARY KEY,
+    name            TEXT,
+    short_form      TEXT,
+    city            TEXT,
+    city_id         INTEGER,
+    state           TEXT,
+    state_id        INTEGER,
+    link            TEXT,
+    rating          REAL,
+    naac_grading    TEXT,
+    top_course_fees TEXT,
+    course_count    INTEGER,
+    approvals       TEXT,
+    source_slug     TEXT,
+    raw_json        TEXT,
+    scraped_at      REAL
+);
+
+-- Per-partition (state slug / base sweep) progress for Directory resume.
+CREATE TABLE IF NOT EXISTS dir_progress (
+    slug       TEXT PRIMARY KEY,
+    status     TEXT,            -- 'partial' | 'done'
+    found      INTEGER DEFAULT 0,
+    last_page  INTEGER DEFAULT 0,
+    updated_at REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_offerings_course ON offerings(course_id);
 CREATE INDEX IF NOT EXISTS idx_offerings_college ON offerings(college_id);
 CREATE INDEX IF NOT EXISTS idx_cc_college ON college_courses(college_id);
@@ -306,7 +335,8 @@ def init_db(db_path: str = DB_PATH) -> None:
             "courses INTEGER, colleges INTEGER, offerings INTEGER, "
             "college_courses INTEGER, note TEXT)")
         # Migration: provenance column on master tables.
-        for tbl in ("courses", "colleges", "offerings", "college_courses"):
+        for tbl in ("courses", "colleges", "offerings", "college_courses",
+                    "colleges_directory"):
             cols = {r[1] for r in conn.execute(f"PRAGMA table_info({tbl})")}
             if "source_job_id" not in cols:
                 conn.execute(f"ALTER TABLE {tbl} ADD COLUMN source_job_id INTEGER")
@@ -556,6 +586,104 @@ def get_cc_done_ids(db_path: str = DB_PATH) -> set:
             "SELECT college_id FROM cc_progress WHERE status IN ('done','empty')")}
 
 
+# ---------------------------------------------------------------------------
+# Directory phase (india-colleges coverage baseline)
+# ---------------------------------------------------------------------------
+def upsert_colleges_directory(rows: Iterable[Dict[str, Any]], db_path: str = DB_PATH) -> int:
+    rows = [r for r in rows if r.get("college_id") is not None]
+    if not rows:
+        return 0
+    cols = ["college_id", "name", "short_form", "city", "city_id", "state",
+            "state_id", "link", "rating", "naac_grading", "top_course_fees",
+            "course_count", "approvals", "source_slug", "raw_json", "scraped_at",
+            "source_job_id"]
+    ph = ",".join("?" for _ in cols)
+    sql = (f"INSERT INTO colleges_directory ({','.join(cols)}) VALUES ({ph}) "
+           f"ON CONFLICT(college_id) DO UPDATE SET "
+           + ",".join(f"{c}=excluded.{c}" for c in cols if c != "college_id"))
+    with connect(db_path) as conn:
+        conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
+    return len(rows)
+
+
+def set_dir_progress(slug: str, status: str, found: int, last_page: int = 0,
+                     db_path: str = DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO dir_progress(slug, status, found, last_page, updated_at) "
+            "VALUES(?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET status=excluded.status, "
+            "found=excluded.found, last_page=excluded.last_page, updated_at=excluded.updated_at",
+            (slug, status, int(found or 0), int(last_page or 0), time.time()))
+
+
+def get_dir_progress(slug: str, db_path: str = DB_PATH) -> Optional[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM dir_progress WHERE slug=?", (slug,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_dir_done_slugs(db_path: str = DB_PATH) -> set:
+    with connect(db_path) as conn:
+        return {r[0] for r in conn.execute("SELECT slug FROM dir_progress WHERE status='done'")}
+
+
+def dir_missing_from_phase2(limit: int = 500000, db_path: str = DB_PATH) -> List[Dict[str, Any]]:
+    """Directory colleges NOT present in the Phase-2 colleges table (the gap)."""
+    with connect(db_path) as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT d.college_id, d.name, d.city, d.state, d.state_id, d.link, "
+            "d.course_count, d.source_slug FROM colleges_directory d "
+            "LEFT JOIN colleges c ON c.college_id = d.college_id "
+            "WHERE c.college_id IS NULL ORDER BY d.college_id LIMIT ?", (int(limit),)).fetchall()]
+
+
+def dir_extra_not_in_directory(limit: int = 500000, db_path: str = DB_PATH) -> List[Dict[str, Any]]:
+    """Phase-2 colleges NOT present in the directory (usually fine — flag anyway)."""
+    with connect(db_path) as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT c.college_id, c.name, c.city, c.state_id FROM colleges c "
+            "LEFT JOIN colleges_directory d ON d.college_id = c.college_id "
+            "WHERE d.college_id IS NULL ORDER BY c.college_id LIMIT ?", (int(limit),)).fetchall()]
+
+
+def dir_coverage_summary(db_path: str = DB_PATH) -> Dict[str, Any]:
+    with connect(db_path) as conn:
+        dtot = conn.execute("SELECT COUNT(*) FROM colleges_directory").fetchone()[0]
+        p2 = conn.execute("SELECT COUNT(*) FROM colleges").fetchone()[0]
+        overlap = conn.execute(
+            "SELECT COUNT(*) FROM colleges_directory d "
+            "JOIN colleges c ON c.college_id = d.college_id").fetchone()[0]
+        by_state = [dict(r) for r in conn.execute(
+            "SELECT COALESCE(NULLIF(d.state,''),'?') AS state, COUNT(*) AS directory, "
+            "SUM(CASE WHEN c.college_id IS NOT NULL THEN 1 ELSE 0 END) AS in_phase2, "
+            "SUM(CASE WHEN c.college_id IS NULL THEN 1 ELSE 0 END) AS missing "
+            "FROM colleges_directory d LEFT JOIN colleges c ON c.college_id = d.college_id "
+            "GROUP BY d.state ORDER BY missing DESC").fetchall()]
+    return {"directory_total": dtot, "phase2_total": p2, "overlap": overlap, "by_state": by_state}
+
+
+def queue_missing_for_phase4(db_path: str = DB_PATH) -> int:
+    """Insert directory colleges missing from Phase 2 into the Phase-4 work queue
+    (cc_progress with status 'queued'), so their courses-fees pages get scraped.
+    Leaves already-done/empty colleges untouched."""
+    ids = [r["college_id"] for r in dir_missing_from_phase2(db_path=db_path)]
+    if not ids:
+        return 0
+    with connect(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO cc_progress(college_id, status, found, last_page, updated_at) "
+            "VALUES(?, 'queued', 0, 0, ?) ON CONFLICT(college_id) DO UPDATE SET "
+            "status='queued' WHERE cc_progress.status NOT IN ('done','empty')",
+            [(i, time.time()) for i in ids])
+    return len(ids)
+
+
+def list_cc_queued_ids(db_path: str = DB_PATH) -> List[int]:
+    with connect(db_path) as conn:
+        return [r[0] for r in conn.execute(
+            "SELECT college_id FROM cc_progress WHERE status='queued'")]
+
+
 def list_known_college_ids(db_path: str = DB_PATH) -> List[int]:
     with connect(db_path) as conn:
         return [r[0] for r in conn.execute(
@@ -647,10 +775,12 @@ STAGE_PK = {
     "colleges": ["college_id"],
     "offerings": ["course_id", "college_id"],
     "college_courses": ["college_id", "course_name"],
+    "colleges_directory": ["college_id"],
 }
 _UPSERTERS = {
     "courses": "upsert_courses", "colleges": "upsert_colleges",
     "offerings": "upsert_offerings", "college_courses": "upsert_college_courses",
+    "colleges_directory": "upsert_colleges_directory",
 }
 
 
@@ -802,7 +932,8 @@ def wipe_data(keep_colleges: bool = True, db_path: str = DB_PATH) -> Dict[str, i
                            table, so Phases 2-4 start completely fresh.
     Returns rows deleted per table."""
     tables = ["offerings", "college_courses", "offering_progress",
-              "cc_progress", "staging", "logs", "jobs", "snapshots"]
+              "cc_progress", "colleges_directory", "dir_progress",
+              "staging", "logs", "jobs", "snapshots"]
     if not keep_colleges:
         tables.insert(0, "colleges")
     deleted: Dict[str, int] = {}
