@@ -44,8 +44,11 @@ import requests
 import db
 
 API_URL = "https://collegedunia.com/web-api/listing-cf"
+COURSES_LIST_API = "https://collegedunia.com/web-api/college/courses-list"
 SITE = "https://collegedunia.com"
 PAGE_SIZE = 10
+CC_PAGE_SIZE = 5          # courses-list API returns 5 course groups per page
+MAX_CC_PAGES = 60         # hard safety cap on course pages per college
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -68,6 +71,29 @@ def base_headers() -> Dict[str, str]:
 def encode_payload(payload: Dict[str, Any]) -> str:
     raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     return base64.b64encode(raw).decode("ascii")
+
+
+def courses_list_payload(college_id: Any, page: Any) -> str:
+    """Base64 payload for the courses-list pagination API. Both fields must be
+    strings: {"id": "<college_id>", "course_page": "<n>"}."""
+    return encode_payload({"id": str(college_id), "course_page": str(page)})
+
+
+def iter_course_pages(fetch_page: "Callable[[int], Dict[str, Any]]",
+                      total_pages: int, start_page: int = 2,
+                      max_pages: int = MAX_CC_PAGES):
+    """Yield (page, data) for course-list API pages start_page..total_pages,
+    stopping as soon as a page reports hasNext=False. `total_pages` caps the
+    loop; `max_pages` is a hard safety cap. `fetch_page(page)` returns the API
+    JSON dict. Pure/generator so it's unit-testable without network."""
+    cap = min(int(total_pages or 0), int(max_pages))
+    page = int(start_page)
+    while page <= cap:
+        data = fetch_page(page)
+        yield page, data
+        if not (data or {}).get("hasNext", False):
+            break
+        page += 1
 
 
 def abs_url(path: Optional[str]) -> str:
@@ -395,6 +421,53 @@ class Client:
                     self.adaptive.on_block()
                 time.sleep(self.backoff * attempt + random.uniform(0, 2))
         raise RuntimeError(f"GET failed after {self.max_retries} attempts: {last_err}")
+
+    def fetch_courses_list(self, college_id: Any, page: int) -> Dict[str, Any]:
+        """Fetch one page of a college's course list from the internal
+        pagination API. Same retry / proxy-rotation / adaptive handling as
+        fetch(). Non-JSON responses and JSON sentinels {"status": 301|404} are
+        treated as soft failures (retried, then raised for the caller to mark
+        the college 'partial')."""
+        params = {"data": courses_list_payload(college_id, page)}
+        headers = {"User-Agent": random.choice(USER_AGENTS), "Accept": "application/json"}
+        last_err: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            proxy = self.pm.get(self.session_id)
+            try:
+                resp = self.session.get(
+                    COURSES_LIST_API, params=params, headers=headers,
+                    proxies=proxy.as_dict() if proxy else None, timeout=self.timeout)
+                self.stats.add(requests=1, byts=len(resp.content or b""))
+                if resp.status_code in (403, 429, 503):
+                    raise BlockedError(f"HTTP {resp.status_code}")
+                resp.raise_for_status()
+                ctype = resp.headers.get("Content-Type", "")
+                if "json" not in ctype and not resp.text.lstrip().startswith("{"):
+                    raise BlockedError("non-JSON courses-list response")
+                data = resp.json()
+                if data.get("status") in (301, 404):
+                    raise BlockedError(f"courses-list status {data.get('status')}")
+                self.pm.report_success(proxy)
+                if self.adaptive:
+                    self.adaptive.on_success()
+                if self.verbose:
+                    self.log(f"   · courses-list col {college_id} p{page} → "
+                             f"{len(data.get('courses') or [])} groups "
+                             f"(hasNext={data.get('hasNext')})")
+                return data
+            except (BlockedError, requests.RequestException, ValueError) as err:
+                last_err = err
+                self.stats.add(blocks=1)
+                self.pm.report_failure(proxy)
+                rotated = self._maybe_rotate(err)
+                if self.adaptive and not rotated:
+                    self.adaptive.on_block()
+                wait = self.backoff * attempt + random.uniform(0, 2)
+                self.log(f"  ! courses-list col {college_id} p{page} attempt "
+                         f"{attempt}/{self.max_retries} failed: {err}"
+                         f"{' [rotating IP]' if rotated else ''} -> retry in {wait:.0f}s")
+                time.sleep(wait)
+        raise RuntimeError(f"courses-list failed after {self.max_retries} attempts: {last_err}")
 
 
 # ---------------------------------------------------------------------------
@@ -1363,43 +1436,58 @@ def parse_courses_fees(page_html: str) -> Dict[str, Any]:
             clist = None
         if clist:
             hostel = _hostel_from_tables(page_html)
-            courses: List[Dict[str, Any]] = []
-            seen = set()
-            for c in clist:
-                base = (c.get("display_name") or c.get("short_head") or "").strip()
-                if not base:
-                    continue
-                for s in (c.get("streams") or [{}]):
-                    spec = (s.get("name") or "").strip()
-                    fd = s.get("fees_data") or {}
-                    amt_fmt = fd.get("amount_formatted") or ""
-                    adm = s.get("admission") or {}
-                    is_spec = bool(spec) and spec.lower() != "general"
-                    full = f"{base} ({spec})" if is_spec else base
-                    key = full.lower()
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    courses.append({
-                        "course_name": full,
-                        "specialization": spec if is_spec else "",
-                        "eligibility": (c.get("eligibility") or "").strip(),
-                        "total_fees": ("₹" + amt_fmt) if amt_fmt else "",
-                        "fees_inr": _to_int(fd.get("amount")),
-                        "hostel_fees": hostel,
-                        "duration": (c.get("duration") or "").strip(),
-                        "mode": c.get("type") or "",
-                        "level": c.get("level") or "",
-                        "course_type": c.get("course_type") or "",
-                        "rating": _to_float(c.get("course_rating")),
-                        "reviews_count": _to_int(c.get("reviews_count")),
-                        "application_start": _clean_date(adm.get("admission_start_date")),
-                        "application_end": _clean_date(adm.get("admission_end_date")),
-                    })
-            return {"college_name": college_name, "courses": courses,
+            return {"college_name": college_name,
+                    "courses": _course_group_rows(clist, hostel),
+                    "groups": clist, "hostel": hostel,
                     "course_count": cd.get("course_count"),
                     "total_pages": cd.get("total_pages")}
-    return _parse_cf_tables(page_html)
+    tbl = _parse_cf_tables(page_html)
+    tbl.setdefault("groups", [])
+    tbl.setdefault("hostel", "")
+    tbl.setdefault("total_pages", 1)
+    return tbl
+
+
+def _course_group_rows(clist: List[Dict[str, Any]], hostel: str = "",
+                       seen: Optional[set] = None) -> List[Dict[str, Any]]:
+    """Flatten a course_data.courses[] list (from __NEXT_DATA__ or the
+    courses-list API — identical schema) into per-(course, specialization) rows.
+    Pass a shared `seen` set to dedupe rows across multiple pages of one college."""
+    if seen is None:
+        seen = set()
+    rows: List[Dict[str, Any]] = []
+    for c in clist:
+        base = (c.get("display_name") or c.get("short_head") or "").strip()
+        if not base:
+            continue
+        for s in (c.get("streams") or [{}]):
+            spec = (s.get("name") or "").strip()
+            fd = s.get("fees_data") or {}
+            amt_fmt = fd.get("amount_formatted") or ""
+            adm = s.get("admission") or {}
+            is_spec = bool(spec) and spec.lower() != "general"
+            full = f"{base} ({spec})" if is_spec else base
+            key = full.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                "course_name": full,
+                "specialization": spec if is_spec else "",
+                "eligibility": (c.get("eligibility") or "").strip(),
+                "total_fees": ("₹" + amt_fmt) if amt_fmt else "",
+                "fees_inr": _to_int(fd.get("amount")),
+                "hostel_fees": hostel,
+                "duration": (c.get("duration") or "").strip(),
+                "mode": c.get("type") or "",
+                "level": c.get("level") or "",
+                "course_type": c.get("course_type") or "",
+                "rating": _to_float(c.get("course_rating")),
+                "reviews_count": _to_int(c.get("reviews_count")),
+                "application_start": _clean_date(adm.get("admission_start_date")),
+                "application_end": _clean_date(adm.get("admission_end_date")),
+            })
+    return rows
 
 
 def _parse_cf_tables(page_html: str) -> Dict[str, Any]:
@@ -1534,21 +1622,76 @@ def run_college_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_P
                 with prog_lock:
                     state["incomplete"] = True; state["msg"] = bh
                 stop_event.set(); return
-            client.session_id = f"cc{cid}"
+            client.session_id = f"col{cid}"          # one sticky IP: page-1 HTML + all API pages
             url = f"{SITE}/college/{cid}/courses-fees"
-            n = 0
+            prog = db.get_cc_progress(cid, db_path=db_path) or {}
+            resume_from = int(prog.get("last_page") or 0)
+            n = int(prog.get("found") or 0) if resume_from else 0
+            hostel = ""
+            seen_rows: set = set()               # row-level dedup across pages
+            seen_groups: set = set()             # group-level dedup on (name/slug, program type)
+
+            def _dedupe_groups(groups):
+                fresh = []
+                for g in (groups or []):
+                    gk = ((g.get("short_head") or g.get("display_name") or "").strip().lower(),
+                          (g.get("course_type") or "").strip().lower())
+                    if not gk[0] or gk in seen_groups:
+                        continue
+                    seen_groups.add(gk)
+                    fresh.append(g)
+                return fresh
+
+            def _stage(groups, cname):
+                nonlocal n
+                rows = _course_group_rows(_dedupe_groups(groups), hostel, seen_rows)
+                rows = [{**r, "college_id": cid, "college_name": cname,
+                         "source_url": url, "scraped_at": time.time()} for r in rows]
+                if rows:
+                    with db_lock:
+                        n += _write_rows(job_id, cfg, "college_courses", rows, db_path)
+
             try:
+                # Page 1 always comes from the SSR page (also yields hostel fee +
+                # total_pages + college name).
                 parsed = parse_courses_fees(client.get_text(url))
-                rows = [{**r, "college_id": cid, "college_name": parsed.get("college_name", ""),
-                         "source_url": url, "scraped_at": time.time()}
-                        for r in parsed.get("courses", [])]
-                with db_lock:
-                    n = _write_rows(job_id, cfg, "college_courses", rows, db_path)
-                    db.set_cc_progress(cid, "done" if n else "empty", n, db_path=db_path)
+                cname = parsed.get("college_name", "")
+                hostel = parsed.get("hostel", "")
+                total_pages = int(parsed.get("total_pages") or 1)
+                if resume_from:
+                    # Page 1 (…resume_from) already staged on a prior run — seed the
+                    # dedupe sets from page-1 groups and continue at resume_from+1.
+                    grp1 = _dedupe_groups(parsed.get("groups") or [])
+                    _course_group_rows(grp1, hostel, seen_rows)
+                    start = resume_from + 1
+                else:
+                    _stage(parsed.get("groups") or [], cname)
+                    with db_lock:
+                        db.set_cc_progress(cid, "partial", n, last_page=1, db_path=db_path)
+                    start = 2
+                # Pages 2..total_pages via the internal courses-list API.
+                completed = True
+                if total_pages > 1 and start <= total_pages:
+                    for page, data in iter_course_pages(
+                            lambda p: client.fetch_courses_list(cid, p),
+                            total_pages, start_page=start):
+                        _stage(data.get("courses") or [], cname)
+                        with db_lock:
+                            db.set_cc_progress(cid, "partial", n, last_page=page, db_path=db_path)
+                        if db.stop_requested(job_id, db_path=db_path) or budget_hit():
+                            completed = False
+                            break
+                        time.sleep(adaptive.value())
+                if completed:
+                    with db_lock:
+                        db.set_cc_progress(cid, "done" if n else "empty", n,
+                                           last_page=total_pages, db_path=db_path)
             except Exception as err:  # noqa: BLE001
+                # Soft failure (non-JSON / api 301|404 / proxy): leave the college
+                # 'partial' at the last good page so a resume retries the rest.
                 with db_lock:
-                    db.set_cc_progress(cid, "error", 0, db_path=db_path)
-                log(f"  college {cid} err: {str(err)[:60]}")
+                    db.set_cc_progress(cid, "partial", n, last_page=resume_from, db_path=db_path)
+                log(f"  college {cid} soft-fail: {str(err)[:70]}")
             with prog_lock:
                 state["done"] += 1
                 state["rows"] += n

@@ -444,9 +444,17 @@ def render_job_monitor(job_types, key: str, govern: bool = True) -> None:
                     st.session_state[f"diff{jid_}"] = db.diff_job(jid_)
                 if st.session_state.get(f"diff{jid_}"):
                     st.json(st.session_state[f"diff{jid_}"])
-                if job.get("promote_status") in ("pending", "rejected"):
+                # Promote / reject is available whenever a finished job has staged
+                # data that isn't promoted yet — including a job you stopped midway
+                # (it won't auto-promote, but you can write its partial data here).
+                finished = job["status"] not in ("running", "queued")
+                if finished and job.get("promote_status") != "promoted":
+                    if job.get("promote_status") not in ("pending", "rejected"):
+                        st.caption("⏸️ This job didn't finish, so it wasn't auto-promoted. "
+                                   "You can still write its partial staged data to master:")
                     ap1, ap2 = st.columns(2)
-                    if ap1.button("✅ Approve & promote", key=f"appr{key}{jid_}"):
+                    if ap1.button(f"✅ Promote staged → master ({sum(staged.values()):,} rows)",
+                                  key=f"appr{key}{jid_}"):
                         summ = db.promote_job(jid_)
                         st.success(f"Promoted {sum(summ.values()):,} rows to master.")
                         st.rerun()
@@ -737,9 +745,14 @@ with tab_run:
             ccfg["id_end"] = r2.number_input("ID end", 1, 100000, 2000, key="cce")
             ccfg["use_known"] = False
             n_target = int(ccfg["id_end"]) - int(ccfg["id_start"]) + 1
-        est_mb = n_target * 500 / 1024
-        st.info(f"📊 ~{n_target:,} colleges → ~**{est_mb:.0f} MB** ({est_mb/1024:.2f} GB) "
-                f"at ~0.5 MB each. Set a budget cap for big ranges.")
+        # Each college = 1 SSR page (~0.5 MB) + extra courses-list API pages
+        # (~15 KB each). total_pages isn't known until scrape time, so estimate
+        # ~2 extra pages/college (page_size 5); actuals are followed via hasNext.
+        est_api_pages = n_target * 2
+        est_mb = (n_target * 500 + est_api_pages * 15) / 1024
+        st.info(f"📊 ~{n_target:,} colleges → ~{n_target + est_api_pages:,} requests "
+                f"(1 page each + ~{est_api_pages:,} pagination calls) → ~**{est_mb:.0f} MB** "
+                f"({est_mb/1024:.2f} GB), est. Set a budget cap for big ranges.")
         ct1, ct2 = st.columns(2)
         cc_conc = ct1.number_input("Parallel workers", 1, 20, 3, key="cconc")
         cc_bud = ct2.number_input("Max bandwidth MB (0=∞)", 0, 200000, 0, step=200, key="ccbud")

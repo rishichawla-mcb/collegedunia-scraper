@@ -296,6 +296,10 @@ def init_db(db_path: str = DB_PATH) -> None:
                          ("application_end", "TEXT")):
             if col not in cccols:
                 conn.execute(f"ALTER TABLE college_courses ADD COLUMN {col} {typ}")
+        # Migration: last completed course_page for Phase-4 mid-college resume.
+        ccpcols = {r[1] for r in conn.execute("PRAGMA table_info(cc_progress)")}
+        if "last_page" not in ccpcols:
+            conn.execute("ALTER TABLE cc_progress ADD COLUMN last_page INTEGER DEFAULT 0")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS snapshots ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, "
@@ -529,13 +533,21 @@ def upsert_college_courses(rows: Iterable[Dict[str, Any]], db_path: str = DB_PAT
     return len(rows)
 
 
-def set_cc_progress(college_id: int, status: str, found: int, db_path: str = DB_PATH) -> None:
+def set_cc_progress(college_id: int, status: str, found: int, last_page: int = 0,
+                    db_path: str = DB_PATH) -> None:
     with connect(db_path) as conn:
         conn.execute(
-            "INSERT INTO cc_progress(college_id, status, found, updated_at) VALUES(?,?,?,?) "
-            "ON CONFLICT(college_id) DO UPDATE SET status=excluded.status, "
-            "found=excluded.found, updated_at=excluded.updated_at",
-            (college_id, status, found, time.time()))
+            "INSERT INTO cc_progress(college_id, status, found, last_page, updated_at) "
+            "VALUES(?,?,?,?,?) ON CONFLICT(college_id) DO UPDATE SET status=excluded.status, "
+            "found=excluded.found, last_page=excluded.last_page, updated_at=excluded.updated_at",
+            (college_id, status, found, int(last_page or 0), time.time()))
+
+
+def get_cc_progress(college_id: int, db_path: str = DB_PATH) -> Optional[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM cc_progress WHERE college_id=?", (college_id,)).fetchone()
+    return dict(row) if row else None
 
 
 def get_cc_done_ids(db_path: str = DB_PATH) -> set:
@@ -871,8 +883,11 @@ def mark_stale_jobs_interrupted(idle_sec: int = 300, db_path: str = DB_PATH) -> 
 
 def resume_job(job_id: int, db_path: str = DB_PATH) -> None:
     """Re-queue an existing job so a worker picks it up and continues from its
-    saved progress (offering_progress / courses_resume_page / dedupe)."""
-    update_job(job_id, status="queued", stop_requested=0, finished_at=None, db_path=db_path)
+    saved progress (offering_progress / courses_resume_page / dedupe). Clearing
+    promote_status lets it auto-promote the full staged set when it completes —
+    even if some partial data was already promoted manually."""
+    update_job(job_id, status="queued", stop_requested=0, finished_at=None,
+               promote_status=None, db_path=db_path)
 
 
 def stop_requested(job_id: int, db_path: str = DB_PATH) -> bool:
