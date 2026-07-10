@@ -100,6 +100,41 @@ with db.connect(DB) as conn:
     ccrow = conn.execute("SELECT duration, rating, application_start FROM college_courses LIMIT 1").fetchone()
 check("college_courses stores rich columns", ccrow[0] == "3 Years" and ccrow[2] == "2026-10-30")
 
+print("MODULE 5b — Phase 4 pagination (courses-list API)")
+import base64 as _b64
+pl = scraper.courses_list_payload(25455, 2)
+check("courses_list_payload -> base64 of string id/page",
+      json.loads(_b64.b64decode(pl)) == {"id": "25455", "course_page": "2"})
+api_courses = [
+    {"display_name": "Master of Technology [M.Tech]", "short_head": "M.Tech", "course_type": "Degree",
+     "type": "Full Time", "level": "Post Graduation", "eligibility": "Graduation", "duration": "2 Years ",
+     "course_rating": 4.2, "reviews_count": 10,
+     "streams": [
+         {"name": "Computer Science And Engineering",
+          "fees_data": {"amount": 506000, "amount_formatted": "5.06 Lakhs"},
+          "admission": {"admission_start_date": "2026-01-01", "admission_end_date": "0000-00-00"}},
+         {"name": "General", "fees_data": {"amount": 500000, "amount_formatted": "5 Lakhs"}}]}]
+rws = scraper._course_group_rows(api_courses, hostel="₹50,000")
+check("parser accepts API-shaped courses list (identical schema)",
+      any(r["course_name"] == "Master of Technology [M.Tech] (Computer Science And Engineering)"
+          and r["fees_inr"] == 506000 and r["hostel_fees"] == "₹50,000" for r in rws))
+check("API parser: General stream keeps base name",
+      any(r["course_name"] == "Master of Technology [M.Tech]" and r["specialization"] == "" for r in rws))
+pages = {2: {"courses": [{"short_head": "A"}], "hasNext": True},
+         3: {"courses": [{"short_head": "B"}], "hasNext": False},
+         4: {"courses": [{"short_head": "C"}], "hasNext": True}}
+seen_pages = [p for p, _ in scraper.iter_course_pages(lambda p: pages[p], total_pages=5, start_page=2)]
+check("iter_course_pages stops on hasNext=false", seen_pages == [2, 3], str(seen_pages))
+seen_resume = [p for p, _ in scraper.iter_course_pages(
+    lambda p: {"courses": [], "hasNext": p < 4}, total_pages=4, start_page=3)]
+check("iter_course_pages resumes from stored start_page", seen_resume == [3, 4], str(seen_resume))
+seen_cap = [p for p, _ in scraper.iter_course_pages(
+    lambda p: {"courses": [], "hasNext": True}, total_pages=999, start_page=2, max_pages=5)]
+check("iter_course_pages honours hard page cap", seen_cap == [2, 3, 4, 5], str(seen_cap))
+db.set_cc_progress(70707, "partial", 12, last_page=3, db_path=DB)
+ccp = db.get_cc_progress(70707, DB)
+check("cc_progress stores/reads last_page (resume)", ccp and ccp["last_page"] == 3 and ccp["status"] == "partial")
+
 print("MODULE 6 — Live scraper helpers")
 html = ('<title>X</title><div class="card"><a class="name" href="/c/1">Alpha</a>'
         '<span class="fee">2.1 Lakhs</span></div>')
