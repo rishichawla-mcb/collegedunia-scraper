@@ -105,8 +105,24 @@ if not st.session_state.get("_recovered"):
     st.session_state["_recovered"] = True
     for _j in db.list_jobs(20):
         if _j["status"] in ("running", "queued") and not _pid_alive(_j.get("pid")):
+            # The worker died (crash / OOM-kill / restart). Save its staged data:
+            # in incremental mode the bulk is already in master; flush the tail too
+            # so nothing scraped is lost. (Strict-gate jobs keep their staging for
+            # manual review.)
+            try:
+                _jcfg = json.loads(_j.get("config_json") or "{}")
+            except Exception:
+                _jcfg = {}
+            _saved = ""
+            try:
+                if _jcfg.get("incremental_promote", True) and db.staged_summary(_j["id"]):
+                    db.flush_job_staging(_j["id"])
+                    db.update_job(_j["id"], promote_status="promoted")
+                    _saved = " — staged data promoted to master"
+            except Exception:
+                pass
             db.update_job(_j["id"], status="stopped",
-                          message="interrupted (worker not running) — resume to continue")
+                          message=f"interrupted (worker not running){_saved}; resume to continue")
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +202,7 @@ def proxy_config_from_ui() -> dict:
         # governance: stage -> validate -> promote
         "staging": st.session_state.get("staging", True),
         "auto_promote": st.session_state.get("auto_promote", True),
+        "incremental_promote": st.session_state.get("incremental_promote", True),
         "validation_rules": {
             "min_rows": int(st.session_state.get("v_min_rows", 1)),
             "max_missing_fee_pct": float(st.session_state.get("v_max_missing", 100)),
@@ -308,6 +325,13 @@ st.session_state["staging"] = st.sidebar.checkbox(
 st.session_state["auto_promote"] = st.sidebar.checkbox(
     "Auto-promote when QC passes", value=True,
     help="Clean jobs merge to master automatically; failed ones wait for your approval.")
+st.session_state["incremental_promote"] = st.sidebar.checkbox(
+    "🧠 Incremental promote (memory-safe)", value=True,
+    help="Move staged rows to master continuously during the run (in small chunks) "
+         "instead of only at the end. Keeps memory low and means an interrupted / "
+         "OOM-killed job keeps everything scraped so far — you lose at most the last "
+         "chunk, which a resume re-scrapes. Turn OFF for the strict validate-then-"
+         "promote-once gate.")
 st.session_state["v_pass_score"] = st.sidebar.number_input("QC pass score (0-100)", 0, 100, 70)
 st.session_state["v_min_rows"] = st.sidebar.number_input("QC: min rows", 0, 100000, 1)
 st.session_state["v_max_missing"] = st.sidebar.number_input("QC: max missing-fee %", 0, 100, 100)
@@ -805,10 +829,12 @@ with tab_run:
         d3.metric("Target (approx)", "~20,700")
         st.caption("📊 Budget est.: ~Σ⌈state/10⌉ + 998 base-sweep ≈ **~3,100 requests** "
                    "(~40–60 MB) — cheap vs Phase 2.")
-        base_sweep = st.checkbox("Base sweep of india-colleges pages 1–998 (extra safety net)",
-                                 value=True, key="dirbase",
-                                 help="Redundant with the state partitions but a cheap safety "
-                                      "net. Everything dedupes on college_id.")
+        base_sweep = st.checkbox("Base sweep of india-colleges pages 1–998 (optional, off)",
+                                 value=False, key="dirbase",
+                                 help="Redundant with the state partitions (which already give "
+                                      "full coverage) and tends to hit 403s near the API's "
+                                      "~999-page ceiling. Leave OFF unless you want the extra "
+                                      "safety net; everything dedupes on college_id.")
         dforce = st.checkbox("Force re-scrape (ignore per-state resume)", key="dirforce")
         if st.button("🗺️ Start directory scrape", type="primary", key="rundir"):
             cfg = proxy_config_from_ui()
