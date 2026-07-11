@@ -9,9 +9,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Persist the SQLite DB outside the image (mount a volume / disk at /data)
+# Persist the SQLite DB outside the image. Do NOT use a Docker VOLUME here —
+# Railway rejects it. Instead attach a Railway Volume mounted at /data (Render
+# uses a Persistent Disk at /data). CD_DB_PATH already points at /data/data.db.
 RUN mkdir -p /data
-VOLUME ["/data"]
 
 EXPOSE 8501
 
