@@ -815,24 +815,40 @@ def _staged_or_master_count(job_id: int, cfg: Dict[str, Any], db_path: str) -> i
     return sum(db.counts(db_path=db_path).values())
 
 
+def _maybe_flush(job_id: int, cfg: Dict[str, Any], db_path: str) -> None:
+    """Incremental promotion: move staged rows to master mid-run (in memory-safe
+    chunks) so the data survives an interrupted/OOM-killed job and staging stays
+    small. Enabled by default; turn off cfg['incremental_promote'] for the strict
+    stage-all-then-validate-then-promote gate."""
+    if cfg.get("staging", True) and cfg.get("incremental_promote", True):
+        try:
+            db.flush_job_staging(job_id, db_path=db_path)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _finalize_job(job_id: int, cfg: Dict[str, Any], log: Callable[[str], None],
                   base_msg: str, db_path: str) -> None:
-    """Validate a job's staged data; auto-promote if it passes, else leave it
-    staged and pending manual approval. No-op (just mark completed) when staging
-    is off."""
+    """Finalize a completed job. With incremental promotion on (default), the bulk
+    is already in master — just flush the remaining tail and mark promoted. In the
+    strict mode, validate the full staged set and auto-promote only if it passes."""
     if not cfg.get("staging", True):
         db.update_job(job_id, status="completed", message=base_msg,
                       finished_at=time.time(), db_path=db_path)
         return
+    incremental = cfg.get("incremental_promote", True)
     v = db.validate_job(job_id, cfg.get("validation_rules") or {}, db_path=db_path)
     staged = sum(db.staged_summary(job_id, db_path=db_path).values())
     db.update_job(job_id, quality_score=v["score"], staged_rows=staged, db_path=db_path)
     auto = cfg.get("auto_promote", True)
-    if v["passed"] and auto:
-        summ = db.promote_job(job_id, db_path=db_path)
-        msg = f"{base_msg} · QC {v['score']:.0f}/100 ✓ promoted ({sum(summ.values())} rows)"
-        db.update_job(job_id, status="completed", promote_status="promoted",
-                      message=msg, finished_at=time.time(), db_path=db_path)
+    if incremental or (v["passed"] and auto):
+        summ = db.flush_job_staging(job_id, db_path=db_path)
+        db.update_job(job_id, promote_status="promoted", db_path=db_path)
+        tag = ("promoted (incremental, memory-safe)" if incremental
+               else f"QC {v['score']:.0f}/100 ✓ promoted ({sum(summ.values())} rows)")
+        msg = f"{base_msg} · {tag}"
+        db.update_job(job_id, status="completed", message=msg,
+                      finished_at=time.time(), db_path=db_path)
         log(msg)
         send_notification(cfg, "Collegedunia job promoted", msg, log)
     else:
@@ -1173,6 +1189,7 @@ def run_offerings(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
                           message=f"{p}/{total_courses} courses · {o} offerings · "
                                   f"{byts/1048576:.1f} MB · {blocks} blocks · "
                                   f"delay {adaptive.value():.1f}s", db_path=db_path)
+            _maybe_flush(job_id, cfg, db_path)   # incremental promote (memory-safe)
 
     def scrape_course(cid: int, client: Client) -> int:
         client.session_id = f"crs{cid}"   # one sticky IP per course's pagination
@@ -1660,6 +1677,7 @@ def run_college_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_P
                           bytes_count=byts,
                           message=f"{d}/{total} colleges · {rw} course-rows · {byts/1048576:.1f} MB",
                           db_path=db_path)
+            _maybe_flush(job_id, cfg, db_path)   # incremental promote (memory-safe)
 
     q: "_queue.Queue" = _queue.Queue()
     for i in ids:
@@ -1978,6 +1996,17 @@ def run_directory(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
                     rows = [parse_directory_college(c, slug) for c in colls]
                     found += _write_rows(job_id, cfg, "colleges_directory", rows, db_path)
                     db.set_dir_progress(slug, "partial", found, page, db_path=db_path)
+                    if page % 10 == 0:
+                        # Live metrics + incremental flush mid-partition (the base
+                        # sweep is one long 998-page partition, so don't wait for it
+                        # to finish before updating the dashboard / promoting).
+                        _maybe_flush(job_id, cfg, db_path)
+                        reqs, byts, _ = stats.snapshot()
+                        got = (db.count_promoted(job_id, "colleges_directory", db_path=db_path)
+                               + db.staged_summary(job_id, db_path=db_path).get("colleges_directory", 0))
+                        db.update_job(job_id, items_written=got, req_count=reqs, bytes_count=byts,
+                                      message=f"{slug} p{page} · {got:,} colleges · "
+                                              f"{byts/1048576:.1f} MB", db_path=db_path)
                     if not data.get("hasNext", False):
                         break
                     page += 1
@@ -1988,13 +2017,15 @@ def run_directory(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
                 db.set_dir_progress(slug, "partial", found,
                                     int(prog.get("last_page") or 0), db_path=db_path)
                 log(f"  ! partition '{slug}' soft-fail: {str(err)[:70]}")
+            _maybe_flush(job_id, cfg, db_path)   # incremental promote (memory-safe)
             processed += 1
             reqs, byts, _ = stats.snapshot()
-            staged = (sum(db.staged_summary(job_id, db_path=db_path).values())
-                      if cfg.get("staging", True) else db.counts(db_path=db_path).get("colleges", 0))
-            db.update_job(job_id, done_units=processed, items_written=staged,
+            got = ((db.count_promoted(job_id, "colleges_directory", db_path=db_path)
+                    + db.staged_summary(job_id, db_path=db_path).get("colleges_directory", 0))
+                   if cfg.get("staging", True) else db.counts(db_path=db_path).get("colleges", 0))
+            db.update_job(job_id, done_units=processed, items_written=got,
                           req_count=reqs, bytes_count=byts,
-                          message=f"{processed}/{total_units} partitions · {staged:,} colleges · "
+                          message=f"{processed}/{total_units} partitions · {got:,} colleges · "
                                   f"{byts/1048576:.1f} MB", db_path=db_path)
             log(f"  ✓ {slug}: +{found} colleges ({processed}/{total_units} partitions)")
     except Exception as err:  # noqa: BLE001
@@ -2006,17 +2037,19 @@ def run_directory(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
     # Quality gate: promoted rows must be within 5% of the API-reported total.
     cfg.setdefault("validation_rules", {})
     cfg["validation_rules"]["min_rows"] = int(0.95 * expected) if expected else 1
+    _maybe_flush(job_id, cfg, db_path)
     reqs, byts, _ = stats.snapshot()
-    staged = (sum(db.staged_summary(job_id, db_path=db_path).values())
-              if cfg.get("staging", True) else db.counts(db_path=db_path).get("colleges", 0))
+    got = ((db.count_promoted(job_id, "colleges_directory", db_path=db_path)
+            + db.staged_summary(job_id, db_path=db_path).get("colleges_directory", 0))
+           if cfg.get("staging", True) else db.counts(db_path=db_path).get("colleges", 0))
     if incomplete or db.stop_requested(job_id, db_path=db_path):
-        msg = (f"INCOMPLETE — {processed}/{total_units} partitions, {staged:,} directory "
-               f"colleges staged. Resume to continue.")
+        msg = (f"INCOMPLETE — {processed}/{total_units} partitions, {got:,} directory "
+               f"colleges. Resume to continue.")
         db.update_job(job_id, status="stopped", message=msg, finished_at=time.time(),
                       req_count=reqs, bytes_count=byts, db_path=db_path)
         log(msg)
     else:
-        msg = (f"done: {staged:,}/{expected:,} directory colleges across "
+        msg = (f"done: {got:,}/{expected:,} directory colleges across "
                f"{total_units} partitions, {byts/1048576:.1f} MB")
         db.update_job(job_id, status="completed", message=msg, finished_at=time.time(),
                       req_count=reqs, bytes_count=byts, db_path=db_path)
