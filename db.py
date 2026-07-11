@@ -812,6 +812,17 @@ def staged_summary(job_id: int, db_path: str = DB_PATH) -> Dict[str, int]:
             (job_id,)).fetchall()}
 
 
+def count_promoted(job_id: int, table: str, db_path: str = DB_PATH) -> int:
+    """Rows in a master table promoted by this job (source_job_id). Used with
+    incremental promotion, where staging is emptied as data lands in master."""
+    with connect(db_path) as conn:
+        try:
+            return conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE source_job_id=?", (job_id,)).fetchone()[0]
+        except Exception:  # noqa: BLE001
+            return 0
+
+
 def get_staged_rows(job_id: int, table_name: str, limit: int = 1000,
                     db_path: str = DB_PATH) -> List[Dict[str, Any]]:
     with connect(db_path) as conn:
@@ -846,71 +857,87 @@ def diff_job(job_id: int, db_path: str = DB_PATH) -> Dict[str, Dict[str, int]]:
 
 def validate_job(job_id: int, rules: Optional[Dict[str, Any]] = None,
                  db_path: str = DB_PATH) -> Dict[str, Any]:
-    """Score a job's staged data 0-100 against simple rules. Returns
-    {score, passed, checks:[...], total}."""
+    """Score a job's staged data 0-100 against simple rules. Streams the staging
+    rows one at a time (O(1) memory — safe for very large jobs on small hosts).
+    Returns {score, passed, checks:[...], total}."""
     rules = rules or {}
     min_rows = int(rules.get("min_rows", 1))
     max_missing_pct = float(rules.get("max_missing_fee_pct", 100))  # default lenient
     pass_score = float(rules.get("pass_score", 70))
 
-    rows_by_table: Dict[str, List[Dict[str, Any]]] = {}
+    total = fee_rows = fee_missing = blanks = 0
     with connect(db_path) as conn:
         for r in conn.execute(
                 "SELECT table_name, payload FROM staging WHERE job_id=?", (job_id,)):
-            rows_by_table.setdefault(r[0], []).append(json.loads(r[1]))
+            tbl = r[0]
+            try:
+                o = json.loads(r[1])
+            except (json.JSONDecodeError, TypeError):
+                o = {}
+            total += 1
+            if tbl in ("offerings", "college_courses"):
+                fee_rows += 1
+                if not (o.get("fees_amount") or o.get("total_fees")):
+                    fee_missing += 1
+            if tbl in ("courses", "offerings") and not o.get("name") and not o.get("course_name"):
+                blanks += 1
 
-    total = sum(len(v) for v in rows_by_table.values())
-    checks = []
+    checks = [{"check": "rows staged", "value": total, "ok": total >= min_rows}]
     score = 100.0
-
-    checks.append({"check": "rows staged", "value": total,
-                   "ok": total >= min_rows})
     if total < min_rows:
         score -= 50
-
-    # fee completeness on the fee-bearing tables
-    fee_rows = (rows_by_table.get("offerings", []) or
-                rows_by_table.get("college_courses", []))
     if fee_rows:
-        def has_fee(r):
-            return bool(r.get("fees_amount") or r.get("total_fees"))
-        missing = sum(1 for r in fee_rows if not has_fee(r))
-        pct = 100.0 * missing / max(1, len(fee_rows))
+        pct = 100.0 * fee_missing / max(1, fee_rows)
         ok = pct <= max_missing_pct
         checks.append({"check": "missing-fee %", "value": round(pct, 1), "ok": ok})
         if not ok:
             score -= min(40, pct - max_missing_pct)
-
-    # blank key fields
-    blanks = 0
-    for tbl, rws in rows_by_table.items():
-        for r in rws:
-            if tbl in ("courses", "offerings") and not r.get("name") and not r.get("course_name"):
-                blanks += 1
     checks.append({"check": "blank-name rows", "value": blanks, "ok": blanks == 0})
     if blanks:
         score -= min(20, blanks)
-
     score = max(0.0, round(score, 1))
     passed = total >= min_rows and score >= pass_score
     return {"score": score, "passed": passed, "checks": checks, "total": total}
 
 
-def promote_job(job_id: int, db_path: str = DB_PATH) -> Dict[str, int]:
-    """Merge a job's staged rows into master, stamping source_job_id."""
+def flush_job_staging(job_id: int, db_path: str = DB_PATH, chunk: int = 500) -> Dict[str, int]:
+    """Promote a job's staged rows into master in MEMORY-SAFE CHUNKS, stamping
+    source_job_id, and delete each promoted chunk from staging as it goes. Only
+    `chunk` rows are held in RAM at once, so this is safe on 512 MB hosts and can
+    be called repeatedly during a run (incremental promotion) — an interrupted
+    job then loses at most the last un-flushed chunk. Returns {table: count}."""
     import sys as _sys
     me = _sys.modules[__name__]
-    by_table: Dict[str, List[Dict[str, Any]]] = {}
-    with connect(db_path) as conn:
-        for r in conn.execute(
-                "SELECT table_name, payload FROM staging WHERE job_id=?", (job_id,)):
-            by_table.setdefault(r[0], []).append(json.loads(r[1]))
     summary: Dict[str, int] = {}
-    for tbl, rows in by_table.items():
-        for row in rows:
-            row["source_job_id"] = job_id
-        getattr(me, _UPSERTERS[tbl])(rows, db_path=db_path)
-        summary[tbl] = len(rows)
+    while True:
+        with connect(db_path) as conn:
+            batch = conn.execute(
+                "SELECT id, table_name, payload FROM staging WHERE job_id=? "
+                "ORDER BY id LIMIT ?", (job_id, int(chunk))).fetchall()
+        if not batch:
+            break
+        by_table: Dict[str, List[Dict[str, Any]]] = {}
+        ids: List[int] = []
+        for r in batch:
+            ids.append(r["id"])
+            try:
+                obj = json.loads(r["payload"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            obj["source_job_id"] = job_id
+            by_table.setdefault(r["table_name"], []).append(obj)
+        for tbl, rows in by_table.items():
+            getattr(me, _UPSERTERS[tbl])(rows, db_path=db_path)
+            summary[tbl] = summary.get(tbl, 0) + len(rows)
+        with connect(db_path) as conn:
+            conn.execute(f"DELETE FROM staging WHERE id IN ({','.join('?' * len(ids))})", ids)
+    return summary
+
+
+def promote_job(job_id: int, db_path: str = DB_PATH) -> Dict[str, int]:
+    """Merge a job's staged rows into master (chunked, memory-safe) and mark it
+    promoted. Clears staged rows as they are promoted."""
+    summary = flush_job_staging(job_id, db_path=db_path)
     update_job(job_id, promote_status="promoted", db_path=db_path)
     return summary
 
