@@ -878,8 +878,10 @@ with tab_run:
                 st.success("✅ No gaps — every directory college is present in Phase 2.")
             with st.expander("🔁 In Phase 2 but NOT in directory (usually fine — flagged)"):
                 extra = db.dir_extra_not_in_directory(limit=2000)
-                st.dataframe(pd.DataFrame(extra), use_container_width=True, height=220) if extra \
-                    else st.caption("None.")
+                if extra:
+                    st.dataframe(pd.DataFrame(extra), use_container_width=True, height=220)
+                else:
+                    st.caption("None.")
 
 
 # ---------------------------------------------------------------------------
