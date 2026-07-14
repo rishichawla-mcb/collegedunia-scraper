@@ -1,5 +1,11 @@
-streamlit>=1.33
-requests>=2.31
-openpyxl>=3.1
-pandas>=2.0
-beautifulsoup4>=4.12
+# Pinned to a known-compatible set. The key one is numpy<2: unpinned builds pull
+# numpy 2.x, and pandas/pyarrow wheels compiled against numpy 1.x then SEGFAULT
+# (status 139) the moment Streamlit renders a dataframe. Do not loosen numpy/
+# pyarrow without testing.
+streamlit==1.37.1
+pandas==2.2.2
+numpy==1.26.4
+pyarrow==16.1.0
+requests==2.32.3
+openpyxl==3.1.5
+beautifulsoup4==4.12.3
