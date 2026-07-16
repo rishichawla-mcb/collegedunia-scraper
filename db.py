@@ -684,6 +684,21 @@ def list_cc_queued_ids(db_path: str = DB_PATH) -> List[int]:
             "SELECT college_id FROM cc_progress WHERE status='queued'")]
 
 
+def college_name_lookup(college_id: int, db_path: str = DB_PATH) -> str:
+    """Best-effort college name from already-scraped tables (Phase 2 colleges,
+    then the directory) — avoids fetching the heavy HTML page just for the name."""
+    with connect(db_path) as conn:
+        for tbl in ("colleges", "colleges_directory"):
+            try:
+                row = conn.execute(
+                    f"SELECT name FROM {tbl} WHERE college_id=?", (college_id,)).fetchone()
+                if row and row[0]:
+                    return row[0]
+            except Exception:  # noqa: BLE001
+                pass
+    return ""
+
+
 def list_known_college_ids(db_path: str = DB_PATH) -> List[int]:
     with connect(db_path) as conn:
         return [r[0] for r in conn.execute(

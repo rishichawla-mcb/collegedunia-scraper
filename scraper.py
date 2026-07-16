@@ -1728,20 +1728,28 @@ def run_college_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_P
                         n += _write_rows(job_id, cfg, "college_courses", rows, db_path)
 
             try:
-                # Page 1 always comes from the SSR page (also yields hostel fee +
-                # total_pages + college name).
-                parsed = parse_courses_fees(client.get_text(url))
-                cname = parsed.get("college_name", "")
-                hostel = parsed.get("hostel", "")
-                total_pages = int(parsed.get("total_pages") or 1)
+                # College name from already-scraped tables (avoids the heavy HTML).
+                cname = db.college_name_lookup(cid, db_path=db_path)
+                # Hostel fee lives only on the ~600 KB SSR page — fetch it ONLY if
+                # asked (off by default: that page is slow and 403-prone, and it's
+                # what was ballooning bandwidth/ETA).
+                if cfg.get("fetch_hostel", False):
+                    try:
+                        _p = parse_courses_fees(client.get_text(url))
+                        hostel = _p.get("hostel", "")
+                        cname = cname or _p.get("college_name", "")
+                    except Exception:  # noqa: BLE001
+                        pass
+                # Page 1 + total_pages come from the small JSON courses-list API
+                # (not the HTML) — ~12 KB vs ~600 KB, and far fewer 403s.
+                first = client.fetch_courses_list(cid, 1)
+                total_pages = int(first.get("total_pages") or 1)
                 if resume_from:
-                    # Page 1 (…resume_from) already staged on a prior run — seed the
-                    # dedupe sets from page-1 groups and continue at resume_from+1.
-                    grp1 = _dedupe_groups(parsed.get("groups") or [])
-                    _course_group_rows(grp1, hostel, seen_rows)
+                    grp1 = _dedupe_groups(first.get("courses") or [])
+                    _course_group_rows(grp1, hostel, seen_rows)   # seed dedupe sets
                     start = resume_from + 1
                 else:
-                    _stage(parsed.get("groups") or [], cname)
+                    _stage(first.get("courses") or [], cname)
                     with db_lock:
                         db.set_cc_progress(cid, "partial", n, last_page=1, db_path=db_path)
                     start = 2

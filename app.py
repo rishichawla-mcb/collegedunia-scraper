@@ -783,6 +783,12 @@ with tab_run:
         cc_bud = ct2.number_input("Max bandwidth MB (0=∞)", 0, 200000, 0, step=200, key="ccbud")
         test4 = st.checkbox("Test run (first 25 known colleges)", key="t4")
         cforce = st.checkbox("Re-scrape already-done", key="ccf")
+        fetch_hostel = st.checkbox(
+            "Also fetch hostel fee (slower: +~0.6 MB HTML page per college)",
+            value=False, key="cchostel",
+            help="Hostel fee isn't in the fast JSON API. Leave OFF for a much faster, "
+                 "lighter run (fewer 403s) — you only lose the hostel_fees column; "
+                 "everything else (fees, eligibility, duration, ratings, dates) still comes through.")
         if st.button("🏫 Start courses-fees scrape", key="run4",
                      disabled=(cc_known == 0 and cscope.startswith("Known"))):
             cfg = proxy_config_from_ui()
@@ -793,6 +799,7 @@ with tab_run:
             cfg["concurrency"] = int(cc_conc)
             cfg["budget_mb"] = float(cc_bud)
             cfg["force_rescrape"] = cforce
+            cfg["fetch_hostel"] = bool(fetch_hostel)
             jid = db.create_job("college_courses", cfg)
             launch_worker(jid)
             st.session_state["watch_p4"] = jid
