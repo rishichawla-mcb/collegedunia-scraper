@@ -21,8 +21,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import threading
 import time
 
 import pandas as pd
@@ -299,6 +301,159 @@ def fmt_eta(done: int, total: int, started: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# System metrics (container-aware, stdlib only — no extra deps)
+# ---------------------------------------------------------------------------
+@st.cache_resource
+def _proc_start_time() -> float:
+    return time.time()
+
+
+def _read_int(path: str):
+    try:
+        with open(path) as fh:
+            return int(fh.read().split()[0])
+    except Exception:
+        return None
+
+
+def _proc_rss_bytes():
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return None
+
+
+def _cgroup_mem():
+    """Container memory (used, limit) in bytes — cgroup v2 then v1."""
+    lim = _read_int("/sys/fs/cgroup/memory.max")
+    use = _read_int("/sys/fs/cgroup/memory.current")
+    if lim is None:
+        lim = _read_int("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        use = _read_int("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    if lim and lim > (1 << 62):          # 'max' / unlimited sentinel
+        lim = None
+    if use is None or lim is None:       # fallback: /proc/meminfo (host-level)
+        mi = {}
+        try:
+            with open("/proc/meminfo") as fh:
+                for line in fh:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        mi[parts[0]] = int(parts[1].split()[0]) * 1024
+        except Exception:
+            pass
+        if lim is None:
+            lim = mi.get("MemTotal")
+        if use is None and mi.get("MemTotal") and "MemAvailable" in mi:
+            use = mi["MemTotal"] - mi["MemAvailable"]
+    return use, lim
+
+
+def _cgroup_cpu_usec():
+    """Cumulative CPU time used by the container, in microseconds."""
+    try:
+        with open("/sys/fs/cgroup/cpu.stat") as fh:
+            for line in fh:
+                if line.startswith("usage_usec"):
+                    return int(line.split()[1])
+    except Exception:
+        pass
+    ns = _read_int("/sys/fs/cgroup/cpuacct/cpuacct.usage")
+    return ns // 1000 if ns else None
+
+
+def _cpu_percent(interval: float = 0.15):
+    c1 = _cgroup_cpu_usec()
+    if c1 is None:
+        return None
+    t1 = time.time()
+    time.sleep(interval)
+    c2 = _cgroup_cpu_usec()
+    dt = time.time() - t1
+    if c2 is None or dt <= 0:
+        return None
+    return max(0.0, 100.0 * (c2 - c1) / (dt * 1e6) / (os.cpu_count() or 1))
+
+
+def _fmt_bytes(n):
+    if n is None:
+        return "—"
+    n = float(n)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def _fmt_dur(s):
+    s = int(s or 0)
+    h, r = divmod(s, 3600)
+    m, sec = divmod(r, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {sec}s"
+    return f"{sec}s"
+
+
+def render_system_bar() -> None:
+    """A live panel of container/system metrics — CPU, memory (cgroup limit),
+    process RSS, disk, DB size, load, threads, active jobs, uptime."""
+    now = time.time()
+    cpu = _cpu_percent()
+    mem_use, mem_lim = _cgroup_mem()
+    mem_pct = (100.0 * mem_use / mem_lim) if (mem_use and mem_lim) else None
+    rss = _proc_rss_bytes()
+    try:
+        du = shutil.disk_usage(os.path.dirname(db.DB_PATH) or "/")
+        disk_used, disk_total = du.used, du.total
+        disk_pct = 100.0 * du.used / du.total if du.total else None
+    except Exception:
+        disk_used = disk_total = disk_pct = None
+    try:
+        db_size = os.path.getsize(db.DB_PATH)
+    except Exception:
+        db_size = None
+    try:
+        la1, la5, la15 = os.getloadavg()
+    except Exception:
+        la1 = la5 = la15 = None
+    try:
+        jobs = db.list_jobs(40)
+        running = sum(1 for j in jobs if j["status"] in ("running", "queued"))
+    except Exception:
+        running = 0
+    threads = threading.active_count()
+    cores = os.cpu_count() or 1
+    uptime = now - _proc_start_time()
+
+    with st.container(border=True):
+        st.caption("🖥️ System — live (refreshes on every rerun; live during a running job)")
+        r1 = st.columns(6)
+        r1[0].metric("CPU", f"{cpu:.0f}%" if cpu is not None else "—", f"{cores} cores")
+        r1[1].metric("Memory", f"{mem_pct:.0f}%" if mem_pct is not None else "—",
+                     f"{_fmt_bytes(mem_use)} / {_fmt_bytes(mem_lim)}")
+        r1[2].metric("App RSS", _fmt_bytes(rss))
+        r1[3].metric("Disk", f"{disk_pct:.0f}%" if disk_pct is not None else "—",
+                     f"{_fmt_bytes(disk_used)} / {_fmt_bytes(disk_total)}")
+        r1[4].metric("DB size", _fmt_bytes(db_size))
+        r1[5].metric("Load 1m", f"{la1:.2f}" if la1 is not None else "—",
+                     f"5m {la5:.2f}" if la5 is not None else None)
+        r2 = st.columns(6)
+        r2[0].metric("Active jobs", f"{running}")
+        r2[1].metric("Threads", f"{threads}")
+        r2[2].metric("Load 15m", f"{la15:.2f}" if la15 is not None else "—")
+        r2[3].metric("Uptime", _fmt_dur(uptime))
+        r2[4].metric("Mem free", _fmt_bytes((mem_lim - mem_use) if (mem_lim and mem_use) else None))
+        r2[5].metric("Disk free", _fmt_bytes((disk_total - disk_used) if (disk_total and disk_used) else None))
+
+
+# ---------------------------------------------------------------------------
 # Sidebar: settings + proxies
 # ---------------------------------------------------------------------------
 st.sidebar.title("⚙️ Settings")
@@ -413,6 +568,8 @@ m1.metric("Courses", f"{c['courses']:,}")
 m2.metric("Unique colleges", f"{c['colleges']:,}")
 m3.metric("Offerings (course×college)", f"{c['offerings']:,}")
 m4.metric("Courses done (phase 2)", f"{c['courses_done_phase2']:,}")
+
+render_system_bar()
 
 
 def render_job_monitor(job_types, key: str, govern: bool = True) -> None:
