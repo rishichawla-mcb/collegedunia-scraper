@@ -302,6 +302,97 @@ def agg_coverage() -> pd.DataFrame:
             "GROUP BY c.stream_name ORDER BY courses DESC", conn)
 
 
+# --- Phase 4 (college_courses) aggregations ---------------------------------
+@st.cache_data(ttl=25, show_spinner=False)
+def agg_cc_summary() -> dict:
+    with db.connect() as conn:
+        def one(q):
+            return conn.execute(q).fetchone()[0]
+        return {
+            "rows": one("SELECT COUNT(*) FROM college_courses"),
+            "colleges": one("SELECT COUNT(DISTINCT college_id) FROM college_courses"),
+            "with_fee": one("SELECT COUNT(*) FROM college_courses WHERE fees_inr>0"),
+            "with_hostel": one("SELECT COUNT(*) FROM college_courses "
+                               "WHERE hostel_fees IS NOT NULL AND hostel_fees<>''"),
+            "processed": one("SELECT COUNT(*) FROM cc_progress WHERE status IN ('done','empty')"),
+        }
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def agg_cc_fee_buckets() -> pd.DataFrame:
+    with db.connect() as conn:
+        return pd.read_sql_query(
+            "SELECT CASE "
+            "WHEN fees_inr<=25000 THEN '0-25k' WHEN fees_inr<=50000 THEN '25-50k' "
+            "WHEN fees_inr<=100000 THEN '50k-1L' WHEN fees_inr<=200000 THEN '1-2L' "
+            "WHEN fees_inr<=500000 THEN '2-5L' WHEN fees_inr<=1000000 THEN '5-10L' "
+            "ELSE '10L+' END AS k, COUNT(*) AS n, MIN(fees_inr) AS mn "
+            "FROM college_courses WHERE fees_inr>0 GROUP BY k ORDER BY mn", conn)
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def agg_cc_group(col: str) -> pd.DataFrame:
+    with db.connect() as conn:
+        return pd.read_sql_query(
+            f"SELECT COALESCE(NULLIF(TRIM({col}),''),'—') AS k, COUNT(*) AS n "
+            f"FROM college_courses GROUP BY k ORDER BY n DESC LIMIT 20", conn)
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def agg_cc_top_colleges(n: int) -> pd.DataFrame:
+    with db.connect() as conn:
+        return pd.read_sql_query(
+            "SELECT college_name AS k, COUNT(*) AS n, "
+            "SUM(CASE WHEN fees_inr>0 THEN 1 ELSE 0 END) AS with_fee "
+            "FROM college_courses WHERE college_name<>'' "
+            "GROUP BY college_id ORDER BY n DESC LIMIT ?", conn, params=[int(n)])
+
+
+# --- Directory (colleges_directory) aggregations ----------------------------
+@st.cache_data(ttl=25, show_spinner=False)
+def agg_dir_summary() -> dict:
+    with db.connect() as conn:
+        def one(q):
+            return conn.execute(q).fetchone()[0]
+        return {
+            "total": one("SELECT COUNT(*) FROM colleges_directory"),
+            "states": one("SELECT COUNT(DISTINCT state) FROM colleges_directory "
+                          "WHERE state IS NOT NULL AND state<>''"),
+            "cities": one("SELECT COUNT(DISTINCT city) FROM colleges_directory "
+                          "WHERE city IS NOT NULL AND city<>''"),
+            "rated": one("SELECT COUNT(*) FROM colleges_directory WHERE rating>0"),
+        }
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def agg_dir_by_state(n: int) -> pd.DataFrame:
+    with db.connect() as conn:
+        return pd.read_sql_query(
+            "SELECT COALESCE(NULLIF(state,''),'?') AS k, COUNT(*) AS n "
+            "FROM colleges_directory GROUP BY state ORDER BY n DESC LIMIT ?",
+            conn, params=[int(n)])
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def agg_dir_by_city(n: int) -> pd.DataFrame:
+    with db.connect() as conn:
+        return pd.read_sql_query(
+            "SELECT COALESCE(NULLIF(city,''),'?') AS k, COUNT(*) AS n "
+            "FROM colleges_directory GROUP BY city ORDER BY n DESC LIMIT ?",
+            conn, params=[int(n)])
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def agg_dir_rating_buckets() -> pd.DataFrame:
+    with db.connect() as conn:
+        return pd.read_sql_query(
+            "SELECT CASE "
+            "WHEN rating<2 THEN '<2' WHEN rating<3 THEN '2-3' WHEN rating<4 THEN '3-4' "
+            "WHEN rating<4.5 THEN '4-4.5' ELSE '4.5-5' END AS k, COUNT(*) AS n, "
+            "MIN(rating) AS mn FROM colleges_directory WHERE rating>0 "
+            "GROUP BY k ORDER BY mn", conn)
+
+
 def fmt_eta(done: int, total: int, started: float) -> str:
     if not done or not total or not started:
         return "—"
@@ -1369,61 +1460,203 @@ with tab_live:
 # ---------------------------------------------------------------------------
 with tab_report:
     st.subheader("📈 Reporting")
-    st.info("**Use case:** at-a-glance analytics — courses by stream / type / level, unique colleges "
-            "by city, 1st-year fee distribution, top-ranked offerings and geography — plus a one-click "
-            "analytics Excel export. Read-only; reflects whatever has been scraped so far.")
+    st.info("**Use case:** at-a-glance analytics across **every phase** — courses, Phase-2 "
+            "offerings, Phase-4 college courses & fees, and the full directory — with live filters "
+            "and a one-click analytics Excel export. Read-only; reflects whatever's scraped so far.")
     rc = db.counts()
-    if rc["courses"] == 0:
+    ccs = agg_cc_summary()
+    dirs = agg_dir_summary()
+    try:
+        stg = db.staging_count()
+    except Exception:  # noqa: BLE001
+        stg = 0
+
+    # ---- Headline KPIs across all phases -----------------------------------
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Courses (P1)", f"{rc['courses']:,}")
+    k2.metric("Colleges (P2)", f"{rc['colleges']:,}")
+    k3.metric("Offerings (P2)", f"{rc['offerings']:,}")
+    k4.metric("College-courses (P4)", f"{ccs['rows']:,}")
+    k5.metric("Directory colleges", f"{dirs['total']:,}")
+    k6.metric("Staged (unpromoted)", f"{stg:,}")
+
+    if rc["courses"] == 0 and ccs["rows"] == 0 and dirs["total"] == 0:
         st.info("No data yet — run a scrape first.")
     else:
-        if st.button("🛠️ Prepare analytics export"):
-            with st.spinner("Building…"):
-                st.session_state["andata"] = export.to_analytics_xlsx()
-        if st.session_state.get("andata"):
-            st.download_button("⬇️ Analytics summary (.xlsx)", data=st.session_state["andata"],
-                               file_name="collegedunia_analytics.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        ecol1, ecol2 = st.columns([1, 3])
+        with ecol1:
+            if st.button("🛠️ Prepare analytics export", use_container_width=True):
+                with st.spinner("Building…"):
+                    st.session_state["andata"] = export.to_analytics_xlsx()
+        with ecol2:
+            if st.session_state.get("andata"):
+                st.download_button(
+                    "⬇️ Analytics summary (.xlsx)", data=st.session_state["andata"],
+                    file_name="collegedunia_analytics.xlsx", use_container_width=True,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        bs = agg_group("stream_name").rename(columns={"k": "stream"}).set_index("stream")["n"]
-        bt = agg_group("course_type").rename(columns={"k": "type"}).set_index("type")["n"]
-        bl = agg_group("level").rename(columns={"k": "level"}).set_index("level")["n"]
-        a, b = st.columns(2)
-        with a:
-            st.markdown("**Courses by stream**"); st.bar_chart(bs)
-        with b:
-            st.markdown("**Courses by type**"); st.bar_chart(bt)
-        st.markdown("**Courses by level**"); st.bar_chart(bl)
+        r_p1, r_p2, r_p4, r_dir, r_geo = st.tabs(
+            ["🎓 Courses (P1)", "🏫 Offerings (P2)", "💸 College courses (P4)",
+             "🗂️ Directory", "🗺️ Geography"])
 
-        if rc["offerings"] > 0:
-            st.divider()
-            st.markdown("### College / fee / ranking analytics (Phase 2)")
-            topn = st.slider("Top N cities", 5, 50, 15)
-            cc = agg_city_counts(topn).set_index("k")["n"]
-            st.markdown("**Unique colleges by city**"); st.bar_chart(cc)
-            fb = agg_fee_buckets()
-            if not fb.empty:
-                st.markdown("**1st-year fee distribution (₹)**")
-                st.bar_chart(fb.set_index("k")["n"])
-            tr = agg_top_ranked()
-            if not tr.empty:
-                st.markdown("**Top-ranked offerings**")
-                st.dataframe(tr, use_container_width=True, height=320)
-        else:
-            st.caption("Run Phase 2 to unlock college / fee / ranking analytics.")
+        # ---- Phase 1: courses ----------------------------------------------
+        with r_p1:
+            if rc["courses"] == 0:
+                st.caption("Run Phase 1 to populate the course catalogue.")
+            else:
+                bs = agg_group("stream_name").rename(columns={"k": "stream"}).set_index("stream")["n"]
+                bt = agg_group("course_type").rename(columns={"k": "type"}).set_index("type")["n"]
+                bl = agg_group("level").rename(columns={"k": "level"}).set_index("level")["n"]
+                a, b = st.columns(2)
+                with a:
+                    st.markdown("**Courses by stream**"); st.bar_chart(bs, height=260)
+                with b:
+                    st.markdown("**Courses by type**"); st.bar_chart(bt, height=260)
+                st.markdown("**Courses by level**"); st.bar_chart(bl, height=240)
+                st.divider()
+                st.markdown("**🔎 Biggest courses by college reach** — filter by stream")
+                streams = ["(all)"] + [s for s in bs.index.tolist() if s]
+                fstream = st.selectbox("Stream", streams, key="rep_p1_stream")
+                topk = st.slider("Show top", 10, 200, 40, step=10, key="rep_p1_topk")
+                q = ("SELECT course_id, name, stream_name, course_type, level, colleges_count "
+                     "FROM courses")
+                pr: list = []
+                if fstream != "(all)":
+                    q += " WHERE stream_name=?"; pr = [fstream]
+                q += " ORDER BY colleges_count DESC LIMIT ?"; pr.append(int(topk))
+                with db.connect() as conn:
+                    st.dataframe(pd.read_sql_query(q, conn, params=pr),
+                                 use_container_width=True, height=340)
 
-        if rc["colleges"] > 0:
-            st.divider()
-            st.markdown("### 🗺️ Geography")
-            topc = st.slider("Top N cities", 5, 60, 20, key="geocities")
-            gc = agg_colleges_by_city(topc)
-            st.markdown("**Colleges by city**")
-            st.bar_chart(gc.set_index("k")["n"])
-            gs = agg_colleges_by_state()
-            if not gs.empty:
-                st.markdown("**Colleges by state (state_id)**")
-                st.bar_chart(gs.set_index("k")["n"])
-                st.caption("State IDs are Collegedunia's internal codes; tell me if "
-                           "you want them mapped to state names.")
+        # ---- Phase 2: offerings --------------------------------------------
+        with r_p2:
+            if rc["offerings"] == 0:
+                st.caption("Run Phase 2 to unlock college / fee / ranking analytics.")
+            else:
+                topn = st.slider("Top N cities", 5, 50, 15, key="rep_p2_cities")
+                cc = agg_city_counts(topn).set_index("k")["n"]
+                st.markdown("**Unique colleges by city**"); st.bar_chart(cc, height=260)
+                fb = agg_fee_buckets()
+                if not fb.empty:
+                    st.markdown("**1st-year fee distribution (₹)**")
+                    st.bar_chart(fb.set_index("k")["n"], height=240)
+                tr = agg_top_ranked()
+                if not tr.empty:
+                    st.markdown("**Top-ranked offerings**")
+                    cityf = st.text_input("Filter by city / college", key="rep_p2_f")
+                    show = tr
+                    if cityf:
+                        m = (tr["city"].str.contains(cityf, case=False, na=False) |
+                             tr["college_name"].str.contains(cityf, case=False, na=False))
+                        show = tr[m]
+                    st.dataframe(show, use_container_width=True, height=320)
+
+        # ---- Phase 4: college courses & fees -------------------------------
+        with r_p4:
+            if ccs["rows"] == 0:
+                st.caption("Run Phase 4 (college courses & fees) to populate this section.")
+            else:
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Course-rows", f"{ccs['rows']:,}")
+                m2.metric("Colleges covered", f"{ccs['colleges']:,}")
+                m3.metric("Rows with fee", f"{ccs['with_fee']:,}")
+                m4.metric("Rows with hostel fee", f"{ccs['with_hostel']:,}")
+                fbc = agg_cc_fee_buckets()
+                if not fbc.empty:
+                    st.markdown("**Total-fee distribution (₹)**")
+                    st.bar_chart(fbc.set_index("k")["n"], height=240)
+                cca, ccb = st.columns(2)
+                lv = agg_cc_group("level")
+                md = agg_cc_group("mode")
+                with cca:
+                    st.markdown("**By level**"); st.bar_chart(lv.set_index("k")["n"], height=240)
+                with ccb:
+                    st.markdown("**By mode**"); st.bar_chart(md.set_index("k")["n"], height=240)
+                st.divider()
+                st.markdown("**🏆 Colleges with the most courses**")
+                tcn = st.slider("Top N colleges", 5, 60, 20, key="rep_p4_top")
+                tc = agg_cc_top_colleges(tcn)
+                st.bar_chart(tc.set_index("k")["n"], height=260)
+                st.divider()
+                st.markdown("**🔎 Browse course rows** — filter by fee & level")
+                f1, f2, f3 = st.columns(3)
+                fmin = f1.number_input("Min fee ₹", 0, 5000000, 0, step=10000, key="rep_p4_fmin")
+                fmax = f2.number_input("Max fee ₹ (0=∞)", 0, 5000000, 0, step=10000, key="rep_p4_fmax")
+                levels = ["(all)"] + [x for x in lv["k"].tolist() if x and x != "—"]
+                flev = f3.selectbox("Level", levels, key="rep_p4_lev")
+                q = ("SELECT college_name, course_name, level, mode, duration, "
+                     "total_fees, hostel_fees, fees_inr FROM college_courses WHERE 1=1")
+                pr = []
+                if fmin > 0:
+                    q += " AND fees_inr>=?"; pr.append(int(fmin))
+                if fmax > 0:
+                    q += " AND fees_inr<=?"; pr.append(int(fmax))
+                if flev != "(all)":
+                    q += " AND level=?"; pr.append(flev)
+                q += " ORDER BY fees_inr DESC LIMIT 500"
+                with db.connect() as conn:
+                    dcc = pd.read_sql_query(q, conn, params=pr)
+                st.caption(f"{len(dcc):,} shown (max 500)")
+                st.dataframe(dcc, use_container_width=True, height=360)
+
+        # ---- Directory -----------------------------------------------------
+        with r_dir:
+            if dirs["total"] == 0:
+                st.caption("Run the Directory phase to populate the coverage baseline.")
+            else:
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("Directory colleges", f"{dirs['total']:,}")
+                d2.metric("States", f"{dirs['states']:,}")
+                d3.metric("Cities", f"{dirs['cities']:,}")
+                d4.metric("Rated", f"{dirs['rated']:,}")
+                dtn = st.slider("Top N states", 5, 40, 20, key="rep_dir_states")
+                st.markdown("**Colleges by state**")
+                st.bar_chart(agg_dir_by_state(dtn).set_index("k")["n"], height=280)
+                dca, dcb = st.columns(2)
+                with dca:
+                    st.markdown("**Colleges by city (top 20)**")
+                    st.bar_chart(agg_dir_by_city(20).set_index("k")["n"], height=260)
+                with dcb:
+                    rbk = agg_dir_rating_buckets()
+                    if not rbk.empty:
+                        st.markdown("**Rating distribution**")
+                        st.bar_chart(rbk.set_index("k")["n"], height=260)
+                st.divider()
+                st.markdown("**🔎 Browse directory** — filter by state & search")
+                with db.connect() as conn:
+                    stopts = ["(all)"] + [r[0] for r in conn.execute(
+                        "SELECT DISTINCT state FROM colleges_directory "
+                        "WHERE state IS NOT NULL AND state<>'' ORDER BY state")]
+                fc1, fc2 = st.columns(2)
+                fst = fc1.selectbox("State", stopts, key="rep_dir_state")
+                fterm = fc2.text_input("Search name / city", key="rep_dir_term")
+                q = ("SELECT college_id, name, city, state, rating, naac_grading, "
+                     "course_count, top_course_fees, approvals FROM colleges_directory WHERE 1=1")
+                pr = []
+                if fst != "(all)":
+                    q += " AND state=?"; pr.append(fst)
+                if fterm:
+                    q += " AND (name LIKE ? OR city LIKE ?)"; pr += [f"%{fterm}%", f"%{fterm}%"]
+                q += " ORDER BY rating DESC, name LIMIT 500"
+                with db.connect() as conn:
+                    ddf = pd.read_sql_query(q, conn, params=pr)
+                st.caption(f"{len(ddf):,} shown (max 500)")
+                st.dataframe(ddf, use_container_width=True, height=360)
+
+        # ---- Geography (master colleges) -----------------------------------
+        with r_geo:
+            if rc["colleges"] == 0:
+                st.caption("Run Phase 2 to populate master colleges.")
+            else:
+                topc = st.slider("Top N cities", 5, 60, 20, key="geocities")
+                st.markdown("**Colleges by city (Phase 2 master)**")
+                st.bar_chart(agg_colleges_by_city(topc).set_index("k")["n"], height=260)
+                gs = agg_colleges_by_state()
+                if not gs.empty:
+                    st.markdown("**Colleges by state (state_id)**")
+                    st.bar_chart(gs.set_index("k")["n"], height=240)
+                    st.caption("Phase-2 master uses Collegedunia's internal state_id codes. "
+                               "The Directory tab has real state names.")
 
 
 # ---------------------------------------------------------------------------
@@ -1431,63 +1664,142 @@ with tab_report:
 # ---------------------------------------------------------------------------
 with tab_index:
     st.subheader("🗂️ Indexing & coverage")
-    st.info("**Use case:** track progress and completeness — how many courses are Phase-2 done vs "
-            "partial vs pending, per-stream coverage, a searchable index of courses & colleges, and "
-            "the biggest still-pending courses to prioritise next.")
+    st.info("**Use case:** track progress and completeness for **every phase** — Phase-2 offerings, "
+            "Phase-4 college courses, and Directory — plus directory-vs-scraped coverage, a unified "
+            "searchable index across all four datasets, and the biggest still-pending work to prioritise.")
     ic = db.counts()
     with db.connect() as conn:
-        done = conn.execute("SELECT COUNT(*) FROM offering_progress WHERE status='done'").fetchone()[0]
-        partial = conn.execute("SELECT COUNT(*) FROM offering_progress WHERE status='partial'").fetchone()[0]
+        def _one(q):
+            return conn.execute(q).fetchone()[0]
+        p2_done = _one("SELECT COUNT(*) FROM offering_progress WHERE status='done'")
+        p2_partial = _one("SELECT COUNT(*) FROM offering_progress WHERE status='partial'")
+        cc_done = _one("SELECT COUNT(*) FROM cc_progress WHERE status IN ('done','empty')")
+        cc_queued = _one("SELECT COUNT(*) FROM cc_progress WHERE status='queued'")
+        dir_total = _one("SELECT COUNT(*) FROM colleges_directory")
+        dir_slugs_done = _one("SELECT COUNT(*) FROM dir_progress WHERE status='done'")
+        dir_slugs_part = _one("SELECT COUNT(*) FROM dir_progress WHERE status='partial'")
     total_courses = ic["courses"]
-    pending = max(0, total_courses - done - partial)
-    i1, i2, i3, i4 = st.columns(4)
-    i1.metric("Courses indexed", f"{total_courses:,}")
-    i2.metric("Phase-2 done", f"{done:,}")
-    i3.metric("Partial", f"{partial:,}")
-    i4.metric("Pending", f"{pending:,}")
-    if total_courses:
-        st.progress(done / total_courses, text=f"Phase-2 coverage: {done:,}/{total_courses:,} courses")
 
-    if total_courses:
-        cov = agg_coverage()
-        if not cov.empty:
-            cov["done"] = cov["done"].fillna(0).astype(int)
-            cov["% done"] = (cov["done"] / cov["courses"] * 100).round(1)
-            st.markdown("**Phase-2 coverage by stream**")
-            st.dataframe(cov, use_container_width=True, height=300)
+    prog2, prog4, progd = st.tabs(
+        ["🏫 Phase 2 — offerings", "💸 Phase 4 — college courses", "🗂️ Directory"])
 
+    # ---- Phase 2 progress --------------------------------------------------
+    with prog2:
+        p2_pending = max(0, total_courses - p2_done - p2_partial)
+        i1, i2, i3, i4 = st.columns(4)
+        i1.metric("Courses indexed", f"{total_courses:,}")
+        i2.metric("Done", f"{p2_done:,}")
+        i3.metric("Partial", f"{p2_partial:,}")
+        i4.metric("Pending", f"{p2_pending:,}")
+        if total_courses:
+            st.progress(p2_done / total_courses,
+                        text=f"Phase-2 coverage: {p2_done:,}/{total_courses:,} courses done")
+            cov = agg_coverage()
+            if not cov.empty:
+                cov["done"] = cov["done"].fillna(0).astype(int)
+                cov["% done"] = (cov["done"] / cov["courses"] * 100).round(1)
+                st.markdown("**Coverage by stream**")
+                st.dataframe(cov, use_container_width=True, height=280)
+            st.markdown("**Biggest still-pending courses** — filter by stream")
+            with db.connect() as conn:
+                strms = ["(all)"] + [r[0] for r in conn.execute(
+                    "SELECT DISTINCT stream_name FROM courses "
+                    "WHERE stream_name IS NOT NULL AND stream_name<>'' ORDER BY stream_name")]
+            pstream = st.selectbox("Stream", strms, key="idx_p2_stream")
+            q = ("SELECT c.course_id, c.name, c.stream_name, c.colleges_count "
+                 "FROM courses c LEFT JOIN offering_progress op ON c.course_id=op.course_id "
+                 "WHERE (op.course_id IS NULL OR op.status<>'done')")
+            pr = []
+            if pstream != "(all)":
+                q += " AND c.stream_name=?"; pr = [pstream]
+            q += " ORDER BY c.colleges_count DESC LIMIT 300"
+            with db.connect() as conn:
+                st.dataframe(pd.read_sql_query(q, conn, params=pr),
+                             use_container_width=True, height=300)
+
+    # ---- Phase 4 progress --------------------------------------------------
+    with prog4:
+        cc_rows = agg_cc_summary()["rows"]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Colleges processed", f"{cc_done:,}")
+        c2.metric("Queued (from gap)", f"{cc_queued:,}")
+        c3.metric("Course-rows", f"{cc_rows:,}")
+        c4.metric("Directory baseline", f"{dir_total:,}")
+        if dir_total:
+            st.progress(min(1.0, cc_done / dir_total),
+                        text=f"Phase-4 vs directory: {cc_done:,}/{dir_total:,} colleges processed "
+                             f"({cc_done/dir_total*100:.0f}%)")
+            st.caption(f"~{max(0, dir_total - cc_done):,} directory colleges still have no Phase-4 "
+                       "courses/fees. Run Phase 4 → Source: **All directory colleges** to close the gap.")
+        st.markdown("**Directory colleges still missing Phase-4 data** — biggest first")
+        with db.connect() as conn:
+            miss = pd.read_sql_query(
+                "SELECT d.college_id, d.name, d.state, d.course_count, d.rating "
+                "FROM colleges_directory d "
+                "LEFT JOIN cc_progress p ON p.college_id=d.college_id "
+                "WHERE p.college_id IS NULL OR p.status NOT IN ('done','empty') "
+                "ORDER BY d.course_count DESC LIMIT 300", conn)
+        st.caption(f"{len(miss):,} shown (max 300)")
+        st.dataframe(miss, use_container_width=True, height=300)
+
+    # ---- Directory progress ------------------------------------------------
+    with progd:
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Directory colleges", f"{dir_total:,}")
+        d2.metric("Partitions done", f"{dir_slugs_done:,}")
+        d3.metric("Partitions partial", f"{dir_slugs_part:,}")
+        cov = db.dir_coverage_summary()
+        st.progress(
+            min(1.0, (cov["overlap"] / cov["directory_total"]) if cov["directory_total"] else 0),
+            text=f"In Phase 2 as well: {cov['overlap']:,}/{cov['directory_total']:,} directory colleges")
+        by_state = pd.DataFrame(cov["by_state"])
+        if not by_state.empty:
+            st.markdown("**Coverage by state — directory vs Phase 2 (missing = gap to fill)**")
+            only_missing = st.checkbox("Show only states with gaps", value=False, key="idx_dir_gap")
+            show = by_state[by_state["missing"] > 0] if only_missing else by_state
+            st.dataframe(show, use_container_width=True, height=320)
+
+    # ---- Unified browse index ---------------------------------------------
     st.divider()
-    st.markdown("### 🔎 Browse index")
-    which = st.radio("Index", ["courses", "colleges"], horizontal=True)
-    term = st.text_input("Search by name", key="idxsearch")
+    st.markdown("### 🔎 Unified index — search across every dataset")
+    which = st.radio(
+        "Dataset",
+        ["Courses (P1)", "Colleges (P2)", "College courses (P4)", "Directory"],
+        horizontal=True, key="idx_which")
+    term = st.text_input("Search by name / city", key="idxsearch")
+    like = f"%{term}%"
     with db.connect() as conn:
-        if which == "courses":
+        if which == "Courses (P1)":
             sql = ("SELECT course_id, name, stream_name, course_type, level, colleges_count "
                    "FROM courses")
             params = []
             if term:
-                sql += " WHERE name LIKE ?"; params = [f"%{term}%"]
+                sql += " WHERE name LIKE ?"; params = [like]
             sql += " ORDER BY colleges_count DESC LIMIT 500"
-        else:
-            sql = "SELECT college_id, name, short_form, city, state_id FROM colleges"
+        elif which == "Colleges (P2)":
+            sql = ("SELECT college_id, name, short_form, city, state_id, rating_value, "
+                   "enriched_at FROM colleges")
             params = []
             if term:
-                sql += " WHERE name LIKE ? OR city LIKE ?"; params = [f"%{term}%", f"%{term}%"]
+                sql += " WHERE name LIKE ? OR city LIKE ?"; params = [like, like]
             sql += " ORDER BY name LIMIT 500"
+        elif which == "College courses (P4)":
+            sql = ("SELECT college_name, course_name, level, mode, duration, "
+                   "total_fees, hostel_fees FROM college_courses")
+            params = []
+            if term:
+                sql += " WHERE college_name LIKE ? OR course_name LIKE ?"; params = [like, like]
+            sql += " ORDER BY fees_inr DESC LIMIT 500"
+        else:  # Directory
+            sql = ("SELECT college_id, name, city, state, rating, naac_grading, "
+                   "course_count, approvals FROM colleges_directory")
+            params = []
+            if term:
+                sql += " WHERE name LIKE ? OR city LIKE ?"; params = [like, like]
+            sql += " ORDER BY rating DESC, name LIMIT 500"
         idf = pd.read_sql_query(sql, conn, params=params)
     st.caption(f"{len(idf):,} shown (max 500)")
-    st.dataframe(idf, use_container_width=True, height=340)
-
-    if total_courses:
-        st.divider()
-        st.markdown("**Pending courses (not yet Phase-2 done)** — biggest first")
-        with db.connect() as conn:
-            pend = pd.read_sql_query(
-                "SELECT c.course_id, c.name, c.stream_name, c.colleges_count "
-                "FROM courses c LEFT JOIN offering_progress op ON c.course_id=op.course_id "
-                "WHERE op.course_id IS NULL OR op.status<>'done' "
-                "ORDER BY c.colleges_count DESC LIMIT 200", conn)
-        st.dataframe(pend, use_container_width=True, height=300)
+    st.dataframe(idf, use_container_width=True, height=360)
 
 
 # ---------------------------------------------------------------------------
