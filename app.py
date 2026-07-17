@@ -1059,11 +1059,28 @@ with tab_run:
         g1.metric("Known colleges", f"{cc_known:,}")
         g2.metric("Processed", f"{cc_done:,}")
         g3.metric("Course-rows", f"{cc_rows:,}")
-        cscope = st.radio("Source", ["Known colleges (from Phase 2)", "College ID range"],
-                          horizontal=True, key="ccscope")
+        with db.connect() as conn:
+            dir_total = conn.execute(
+                "SELECT COUNT(*) FROM colleges_directory "
+                "WHERE college_id IS NOT NULL").fetchone()[0]
+        cscope = st.radio(
+            "Source",
+            ["Known colleges (from Phase 2)",
+             f"All directory colleges ({dir_total:,})",
+             "College ID range"],
+            horizontal=True, key="ccscope")
         ccfg: dict = {}
         n_target = max(0, cc_known - cc_done)
-        if cscope == "College ID range":
+        if cscope.startswith("All directory"):
+            n_target = max(0, dir_total - cc_done)
+            ccfg["use_directory"] = True
+            ccfg["use_known"] = False
+            st.caption(
+                f"Scrapes courses & fees for **all {dir_total:,}** directory colleges. "
+                f"Resume skips the {cc_done:,} already processed, so this run fills the "
+                f"**~{n_target:,} pending** — including the ~{max(0, dir_total - cc_known):,} "
+                "colleges Phase 2 never found. Set a bandwidth cap and let it run in chunks.")
+        elif cscope == "College ID range":
             r1, r2 = st.columns(2)
             ccfg["id_start"] = r1.number_input("ID start", 1, 100000, 1, key="ccs")
             ccfg["id_end"] = r2.number_input("ID end", 1, 100000, 2000, key="cce")
@@ -1092,6 +1109,9 @@ with tab_run:
                      disabled=(cc_known == 0 and cscope.startswith("Known"))):
             cfg = proxy_config_from_ui()
             cfg.update(ccfg)
+            if cscope.startswith("All directory"):
+                cfg["college_ids"] = db.list_directory_college_ids()
+                cfg["use_known"] = False
             if test4:
                 cfg["college_ids"] = db.list_known_college_ids()[:25]
                 cfg["use_known"] = False

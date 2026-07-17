@@ -736,6 +736,16 @@ def list_known_college_ids(db_path: str = DB_PATH) -> List[int]:
             "SELECT college_id FROM colleges ORDER BY college_id")]
 
 
+def list_directory_college_ids(db_path: str = DB_PATH) -> List[int]:
+    """Every college_id discovered by the Directory phase (~18.8k) — the widest
+    baseline. Feed this to Phase 4 to scrape courses & fees for colleges the
+    course-finder (Phase 2) never surfaced. Resume/cc_progress skips done ones."""
+    with connect(db_path) as conn:
+        return [r[0] for r in conn.execute(
+            "SELECT college_id FROM colleges_directory "
+            "WHERE college_id IS NOT NULL ORDER BY college_id")]
+
+
 def get_offering_progress(course_id: int, db_path: str = DB_PATH) -> Optional[Dict[str, Any]]:
     with connect(db_path) as conn:
         row = conn.execute(
