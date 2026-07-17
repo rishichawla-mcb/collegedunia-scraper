@@ -220,6 +220,22 @@ def human_mb(byts) -> str:
         return "0 MB"
 
 
+def _preview_df(df):
+    """Make a dataframe light/safe to render in Streamlit's data grid: drop the
+    heavy raw_json blob and truncate long text cells. Very large cells can make
+    the grid loop ('Maximum update depth exceeded' / React #185). Exports use the
+    full data separately — this only affects on-screen previews."""
+    try:
+        drop = [c for c in ("raw_json",) if c in df.columns]
+        out = df.drop(columns=drop) if drop else df
+        for col in out.columns:
+            if out[col].dtype == object:
+                out[col] = out[col].astype(str).str.slice(0, 300)
+        return out
+    except Exception:
+        return df
+
+
 # --- Cached SQL aggregations for the dashboards (tiny result sets, computed at
 # --- most every TTL seconds — never loads full tables into memory). ---
 @st.cache_data(ttl=15, show_spinner=False)
@@ -614,7 +630,7 @@ def render_job_monitor(job_types, key: str, govern: bool = True) -> None:
                 stbl = st.selectbox("Table", list(staged.keys()), key=f"stbl{key}{jid_}")
                 srows = db.get_staged_rows(jid_, stbl, limit=500)
                 if srows:
-                    st.dataframe(pd.DataFrame(srows), use_container_width=True, height=300)
+                    st.dataframe(_preview_df(pd.DataFrame(srows)), use_container_width=True, height=300)
                     st.download_button(
                         f"⬇️ Download staged {stbl} (CSV)",
                         data=pd.DataFrame(db.get_staged_rows(jid_, stbl, limit=100000))
@@ -679,10 +695,86 @@ def render_job_monitor(job_types, key: str, govern: bool = True) -> None:
         st.rerun()
 
 
-(tab_run, tab_query, tab_live, tab_report, tab_index, tab_data,
+(tab_overview, tab_run, tab_query, tab_live, tab_report, tab_index, tab_data,
  tab_quality, tab_history) = st.tabs(
-    ["▶️ Run", "🔎 Query", "🧪 Live scraper", "📈 Reporting", "🗂️ Indexing",
-     "📊 Data & export", "🩺 Quality", "🕓 History"])
+    ["🗄️ Overview", "▶️ Run", "🔎 Query", "🧪 Live scraper", "📈 Reporting",
+     "🗂️ Indexing", "📊 Data & export", "🩺 Quality", "🕓 History"])
+
+
+with tab_overview:
+    st.subheader("🗄️ Database overview")
+    st.info("**Use case:** see everything you've scraped in one place — every table with its "
+            "row count and description, plus per-column completeness, a sample, and Phase-2 vs "
+            "directory coverage. Read-only; nothing is written here.")
+    try:
+        _dbsize = os.path.getsize(db.DB_PATH)
+    except Exception:
+        _dbsize = None
+    st.caption(f"SQLite database · {_fmt_bytes(_dbsize)}")
+
+    _TABLE_INFO = {
+        "courses": "Phase 1 — course catalogue",
+        "colleges": "Phase 2 — unique colleges (Phase 3 enriches these)",
+        "offerings": "Phase 2 — course × college (fees, ranking, cutoff, dates)",
+        "college_courses": "Phase 4 — per-college courses & fees",
+        "colleges_directory": "Directory — full india-colleges baseline",
+        "offering_progress": "Phase 2 progress (per course)",
+        "cc_progress": "Phase 4 progress (per college)",
+        "dir_progress": "Directory progress (per state)",
+        "jobs": "Scrape run history",
+        "staging": "Un-promoted staged rows (pending governance)",
+        "snapshots": "Dataset-size snapshots",
+        "logs": "Live logs",
+    }
+    _rows = []
+    with db.connect() as conn:
+        for _t, _desc in _TABLE_INFO.items():
+            try:
+                _n = conn.execute(f"SELECT COUNT(*) FROM {_t}").fetchone()[0]
+            except Exception:
+                _n = None
+            _rows.append({"table": _t, "rows": _n, "what it is": _desc})
+    st.markdown("**Tables**")
+    st.dataframe(pd.DataFrame(_rows), use_container_width=True, height=440)
+
+    _dtot = next((r["rows"] for r in _rows if r["table"] == "colleges_directory"), 0) or 0
+    if _dtot:
+        _cov = db.dir_coverage_summary()
+        _pct = (100.0 * _cov["overlap"] / _cov["directory_total"]) if _cov["directory_total"] else 0.0
+        st.markdown("**Coverage — directory vs Phase 2**")
+        _o = st.columns(3)
+        _o[0].metric("Directory colleges", f"{_cov['directory_total']:,}")
+        _o[1].metric("In Phase 2 (overlap)", f"{_cov['overlap']:,}", f"{_pct:.1f}% covered")
+        _o[2].metric("Missing from Phase 2", f"{_cov['directory_total'] - _cov['overlap']:,}")
+
+    st.divider()
+    st.markdown("**Inspect a table** — columns, completeness (sampled) and a data sample")
+    _pick = st.selectbox("Table", [r["table"] for r in _rows if r["rows"]], key="ovtbl")
+    if _pick:
+        with db.connect() as conn:
+            _cols = [r[1] for r in conn.execute(f"PRAGMA table_info({_pick})")]
+            _total = conn.execute(f"SELECT COUNT(*) FROM {_pick}").fetchone()[0]
+            _base = f"(SELECT * FROM {_pick} LIMIT 5000)"
+            _sn = conn.execute(f"SELECT COUNT(*) FROM {_base}").fetchone()[0] or 1
+            _comp = []
+            for _c in _cols:
+                try:
+                    _f = conn.execute(
+                        f"SELECT COUNT(*) FROM {_base} WHERE {_c} IS NOT NULL "
+                        f"AND CAST({_c} AS TEXT)<>''").fetchone()[0]
+                except Exception:
+                    _f = conn.execute(
+                        f"SELECT COUNT(*) FROM {_base} WHERE {_c} IS NOT NULL").fetchone()[0]
+                _comp.append({"column": _c, "filled": _f,
+                              "% filled": round(100.0 * _f / _sn, 1)})
+            _sample = pd.read_sql_query(f"SELECT * FROM {_pick} LIMIT 20", conn)
+        _m = st.columns(2)
+        _m[0].metric("Rows", f"{_total:,}")
+        _m[1].metric("Columns", f"{len(_cols)}")
+        st.markdown(f"**Column completeness** (of a {_sn:,}-row sample)")
+        st.dataframe(pd.DataFrame(_comp), use_container_width=True, height=300)
+        st.markdown("**Sample (first 20 rows)**")
+        st.dataframe(_preview_df(_sample), use_container_width=True, height=320)
 
 
 # ---------------------------------------------------------------------------
@@ -1360,7 +1452,9 @@ with tab_data:
             params = [f"%{q}%", f"%{q}%", f"%{q}%"]
     with db.connect() as conn:
         df = pd.read_sql_query(f"SELECT * FROM {table} {where} LIMIT {int(limit)}", conn, params=params)
-    st.dataframe(df, use_container_width=True, height=420)
+    st.dataframe(_preview_df(df), use_container_width=True, height=420)
+    st.caption("Preview hides the large `raw_json` column and truncates long text — "
+               "downloads below include the full data.")
 
     st.subheader("Download")
     st.caption("Exports are built only when you click Prepare (keeps memory low).")
