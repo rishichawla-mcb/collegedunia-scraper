@@ -737,6 +737,24 @@ with tab_overview:
     st.markdown("**Tables**")
     st.dataframe(pd.DataFrame(_rows), use_container_width=True, height=440)
 
+    _staged = next((r["rows"] for r in _rows if r["table"] == "staging"), 0) or 0
+    if _staged:
+        st.warning(f"⚠️ **{_staged:,} rows are sitting in `staging`** (scraped but not yet in the "
+                   "master tables) — a backlog from jobs that were interrupted before promoting. "
+                   "Promote them into master (upsert — dedupes against existing rows) or discard.")
+        _pc = st.columns(2)
+        if _pc[0].button(f"🚚 Promote ALL staged → master ({_staged:,} rows)", key="flushall",
+                         type="primary"):
+            with st.spinner("Promoting in memory-safe chunks…"):
+                _summ = db.flush_all_staging()
+            st.success("Promoted → " + (", ".join(f"{k}={v:,}" for k, v in _summ.items())
+                                        if _summ else "nothing to promote."))
+            st.rerun()
+        if _pc[1].button("🗑️ Discard ALL staged", key="discardall"):
+            _nd = db.discard_all_staging()
+            st.warning(f"Discarded {_nd:,} staged rows.")
+            st.rerun()
+
     _dtot = next((r["rows"] for r in _rows if r["table"] == "colleges_directory"), 0) or 0
     if _dtot:
         _cov = db.dir_coverage_summary()
@@ -746,6 +764,38 @@ with tab_overview:
         _o[0].metric("Directory colleges", f"{_cov['directory_total']:,}")
         _o[1].metric("In Phase 2 (overlap)", f"{_cov['overlap']:,}", f"{_pct:.1f}% covered")
         _o[2].metric("Missing from Phase 2", f"{_cov['directory_total'] - _cov['overlap']:,}")
+
+    st.divider()
+    st.markdown("**🧹 Junk / quality audit**")
+    try:
+        _junk = db.count_junk_college_courses()
+    except Exception:
+        _junk = 0
+    try:
+        _qa = db.qa_report()
+    except Exception:
+        _qa = {}
+    _q = st.columns(4)
+    _q[0].metric("Junk course-rows", f"{_junk:,}",
+                 help="college_courses rows whose name is a fee label / amount / college "
+                      "name — leftovers from the old parser. Not true duplicates, but junk.")
+    _q[1].metric("Offerings w/o fee", f"{_qa.get('offerings_no_fee', 0):,}")
+    _q[2].metric("Duplicate college names", f"{_qa.get('dup_college_names', 0):,}",
+                 help="Same name, different college_id — usually separate campuses, not dupes.")
+    _q[3].metric("Colleges not enriched", f"{_qa.get('colleges_unenriched', 0):,}")
+    if _junk:
+        with st.expander(f"Preview junk rows (up to 50 of {_junk:,})"):
+            st.dataframe(pd.DataFrame(db.sample_junk_college_courses(50)),
+                         use_container_width=True, height=260)
+        _delok = st.checkbox("Yes, delete these junk course-rows from college_courses",
+                             key="junkok")
+        if st.button(f"🧹 Delete {_junk:,} junk rows", key="deljunk", disabled=not _delok):
+            _dn = db.delete_junk_college_courses()
+            st.success(f"Deleted {_dn:,} junk rows from college_courses. Re-running Phase 4 "
+                       "only adds clean rows, so they won't come back.")
+            st.rerun()
+    else:
+        st.success("✅ No junk course-rows detected in college_courses.")
 
     st.divider()
     st.markdown("**Inspect a table** — columns, completeness (sampled) and a data sample")

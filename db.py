@@ -544,6 +544,37 @@ def qa_report(db_path: str = DB_PATH) -> Dict[str, int]:
     return out
 
 
+# college_courses rows whose course_name is clearly junk (leftovers from the old
+# HTML-table parser: fee labels, amounts, or college names leaked as a course).
+_JUNK_CC_WHERE = (
+    "(LOWER(course_name) LIKE '%fee%' "
+    "OR (LOWER(course_name) LIKE '%college%' AND course_name LIKE '%,%') "
+    "OR (LOWER(course_name) LIKE '%university%' AND course_name LIKE '%,%') "
+    "OR substr(course_name,1,1) IN ('₹','0','1','2','3','4','5','6','7','8','9') "
+    "OR LOWER(TRIM(course_name)) IN "
+    "('semester','amount','total','tuition','yearly','caution','admission',"
+    "'registration','exam','other','hostel','n/a','na','-',''))"
+)
+
+
+def count_junk_college_courses(db_path: str = DB_PATH) -> int:
+    with connect(db_path) as conn:
+        return conn.execute(
+            f"SELECT COUNT(*) FROM college_courses WHERE {_JUNK_CC_WHERE}").fetchone()[0]
+
+
+def sample_junk_college_courses(limit: int = 50, db_path: str = DB_PATH) -> List[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        return [dict(r) for r in conn.execute(
+            f"SELECT college_id, college_name, course_name, total_fees "
+            f"FROM college_courses WHERE {_JUNK_CC_WHERE} LIMIT ?", (int(limit),)).fetchall()]
+
+
+def delete_junk_college_courses(db_path: str = DB_PATH) -> int:
+    with connect(db_path) as conn:
+        return conn.execute(f"DELETE FROM college_courses WHERE {_JUNK_CC_WHERE}").rowcount
+
+
 def upsert_college_courses(rows: Iterable[Dict[str, Any]], db_path: str = DB_PATH) -> int:
     rows = [r for r in rows if r.get("course_name")]
     if not rows:
@@ -955,6 +986,34 @@ def promote_job(job_id: int, db_path: str = DB_PATH) -> Dict[str, int]:
     summary = flush_job_staging(job_id, db_path=db_path)
     update_job(job_id, promote_status="promoted", db_path=db_path)
     return summary
+
+
+def flush_all_staging(db_path: str = DB_PATH, chunk: int = 500) -> Dict[str, int]:
+    """Promote EVERY job's staged rows into master (chunked, memory-safe), clearing
+    staging as it goes. Drains a backlog left by interrupted/crashed jobs. Upserts,
+    so it dedupes against what's already in master. Returns {table: promoted}."""
+    with connect(db_path) as conn:
+        jids = [r[0] for r in conn.execute("SELECT DISTINCT job_id FROM staging")]
+    total: Dict[str, int] = {}
+    for jid in jids:
+        summ = flush_job_staging(jid, db_path=db_path, chunk=chunk)
+        for k, v in summ.items():
+            total[k] = total.get(k, 0) + v
+        try:
+            update_job(jid, promote_status="promoted", db_path=db_path)
+        except Exception:  # noqa: BLE001
+            pass
+    return total
+
+
+def discard_all_staging(db_path: str = DB_PATH) -> int:
+    with connect(db_path) as conn:
+        return conn.execute("DELETE FROM staging").rowcount
+
+
+def staging_count(db_path: str = DB_PATH) -> int:
+    with connect(db_path) as conn:
+        return conn.execute("SELECT COUNT(*) FROM staging").fetchone()[0]
 
 
 def discard_staging(job_id: int, db_path: str = DB_PATH) -> int:
