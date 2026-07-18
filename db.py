@@ -281,6 +281,22 @@ CREATE TABLE IF NOT EXISTS dir_progress (
     updated_at REAL
 );
 
+-- Enrichment A: per-course aggregates DERIVED from already-scraped offerings
+-- (no network). Rebuilt on demand; keyed by course_id.
+CREATE TABLE IF NOT EXISTS course_enrichment (
+    course_id    INTEGER PRIMARY KEY,
+    n_colleges   INTEGER DEFAULT 0,
+    n_cities     INTEGER DEFAULT 0,
+    n_states     INTEGER DEFAULT 0,
+    fee_min      INTEGER,
+    fee_avg      INTEGER,
+    fee_max      INTEGER,
+    avg_rating   REAL,
+    top_colleges TEXT,          -- JSON: [{college, city, fee, rank}]
+    state_spread TEXT,          -- JSON: {state_id: college_count}
+    updated_at   REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_offerings_course ON offerings(course_id);
 CREATE INDEX IF NOT EXISTS idx_offerings_college ON offerings(college_id);
 CREATE INDEX IF NOT EXISTS idx_cc_college ON college_courses(college_id);
@@ -322,7 +338,7 @@ def init_db(db_path: str = DB_PATH) -> None:
                          ("duration", "TEXT"), ("mode", "TEXT"), ("level", "TEXT"),
                          ("course_type", "TEXT"), ("rating", "REAL"),
                          ("reviews_count", "INTEGER"), ("application_start", "TEXT"),
-                         ("application_end", "TEXT")):
+                         ("application_end", "TEXT"), ("course_url", "TEXT")):
             if col not in cccols:
                 conn.execute(f"ALTER TABLE college_courses ADD COLUMN {col} {typ}")
         # Migration: last completed course_page for Phase-4 mid-college resume.
@@ -374,7 +390,13 @@ def set_setting(key: str, value: Any, db_path: str = DB_PATH) -> None:
 # ---------------------------------------------------------------------------
 # Course upserts (phase 1)
 # ---------------------------------------------------------------------------
-def upsert_courses(rows: Iterable[Dict[str, Any]], db_path: str = DB_PATH) -> int:
+def upsert_courses(rows: Iterable[Dict[str, Any]], db_path: str = DB_PATH,
+                   fill_empty: bool = False) -> int:
+    """Insert/refresh course rows. Normally overwrites every column on conflict.
+    With fill_empty=True (Enrichment B — backfill mode) an existing non-empty
+    value is preserved and only NULL/'' columns are patched from the new scrape,
+    so a re-run can top up gaps without clobbering good data. course_id, raw_json,
+    scraped_at and source_job_id are always refreshed for provenance."""
     rows = list(rows)
     if not rows:
         return 0
@@ -385,11 +407,25 @@ def upsert_courses(rows: Iterable[Dict[str, Any]], db_path: str = DB_PATH) -> in
         "stream_id", "stream_name", "course_tag", "course_tag_id", "description",
         "colleges_url", "raw_json", "scraped_at", "source_job_id",
     ]
+    always = {"course_id", "raw_json", "scraped_at", "source_job_id"}
     placeholders = ",".join("?" for _ in cols)
+    if fill_empty:
+        sets = []
+        for c in cols:
+            if c == "course_id":
+                continue
+            if c in always:
+                sets.append(f"{c}=excluded.{c}")
+            else:
+                sets.append(
+                    f"{c}=CASE WHEN courses.{c} IS NULL OR courses.{c}='' "
+                    f"THEN excluded.{c} ELSE courses.{c} END")
+        set_clause = ",".join(sets)
+    else:
+        set_clause = ",".join(f"{c}=excluded.{c}" for c in cols if c != "course_id")
     sql = (
         f"INSERT INTO courses ({','.join(cols)}) VALUES ({placeholders}) "
-        f"ON CONFLICT(course_id) DO UPDATE SET "
-        + ",".join(f"{c}=excluded.{c}" for c in cols if c != "course_id")
+        f"ON CONFLICT(course_id) DO UPDATE SET " + set_clause
     )
     with connect(db_path) as conn:
         conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
@@ -582,8 +618,8 @@ def upsert_college_courses(rows: Iterable[Dict[str, Any]], db_path: str = DB_PAT
     cols = ["college_id", "college_name", "course_name", "specialization",
             "eligibility", "total_fees", "fees_inr", "hostel_fees", "duration",
             "mode", "level", "course_type", "rating", "reviews_count",
-            "application_start", "application_end", "source_url", "scraped_at",
-            "source_job_id"]
+            "application_start", "application_end", "source_url", "course_url",
+            "scraped_at", "source_job_id"]
     ph = ",".join("?" for _ in cols)
     sql = (f"INSERT INTO college_courses ({','.join(cols)}) VALUES ({ph}) "
            f"ON CONFLICT(college_id, course_name) DO UPDATE SET "
@@ -736,6 +772,30 @@ def list_known_college_ids(db_path: str = DB_PATH) -> List[int]:
             "SELECT college_id FROM colleges ORDER BY college_id")]
 
 
+def list_colleges_missing_course_url(db_path: str = DB_PATH) -> List[int]:
+    """College ids that still have >=1 college_courses row with no course_url.
+    This IS the resumable backfill queue: each college drops out of the query
+    the moment its rows are re-scraped and filled, so restarts auto-continue."""
+    with connect(db_path) as conn:
+        return [r[0] for r in conn.execute(
+            "SELECT DISTINCT college_id FROM college_courses "
+            "WHERE (course_url IS NULL OR course_url='') AND college_id IS NOT NULL "
+            "ORDER BY college_id")]
+
+
+def course_url_backfill_status(db_path: str = DB_PATH) -> Dict[str, int]:
+    with connect(db_path) as conn:
+        def one(q):
+            return conn.execute(q).fetchone()[0]
+        return {
+            "rows_total": one("SELECT COUNT(*) FROM college_courses"),
+            "rows_missing": one("SELECT COUNT(*) FROM college_courses "
+                                "WHERE course_url IS NULL OR course_url=''"),
+            "colleges_missing": one("SELECT COUNT(DISTINCT college_id) FROM college_courses "
+                                    "WHERE course_url IS NULL OR course_url=''"),
+        }
+
+
 def list_directory_college_ids(db_path: str = DB_PATH) -> List[int]:
     """Every college_id discovered by the Directory phase (~18.8k) — the widest
     baseline. Feed this to Phase 4 to scrape courses & fees for colleges the
@@ -769,6 +829,60 @@ def list_course_ids(db_path: str = DB_PATH, where: str = "", params: tuple = (),
     sql += " ORDER BY " + _ORDER_SQL.get(order, "colleges_count DESC")
     with connect(db_path) as conn:
         return [r["course_id"] for r in conn.execute(sql, params).fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Enrichment A — derive per-course aggregates from already-scraped offerings.
+# Pure SQL over data already in the DB: no network, memory-bounded (one small
+# GROUP BY + a couple of tiny per-course lookups). Rebuilds course_enrichment.
+# ---------------------------------------------------------------------------
+def enrich_courses(db_path: str = DB_PATH) -> int:
+    with connect(db_path) as conn:
+        conn.execute("DELETE FROM course_enrichment")
+        agg = conn.execute(
+            "SELECT course_id, "
+            "COUNT(DISTINCT college_id) AS n_colleges, "
+            "COUNT(DISTINCT NULLIF(city,'')) AS n_cities, "
+            "COUNT(DISTINCT state_id) AS n_states, "
+            "MIN(NULLIF(fees_amount,0)) AS fee_min, "
+            "CAST(AVG(NULLIF(fees_amount,0)) AS INTEGER) AS fee_avg, "
+            "MAX(NULLIF(fees_amount,0)) AS fee_max, "
+            "AVG(NULLIF(course_rating,0)) AS avg_rating "
+            "FROM offerings GROUP BY course_id").fetchall()
+        n = 0
+        for r in agg:
+            cid = r["course_id"]
+            tops = conn.execute(
+                "SELECT college_name, city, fees_amount, ranking_rank FROM offerings "
+                "WHERE course_id=? AND college_name<>'' "
+                "ORDER BY CASE WHEN ranking_rank>0 THEN ranking_rank ELSE 9999999 END, "
+                "fees_amount DESC LIMIT 5", (cid,)).fetchall()
+            top_json = json.dumps([
+                {"college": t["college_name"], "city": t["city"],
+                 "fee": t["fees_amount"], "rank": t["ranking_rank"]} for t in tops])
+            spread = conn.execute(
+                "SELECT CAST(state_id AS TEXT) AS s, COUNT(DISTINCT college_id) AS c "
+                "FROM offerings WHERE course_id=? AND state_id IS NOT NULL "
+                "GROUP BY state_id ORDER BY c DESC LIMIT 12", (cid,)).fetchall()
+            spread_json = json.dumps({row["s"]: row["c"] for row in spread})
+            conn.execute(
+                "INSERT OR REPLACE INTO course_enrichment("
+                "course_id, n_colleges, n_cities, n_states, fee_min, fee_avg, fee_max, "
+                "avg_rating, top_colleges, state_spread, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (cid, r["n_colleges"], r["n_cities"], r["n_states"],
+                 r["fee_min"], r["fee_avg"], r["fee_max"],
+                 round(r["avg_rating"], 2) if r["avg_rating"] else None,
+                 top_json, spread_json, time.time()))
+            n += 1
+        return n
+
+
+def course_enrichment_summary(db_path: str = DB_PATH) -> Dict[str, Any]:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n, MAX(updated_at) AS last FROM course_enrichment").fetchone()
+    return {"rows": row["n"] if row else 0, "last": row["last"] if row else None}
 
 
 # ---------------------------------------------------------------------------

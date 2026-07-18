@@ -804,6 +804,11 @@ def _write_rows(job_id: int, cfg: Dict[str, Any], table: str,
     master (fallback when cfg['staging'] is False)."""
     if not rows:
         return 0
+    # Enrichment B — backfill mode patches only empty columns on existing course
+    # rows, writing straight to master (no staging/QC gate: it never adds rows,
+    # only tops up gaps in ones already scraped).
+    if table == "courses" and cfg.get("backfill_only"):
+        return db.upsert_courses(rows, db_path=db_path, fill_empty=True)
     if cfg.get("staging", True):
         return db.stage_records(job_id, table, rows, db_path=db_path)
     return getattr(db, _UPSERT_MAP[table])(rows, db_path=db_path)
@@ -1521,6 +1526,25 @@ def parse_courses_fees(page_html: str) -> Dict[str, Any]:
     return tbl
 
 
+_URL_KEYS = ("url", "course_url", "course_link", "seo_url", "landing_url",
+             "landing_page", "page_url", "link", "slug", "course_slug", "seo_slug")
+
+
+def _first_url(*objs: Dict[str, Any]) -> str:
+    """Best-effort per-course URL from a course/stream object. The courses-list
+    API's exact URL key isn't documented, so we probe the common candidates (most
+    specific object first) and absolutise whatever we find. Empty if none — the
+    caller then falls back to the college's courses-fees page."""
+    for o in objs:
+        if not isinstance(o, dict):
+            continue
+        for k in _URL_KEYS:
+            v = o.get(k)
+            if isinstance(v, str) and v.strip():
+                return abs_url(v.strip())
+    return ""
+
+
 def _course_group_rows(clist: List[Dict[str, Any]], hostel: str = "",
                        seen: Optional[set] = None) -> List[Dict[str, Any]]:
     """Flatten a course_data.courses[] list (from __NEXT_DATA__ or the
@@ -1547,6 +1571,7 @@ def _course_group_rows(clist: List[Dict[str, Any]], hostel: str = "",
             rows.append({
                 "course_name": full,
                 "specialization": spec if is_spec else "",
+                "course_url": _first_url(s, c),
                 "eligibility": (c.get("eligibility") or "").strip(),
                 "total_fees": ("₹" + amt_fmt) if amt_fmt else "",
                 "fees_inr": _to_int(fd.get("amount")),
@@ -1722,7 +1747,9 @@ def run_college_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_P
                 nonlocal n
                 rows = _course_group_rows(_dedupe_groups(groups), hostel, seen_rows)
                 rows = [{**r, "college_id": cid, "college_name": cname,
-                         "source_url": url, "scraped_at": time.time()} for r in rows]
+                         "source_url": url,
+                         "course_url": r.get("course_url") or url,
+                         "scraped_at": time.time()} for r in rows]
                 if rows:
                     with db_lock:
                         n += _write_rows(job_id, cfg, "college_courses", rows, db_path)

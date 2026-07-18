@@ -407,6 +407,21 @@ def fmt_eta(done: int, total: int, started: float) -> str:
     return f"~{mins/60:.1f} hr"
 
 
+def fmt_ago(ts) -> str:
+    if not ts:
+        return "—"
+    secs = max(0, time.time() - float(ts))
+    if secs < 90:
+        return "just now"
+    mins = secs / 60
+    if mins < 90:
+        return f"{mins:.0f} min ago"
+    hrs = mins / 60
+    if hrs < 36:
+        return f"{hrs:.0f} hr ago"
+    return f"{hrs/24:.0f} d ago"
+
+
 # ---------------------------------------------------------------------------
 # System metrics (container-aware, stdlib only — no extra deps)
 # ---------------------------------------------------------------------------
@@ -977,6 +992,40 @@ with tab_run:
             launch_worker(jid)
             st.session_state["watch_p1"] = jid
             st.success(f"Started complete scrape — job #{jid}")
+
+        # ---- Enrichment B: backfill empty fields ---------------------------
+        with st.expander("✨ Enrichment B — backfill empty course fields", expanded=False):
+            with db.connect() as conn:
+                blanks = conn.execute(
+                    "SELECT "
+                    "SUM(CASE WHEN duration IS NULL OR duration='' THEN 1 ELSE 0 END) AS d, "
+                    "SUM(CASE WHEN eligibility IS NULL OR eligibility='' THEN 1 ELSE 0 END) AS e, "
+                    "SUM(CASE WHEN avg_salary IS NULL OR avg_salary='' THEN 1 ELSE 0 END) AS s, "
+                    "SUM(CASE WHEN job_roles IS NULL OR job_roles='' THEN 1 ELSE 0 END) AS j, "
+                    "COUNT(*) AS n FROM courses").fetchone()
+            st.caption(
+                "Re-runs the light Phase-1 listing and patches **only blank** fields on "
+                "existing courses (never overwrites good data, adds no rows). Writes straight "
+                "to master. Uses the partitioned scrape so it reaches every course.")
+            if blanks and blanks["n"]:
+                bb1, bb2, bb3, bb4 = st.columns(4)
+                bb1.metric("Missing duration", f"{blanks['d'] or 0:,}")
+                bb2.metric("Missing eligibility", f"{blanks['e'] or 0:,}")
+                bb3.metric("Missing salary", f"{blanks['s'] or 0:,}")
+                bb4.metric("Missing job roles", f"{blanks['j'] or 0:,}")
+            bf_part = st.checkbox("Partitioned (reach all ~21.5k courses)", value=True,
+                                  key="bf_part")
+            if st.button("✨ Start backfill (empty fields only)", key="run1bf"):
+                cfg = proxy_config_from_ui()
+                cfg["backfill_only"] = True
+                cfg["staging"] = False           # patch master directly
+                cfg["force_restart"] = True       # sweep the whole catalogue
+                if bf_part:
+                    cfg["partition"] = True
+                jid = db.create_job("courses", cfg)
+                launch_worker(jid)
+                st.session_state["watch_p1"] = jid
+                st.success(f"Started backfill — job #{jid}. Only empty fields will be filled.")
         render_job_monitor(["courses", "pipeline"], "p1")
 
     # ============================ Phase 2 ============================
@@ -1214,6 +1263,44 @@ with tab_run:
             launch_worker(jid)
             st.session_state["watch_p4"] = jid
             st.success(f"Started courses-fees scrape — job #{jid}")
+
+        # ---- Resumable course-URL backfill on already-scraped colleges -----
+        if cc_rows > 0:
+            with st.expander("🔗 Backfill course URLs on already-scraped colleges",
+                             expanded=False):
+                ub = db.course_url_backfill_status()
+                st.caption(
+                    "Re-scrapes only colleges whose existing course rows are missing a "
+                    "`course_url`, refilling every column (incl. the new URL) via the fast "
+                    "courses-list API. **Resumable**: each college drops out of the queue once "
+                    "filled, so you can run it in chunks with a bandwidth cap and just restart.")
+                ubm1, ubm2, ubm3 = st.columns(3)
+                ubm1.metric("Course-rows total", f"{ub['rows_total']:,}")
+                ubm2.metric("Rows missing URL", f"{ub['rows_missing']:,}")
+                ubm3.metric("Colleges to backfill", f"{ub['colleges_missing']:,}")
+                ub_est = ub["colleges_missing"] * 25 / 1024
+                st.caption(f"~{ub['colleges_missing']:,} colleges → ~**{ub_est:.0f} MB** "
+                           "via the light JSON API (~25 KB each). Set a cap and run in chunks.")
+                ubc1, ubc2 = st.columns(2)
+                ub_conc = ubc1.number_input("Parallel workers", 1, 20, 3, key="ubconc")
+                ub_bud = ubc2.number_input("Max bandwidth MB (0=∞)", 0, 200000, 500,
+                                           step=100, key="ubbud")
+                if st.button("🔗 Start URL backfill", key="run4url",
+                             disabled=ub["colleges_missing"] == 0):
+                    ids = db.list_colleges_missing_course_url()
+                    cfg = proxy_config_from_ui()
+                    cfg["college_ids"] = ids
+                    cfg["use_known"] = False
+                    cfg["force_rescrape"] = True      # re-hit 'done' colleges
+                    cfg["fetch_hostel"] = False       # URL comes from the JSON API
+                    cfg["concurrency"] = int(ub_conc)
+                    cfg["budget_mb"] = float(ub_bud)
+                    jid = db.create_job("college_courses", cfg)
+                    launch_worker(jid)
+                    st.session_state["watch_p4"] = jid
+                    st.success(f"Started URL backfill over {len(ids):,} colleges — job #{jid}. "
+                               "Restart after a budget stop; it auto-continues.")
+
         if cc_rows > 0:
             with st.expander("🔀 Reconcile: college-side vs course-side"):
                 with db.connect() as conn:
@@ -1514,19 +1601,67 @@ with tab_report:
                     st.markdown("**Courses by type**"); st.bar_chart(bt, height=260)
                 st.markdown("**Courses by level**"); st.bar_chart(bl, height=240)
                 st.divider()
-                st.markdown("**🔎 Biggest courses by college reach** — filter by stream")
+                # ---- Enrichment A: derived per-course aggregates ------------
+                ce = db.course_enrichment_summary()
+                st.markdown("**✨ Course enrichment** — fee ranges, reach & top colleges "
+                            "derived from your Phase-2 offerings (no new scraping)")
+                eca, ecb = st.columns([1, 2])
+                with eca:
+                    if st.button("⚡ Build / refresh enrichment", key="rep_p1_enrich",
+                                 disabled=rc["offerings"] == 0, use_container_width=True):
+                        with st.spinner("Aggregating offerings…"):
+                            written = db.enrich_courses()
+                        st.success(f"Enriched {written:,} courses.")
+                        ce = db.course_enrichment_summary()
+                with ecb:
+                    if ce["rows"]:
+                        st.caption(f"Enriched **{ce['rows']:,}** courses"
+                                   + (f" · updated {fmt_ago(ce['last'])}" if ce.get("last") else ""))
+                    elif rc["offerings"] == 0:
+                        st.caption("Run Phase 2 first — enrichment is derived from offerings.")
+                    else:
+                        st.caption("Not built yet — click the button to derive it.")
+
+                st.divider()
+                st.markdown("**🔎 Courses — with enrichment** — filter by stream")
                 streams = ["(all)"] + [s for s in bs.index.tolist() if s]
                 fstream = st.selectbox("Stream", streams, key="rep_p1_stream")
+                only_en = st.checkbox("Only enriched courses", value=False, key="rep_p1_onlyen")
                 topk = st.slider("Show top", 10, 200, 40, step=10, key="rep_p1_topk")
-                q = ("SELECT course_id, name, stream_name, course_type, level, colleges_count "
-                     "FROM courses")
+                join = "LEFT JOIN" if not only_en else "JOIN"
+                q = ("SELECT c.course_id, c.name, c.stream_name, c.level, c.colleges_count, "
+                     "e.n_colleges AS scraped_colleges, e.fee_min, e.fee_avg, e.fee_max, "
+                     "e.n_states, e.avg_rating "
+                     f"FROM courses c {join} course_enrichment e ON e.course_id=c.course_id")
                 pr: list = []
                 if fstream != "(all)":
-                    q += " WHERE stream_name=?"; pr = [fstream]
-                q += " ORDER BY colleges_count DESC LIMIT ?"; pr.append(int(topk))
+                    q += " WHERE c.stream_name=?"; pr = [fstream]
+                q += " ORDER BY c.colleges_count DESC LIMIT ?"; pr.append(int(topk))
                 with db.connect() as conn:
-                    st.dataframe(pd.read_sql_query(q, conn, params=pr),
-                                 use_container_width=True, height=340)
+                    dfp1 = pd.read_sql_query(q, conn, params=pr)
+                st.dataframe(dfp1, use_container_width=True, height=340)
+                # Drill-down: top colleges + state spread for one course
+                if ce["rows"] and not dfp1.empty:
+                    pick = st.selectbox(
+                        "Drill into a course (top colleges & geography)",
+                        ["—"] + dfp1["name"].tolist(), key="rep_p1_pick")
+                    if pick and pick != "—":
+                        cid = int(dfp1[dfp1["name"] == pick]["course_id"].iloc[0])
+                        with db.connect() as conn:
+                            row = conn.execute(
+                                "SELECT top_colleges, state_spread FROM course_enrichment "
+                                "WHERE course_id=?", (cid,)).fetchone()
+                        if row:
+                            import json as _json
+                            tops = _json.loads(row["top_colleges"] or "[]")
+                            if tops:
+                                st.markdown("**Top colleges**")
+                                st.dataframe(pd.DataFrame(tops), use_container_width=True,
+                                             height=210)
+                            spread = _json.loads(row["state_spread"] or "{}")
+                            if spread:
+                                st.markdown("**Colleges by state_id**")
+                                st.bar_chart(pd.Series(spread), height=200)
 
         # ---- Phase 2: offerings --------------------------------------------
         with r_p2:
@@ -1585,7 +1720,8 @@ with tab_report:
                 levels = ["(all)"] + [x for x in lv["k"].tolist() if x and x != "—"]
                 flev = f3.selectbox("Level", levels, key="rep_p4_lev")
                 q = ("SELECT college_name, course_name, level, mode, duration, "
-                     "total_fees, hostel_fees, fees_inr FROM college_courses WHERE 1=1")
+                     "total_fees, hostel_fees, fees_inr, course_url "
+                     "FROM college_courses WHERE 1=1")
                 pr = []
                 if fmin > 0:
                     q += " AND fees_inr>=?"; pr.append(int(fmin))
@@ -1785,7 +1921,7 @@ with tab_index:
             sql += " ORDER BY name LIMIT 500"
         elif which == "College courses (P4)":
             sql = ("SELECT college_name, course_name, level, mode, duration, "
-                   "total_fees, hostel_fees FROM college_courses")
+                   "total_fees, hostel_fees, course_url FROM college_courses")
             params = []
             if term:
                 sql += " WHERE college_name LIKE ? OR course_name LIKE ?"; params = [like, like]
