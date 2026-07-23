@@ -34,6 +34,19 @@ import db
 import export
 import scraper
 
+# Build stamp — bumped whenever the matched set of core files changes. The header
+# cross-checks db/scraper/export against this value; if you deploy a stale subset,
+# a banner names the out-of-sync file instead of failing with a cryptic 404.
+BUILD = "2026-07-23a"
+
+
+def _build_status():
+    mods = {"app.py": BUILD, "db.py": getattr(db, "BUILD", "?"),
+            "scraper.py": getattr(scraper, "BUILD", "?"),
+            "export.py": getattr(export, "BUILD", "?")}
+    stale = {k: v for k, v in mods.items() if v != BUILD}
+    return mods, stale
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 st.set_page_config(page_title="Collegedunia Scraper", page_icon="🎓", layout="wide")
@@ -684,6 +697,16 @@ if st.sidebar.button("🧪 Test proxies"):
 _start_scheduler()  # start the scheduled-refresh daemon once per server
 
 st.title("🎓 Collegedunia Course & College Scraper")
+_bmods, _bstale = _build_status()
+if _bstale:
+    st.error(
+        f"⚠️ **Version mismatch** — app.py is build `{BUILD}` but these files are "
+        f"out of sync: {', '.join(f'{k} = {v}' for k, v in _bstale.items())}. "
+        "Re-upload the **full matched set** (app.py, db.py, scraper.py, export.py) "
+        "and redeploy with *Clear build cache*. This is the usual cause of 404 "
+        "exports and the 'Connecting' / SessionInfo errors.")
+else:
+    st.caption(f"🧩 Build `{BUILD}` · core files in sync (app · db · scraper · export)")
 c = db.counts()
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Courses", f"{c['courses']:,}")

@@ -7,6 +7,8 @@ is the "joined" view linking courses to the colleges that offer them.
 
 from __future__ import annotations
 
+BUILD = "2026-07-23a"  # keep in sync across app/db/scraper/export (header checks this)
+
 import io
 import json
 from typing import List, Tuple
@@ -17,7 +19,8 @@ from openpyxl.utils import get_column_letter
 
 import db
 
-TABLES = ("courses", "colleges", "offerings", "college_courses", "colleges_directory")
+TABLES = ("courses", "colleges", "offerings", "college_courses", "colleges_directory",
+          "course_enrichment")
 
 
 def _fetch(table: str, db_path: str = db.DB_PATH) -> Tuple[List[str], List[tuple]]:

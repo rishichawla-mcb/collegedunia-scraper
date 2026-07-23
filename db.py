@@ -19,6 +19,8 @@ WAL mode is enabled so the Streamlit UI can read while the worker writes.
 
 from __future__ import annotations
 
+BUILD = "2026-07-23a"  # keep in sync across app/db/scraper/export (header checks this)
+
 import json
 import os
 import re

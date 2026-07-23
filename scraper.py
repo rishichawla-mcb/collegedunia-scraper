@@ -26,6 +26,8 @@ does NOT solve CAPTCHAs or spoof browser fingerprints.
 
 from __future__ import annotations
 
+BUILD = "2026-07-23a"  # keep in sync across app/db/scraper/export (header checks this)
+
 import base64
 from collections import Counter
 import html as _html
