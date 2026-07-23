@@ -55,6 +55,11 @@ def fee_to_inr(value: Any) -> Optional[int]:
 
 DB_PATH = os.environ.get("CD_DB_PATH", os.path.join(os.path.dirname(__file__), "data.db"))
 
+# Rows held in RAM per promotion batch. Sized for the host: 2500 is comfortable
+# on a 2 GB box and drains a big staging backlog in far fewer passes; drop to
+# ~500 on a 512 MB host. Override with CD_PROMOTE_CHUNK.
+PROMOTE_CHUNK = int(os.environ.get("CD_PROMOTE_CHUNK", "2500"))
+
 # Collegedunia internal stream IDs -> human-readable names (verified via the API).
 STREAMS = {
     1: "Agriculture", 2: "Architecture", 3: "Arts", 4: "Aviation",
@@ -1070,11 +1075,12 @@ def validate_job(job_id: int, rules: Optional[Dict[str, Any]] = None,
     return {"score": score, "passed": passed, "checks": checks, "total": total}
 
 
-def flush_job_staging(job_id: int, db_path: str = DB_PATH, chunk: int = 500) -> Dict[str, int]:
+def flush_job_staging(job_id: int, db_path: str = DB_PATH,
+                      chunk: int = PROMOTE_CHUNK) -> Dict[str, int]:
     """Promote a job's staged rows into master in MEMORY-SAFE CHUNKS, stamping
     source_job_id, and delete each promoted chunk from staging as it goes. Only
-    `chunk` rows are held in RAM at once, so this is safe on 512 MB hosts and can
-    be called repeatedly during a run (incremental promotion) — an interrupted
+    `chunk` rows are held in RAM at once (PROMOTE_CHUNK, sized to the host), so it
+    can be called repeatedly during a run (incremental promotion) — an interrupted
     job then loses at most the last un-flushed chunk. Returns {table: count}."""
     import sys as _sys
     me = _sys.modules[__name__]
@@ -1112,7 +1118,7 @@ def promote_job(job_id: int, db_path: str = DB_PATH) -> Dict[str, int]:
     return summary
 
 
-def flush_all_staging(db_path: str = DB_PATH, chunk: int = 500) -> Dict[str, int]:
+def flush_all_staging(db_path: str = DB_PATH, chunk: int = PROMOTE_CHUNK) -> Dict[str, int]:
     """Promote EVERY job's staged rows into master (chunked, memory-safe), clearing
     staging as it goes. Drains a backlog left by interrupted/crashed jobs. Upserts,
     so it dedupes against what's already in master. Returns {table: promoted}."""

@@ -1,0 +1,23 @@
+# Run on any VM (Oracle Always-Free, Hetzner, etc.) — persistence is automatic:
+# the ./data host folder is bind-mounted to /data, so the SQLite DB survives
+# restarts and rebuilds. No platform "volume" feature needed.
+#
+#   sudo apt update && sudo apt install -y docker.io docker-compose-v2 git
+#   git clone <your-repo> && cd collegedunia-scraper
+#   echo "APP_PASSWORD=choose-a-password" > .env
+#   docker compose up -d --build
+#   # open http://<vm-public-ip>:8501   (allow port 8501 in the VM firewall/security list)
+#
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      - CD_DB_PATH=/data/data.db
+      - CD_PROMOTE_CHUNK=2500      # rows/promotion batch; 2500≈2GB, ~5000 for 4GB+
+      - PORT=8501
+      - APP_PASSWORD=${APP_PASSWORD:-}
+    volumes:
+      - ./data:/data          # host folder -> /data (persistent DB lives here)
