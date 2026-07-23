@@ -2,7 +2,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
-    CD_DB_PATH=/data/data.db
+    CD_DB_PATH=/data/data.db \
+    CD_PROMOTE_CHUNK=2500
+# CD_PROMOTE_CHUNK = rows held in RAM per staging→master promotion batch.
+# 2500 suits a 2 GB host; raise to ~5000 on 4 GB+, drop to ~500 on 512 MB.
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
