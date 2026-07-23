@@ -17,6 +17,8 @@ It can also be used directly from the command line:
 
 from __future__ import annotations
 
+BUILD = "2026-07-23a"  # keep in sync across app/db/scraper/export (header checks this)
+
 import argparse
 import json
 import os
