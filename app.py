@@ -694,9 +694,15 @@ m4.metric("Courses done (phase 2)", f"{c['courses_done_phase2']:,}")
 render_system_bar()
 
 
+@st.fragment(run_every=3)
 def render_job_monitor(job_types, key: str, govern: bool = True) -> None:
     """Per-phase live monitor: progress, staged data (live), logs, controls —
-    scoped to this phase's job (its watch id, else the latest job of job_types)."""
+    scoped to this phase's job (its watch id, else the latest job of job_types).
+
+    Wrapped in an st.fragment so the 3-second live refresh reruns ONLY this panel,
+    not the whole app. The old approach (time.sleep + st.rerun) re-ran every tab and
+    the system bar each cycle, hammering the websocket and causing Render to flash
+    'CONNECTING' / 'Tried to use SessionInfo before it was initialized'."""
     watch_id = st.session_state.get(f"watch_{key}")
     job = db.get_job(watch_id) if watch_id else None
     if not job:
@@ -795,10 +801,10 @@ def render_job_monitor(job_types, key: str, govern: bool = True) -> None:
     if lc1.button("🗑️ Clear this job's logs", key=f"clr{key}"):
         db.clear_logs(job["id"])
         st.rerun()
-    lc2.caption(f"{len(logs)} lines shown · auto-refreshes while running")
-    if job["status"] in ("running", "queued"):
-        time.sleep(3)
-        st.rerun()
+    lc2.caption(f"{len(logs)} lines shown · auto-refreshes every 3s while running")
+    # Live refresh is handled by the @st.fragment(run_every=3) decorator — no
+    # blocking sleep / full-app st.rerun() here (that caused the Render websocket
+    # churn). The fragment quietly re-renders just this panel every 3 seconds.
 
 
 (tab_overview, tab_run, tab_query, tab_live, tab_report, tab_index, tab_data,
