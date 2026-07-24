@@ -51,3 +51,9 @@ def to_csv(table, db_path=sa_db.SA_DB_PATH) -> bytes:
     for r in rows:
         w.writerow(["" if v is None else v for v in r])
     return buf.getvalue().encode("utf-8")
+
+
+def to_json(table, db_path=sa_db.SA_DB_PATH) -> bytes:
+    cols, rows = _fetch(table, db_path)
+    data = [dict(zip(cols, r)) for r in rows]
+    return json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
