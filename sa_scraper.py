@@ -19,13 +19,17 @@ BUILD = "2026-07-23a"
 
 import json
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
 import sa_db
+import db as _core  # read SHARED proxy/rate settings (used as-is by SA)
 # Generic infra reused from the domestic engine (imported, never modified):
 from scraper import (Client, ProxyManager, encode_payload, abs_url,
-                     _to_int, _nextdata_pageprops, BudgetExceeded)
+                     _to_int, _nextdata_pageprops, BudgetExceeded,
+                     Stats, AdaptiveDelay, send_notification)
 
 SA_LISTING_API = "https://collegedunia.com/web-api/listing-cf-sa"
 SITE = "https://collegedunia.com"
@@ -203,10 +207,33 @@ def fetch_listing(client: "Client", filters: Dict[str, Any], page: int) -> Dict[
         raise RuntimeError(f"non-JSON listing-cf-sa response: {str(err)[:80]}")
 
 
+def shared_proxy_cfg() -> Dict[str, Any]:
+    """Read the SAME proxy / rate-limit settings the domestic vertical uses (from
+    the shared `settings` table) so Study Abroad uses the configured gateway AS-IS.
+    No separate proxy config for SA."""
+    try:
+        g = _core.get_setting
+        return {
+            "proxy_mode": g("proxy_mode", "none"),
+            "proxy_gateway": g("proxy_gateway", "") or "",
+            "proxy_list": [p.strip() for p in (g("proxy_list_text", "") or "").splitlines() if p.strip()],
+            "proxy_cooldown": g("proxy_cooldown", 120),
+            "delay": float(g("delay", 1.0) or 1.0),
+        }
+    except Exception:  # noqa: BLE001  (settings table not present yet -> direct)
+        return {"proxy_mode": "none", "proxy_gateway": "", "proxy_list": [],
+                "proxy_cooldown": 120, "delay": 1.0}
+
+
 def _build_client(cfg: Dict[str, Any], log) -> "Client":
-    pm = ProxyManager.from_config(cfg)
-    return Client(pm, log=log, max_retries=int(cfg.get("max_retries", 5)),
-                  backoff=float(cfg.get("backoff", 4)))
+    # Shared proxy/rate settings first; the job cfg may override (e.g. budget).
+    merged = {**shared_proxy_cfg(), **cfg}
+    pm = ProxyManager.from_config(merged)
+    stats = Stats()
+    adaptive = AdaptiveDelay(float(merged.get("delay", 1.0)),
+                             enabled=bool(merged.get("adaptive", True)))
+    return Client(pm, log=log, max_retries=int(merged.get("max_retries", 5)),
+                  backoff=float(merged.get("backoff", 4)), stats=stats, adaptive=adaptive)
 
 
 # ---------------------------------------------------------------------------
@@ -256,107 +283,175 @@ def _pkey(filters: Dict[str, Any]) -> str:
 # Phase: Programs — adaptive partitioned crawl with resume
 # ---------------------------------------------------------------------------
 def run_programs(job_id: int, cfg: Dict[str, Any], log: Callable[[str], None]) -> None:
-    client = _build_client(cfg, log)
-    _ensure_facets(client, job_id, log)
-    delay = float(cfg.get("delay", 1.0))
+    merged = {**shared_proxy_cfg(), **cfg}
+    shared_stats = Stats()
+    shared_adaptive = AdaptiveDelay(float(merged.get("delay", 1.0)),
+                                    enabled=bool(merged.get("adaptive", True)))
+
+    def make_client() -> "Client":
+        pm = ProxyManager.from_config(merged)
+        return Client(pm, log=log, max_retries=int(merged.get("max_retries", 5)),
+                      backoff=float(merged.get("backoff", 4)),
+                      stats=shared_stats, adaptive=shared_adaptive)
+
+    disc_client = make_client()
+    _ensure_facets(disc_client, job_id, log)
+    concurrency = max(1, int(cfg.get("concurrency", 1)))
     budget_bytes = int(float(cfg.get("budget_mb", 0)) * 1024 * 1024)
+    budget_reqs = int(cfg.get("budget_requests", 0) or 0)
+    incremental = bool(cfg.get("incremental_promote", True)) and bool(cfg.get("staging", True))
     done = sa_db.done_partitions()
     state = {"written": 0, "partitions": 0}
+    lock = threading.Lock()
+    stop_flag = {"stop": False}
 
-    sa_db.update_job(job_id, status="running", message="starting programs crawl")
+    sa_db.update_job(job_id, status="running", message="discovering partitions")
 
     def budget_hit() -> bool:
-        return bool(budget_bytes and client.stats.snapshot()[1] >= budget_bytes)
+        reqs, byts, _ = shared_stats.snapshot()
+        if budget_bytes and byts >= budget_bytes:
+            return True
+        if budget_reqs and reqs >= budget_reqs:
+            return True
+        return False
 
-    def write_page(data, job_id):
+    def write_page(data):
         courses = data.get("courses") or []
         if not courses:
             return 0
         progs = [sa_parse_program(c, job_id) for c in courses]
-        sa_db.upsert_programs(progs)
-        sa_db.upsert_universities([sa_derive_university(c, job_id) for c in courses])
+        univs = [sa_derive_university(c, job_id) for c in courses]
         exams = []
         for c in courses:
             exams += sa_derive_exams(c)
-        sa_db.upsert_program_exams(exams)
-        # countries (dedupe by code)
         seen = {}
         for p in progs:
             cc = p.get("country_code")
             if cc and cc not in seen:
-                seen[cc] = {"country_code": cc, "country_id": None,
-                            "name": cc.upper(), "raw_json": "",
-                            "scraped_at": time.time(), "source_job_id": job_id}
-        sa_db.upsert_countries(list(seen.values()))
+                seen[cc] = {"country_code": cc, "country_id": None, "name": cc.upper(),
+                            "raw_json": "", "scraped_at": time.time(), "source_job_id": job_id}
+        # governance: route to staging (default) or straight to master
+        sa_db.write_rows(job_id, cfg, "sa_programs", progs)
+        sa_db.write_rows(job_id, cfg, "sa_universities", univs)
+        sa_db.write_rows(job_id, cfg, "sa_program_exams", exams)
+        sa_db.write_rows(job_id, cfg, "sa_countries", list(seen.values()))
         return len(progs)
 
-    def page_partition(filters, key, first_data):
+    def maybe_flush():
+        if incremental:
+            try:
+                sa_db.flush_job_staging(job_id)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def page_partition(cl, filters, key):
+        """Page one leaf partition to hasNext=false (or the ~10k cap). Thread-safe:
+        `found` is local; only shared counters/flush are guarded by `lock`."""
         prog = sa_db.get_progress(key) or {}
         start = 1
         if prog.get("status") == "partial" and prog.get("last_page"):
             start = int(prog["last_page"]) + 1
         found = int(prog.get("found") or 0)
-        if start == 1:
-            found += write_page(first_data, job_id)
-            sa_db.set_progress(key, "partial", 1, found)
-        data = first_data
-        page = max(2, start)
+        page = start
         while page <= MAX_PAGES:
-            if sa_db.stop_requested(job_id):
+            if stop_flag["stop"] or sa_db.stop_requested(job_id):
+                stop_flag["stop"] = True
                 raise StopRequested()
             if budget_hit():
-                raise BudgetExceeded("bandwidth budget reached")
-            if start > 1 and page == start:
-                pass  # resuming; fall through to fetch
-            elif not data.get("hasNext", False):
-                break
-            time.sleep(delay)
-            data = fetch_listing(client, filters, page)
-            n = write_page(data, job_id)
+                stop_flag["stop"] = True
+                raise BudgetExceeded("budget reached")
+            data = fetch_listing(cl, filters, page)
+            n = write_page(data)
             found += n
             sa_db.set_progress(key, "partial", page, found)
-            state["written"] += n
+            with lock:
+                state["written"] += n
+                maybe_flush()
+                reqs, byts, _ = shared_stats.snapshot()
             sa_db.update_job(job_id, done_units=state["written"], items_written=state["written"],
+                             req_count=reqs, bytes_count=byts,
                              message=f"{key} p{page}: +{n} (total {state['written']})")
             log(f"  {key} p{page}: +{n} (partition total {found})")
             if not data.get("hasNext", False):
                 break
             page += 1
+            time.sleep(cl.adaptive.value() if cl.adaptive else 1.0)  # adaptive throttle
         sa_db.set_progress(key, "done", page, found)
-        state["partitions"] += 1
+        with lock:
+            state["partitions"] += 1
 
-    def crawl(filters, di):
-        if sa_db.stop_requested(job_id):
-            raise StopRequested()
+    # ---- Discovery: recursively split until each leaf slice is under the cap ----
+    leaves: List = []
+
+    def discover(filters, di):
+        if stop_flag["stop"] or sa_db.stop_requested(job_id):
+            stop_flag["stop"] = True
+            return
         key = _pkey(filters)
         if key in done:
-            log(f"skip (done): {key}")
             return
-        first = fetch_listing(client, filters, 1)
-        cnt = int(first.get("count") or 0)
-        log(f"partition {key} -> count {cnt:,}")
+        cnt = int(fetch_listing(disc_client, filters, 1).get("count") or 0)
         if cnt == 0:
             sa_db.set_progress(key, "done", 1, 0)
             return
         if cnt <= RESULT_CAP or di >= len(SPLIT_ORDER):
             if cnt > RESULT_CAP:
-                log(f"  ! {key} has {cnt:,} > cap {RESULT_CAP:,} and no more split dims — "
-                    f"will capture first ~{RESULT_CAP:,} only.")
-            page_partition(filters, key, first)
+                log(f"  ! {key} {cnt:,} > cap {RESULT_CAP:,}, no more split dims — first ~{RESULT_CAP:,} only")
+            leaves.append((filters, key))
         else:
-            dim = SPLIT_ORDER[di]
-            vals = _split_values(dim)
+            vals = _split_values(SPLIT_ORDER[di])
             if not vals:
-                page_partition(filters, key, first)  # can't split, page what we can
+                leaves.append((filters, key))
                 return
-            log(f"  splitting {key} by {dim} ({len(vals)} values)")
             for v in vals:
-                crawl({**filters, dim: v}, di + 1)
+                discover({**filters, SPLIT_ORDER[di]: v}, di + 1)
+
+    def do_leaf(item):
+        if stop_flag["stop"]:
+            return
+        filters, key = item
+        cl = make_client() if concurrency > 1 else disc_client
+        page_partition(cl, filters, key)
+
+    def crawl_all():
+        discover({}, 0)
+        log(f"{len(leaves)} leaf partitions to crawl · concurrency={concurrency}")
+        sa_db.update_job(job_id, total_units=len(leaves), message=f"{len(leaves)} partitions")
+        if concurrency > 1 and len(leaves) > 1:
+            with ThreadPoolExecutor(max_workers=concurrency) as ex:
+                for fut in [ex.submit(do_leaf, it) for it in leaves]:
+                    fut.result()  # propagate the first exception (Stop/Budget/error)
+        else:
+            for it in leaves:
+                do_leaf(it)
+
+    def finalize(base_msg: str):
+        """QC the staged data and promote (mirrors the domestic _finalize_job)."""
+        if not cfg.get("staging", True):
+            sa_db.update_job(job_id, status="completed", finished_at=time.time(), message=base_msg)
+            return
+        v = sa_db.validate_job(job_id, cfg.get("validation_rules") or {})
+        auto = cfg.get("auto_promote", True)
+        if incremental or (v["passed"] and auto):
+            summ = sa_db.flush_job_staging(job_id)
+            tag = ("promoted (incremental)" if incremental
+                   else f"QC {v['score']:.0f}/100 ✓ promoted ({sum(summ.values())} rows)")
+            msg = f"{base_msg} · {tag}"
+            sa_db.update_job(job_id, status="completed", finished_at=time.time(),
+                             quality_score=v["score"], message=msg)
+            log(msg)
+            send_notification(cfg, "Study Abroad job promoted", msg, log)
+        else:
+            why = "failed QC" if not v["passed"] else "auto-promote off"
+            msg = f"{base_msg} · QC {v['score']:.0f}/100 — staged, awaiting approval ({why})"
+            sa_db.update_job(job_id, status="completed", finished_at=time.time(),
+                             quality_score=v["score"], message=msg)
+            log(msg)
+            send_notification(cfg, "Study Abroad job needs review", msg, log)
 
     try:
-        crawl({}, 0)
-        sa_db.update_job(job_id, status="completed", finished_at=time.time(),
-                         message=f"done: {state['written']} programs, {state['partitions']} partitions")
+        crawl_all()
+        finalize(f"done: {state['written']} programs, {state['partitions']} partitions")
         log(f"Done. {state['written']} programs across {state['partitions']} partitions.")
     except StopRequested:
         sa_db.update_job(job_id, status="stopped", finished_at=time.time(),
