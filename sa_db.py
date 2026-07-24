@@ -1,0 +1,347 @@
+"""
+Study Abroad — data layer. COMPLETELY ISOLATED from the domestic scraper:
+its own SQLite file (CD_SA_DB_PATH), its own `sa_`-prefixed tables, and its own
+jobs/logs/progress bookkeeping. Nothing here reads or writes a domestic table.
+
+Reuses ONLY generic infrastructure from the existing `db` module: the WAL
+connection context manager (`db.connect`). Everything else is vertical-specific.
+
+This module is the reference for how any future vertical's DB layer should look:
+own file, own namespace, own bookkeeping, generic connection reuse.
+"""
+from __future__ import annotations
+
+BUILD = "2026-07-23a"
+
+import json
+import os
+import time
+from typing import Any, Dict, Iterable, List, Optional
+
+import db as _core  # reuse db.connect (generic WAL connection) + the SHARED db file.
+
+# SHARED database, SEPARATE tables. Study Abroad lives in the SAME data.db as the
+# domestic vertical but only ever touches its own `sa_`-prefixed tables — data
+# stays logically isolated by namespace. Override with CD_SA_DB_PATH if you ever
+# want to split it back into its own file (e.g. /data/sa_data.db).
+SA_DB_PATH = os.environ.get("CD_SA_DB_PATH") or _core.DB_PATH
+
+
+def connect(db_path: str = SA_DB_PATH):
+    """Generic WAL connection, reused from the core db module but pointed at the
+    ISOLATED Study Abroad database file."""
+    return _core.connect(db_path)
+
+
+# ---------------------------------------------------------------------------
+# Schema — all sa_-prefixed. Includes its OWN jobs/logs/progress so the vertical
+# is fully self-contained and can never collide with domestic bookkeeping.
+# ---------------------------------------------------------------------------
+SCHEMA = """
+-- Dimension: countries (derived from program rows)
+CREATE TABLE IF NOT EXISTS sa_countries (
+    country_code TEXT PRIMARY KEY,          -- 'uk','usa' (from URL first segment)
+    country_id   INTEGER,                   -- facet id (13=USA,12=UK,...)
+    name         TEXT,
+    raw_json     TEXT, scraped_at REAL, source_job_id INTEGER
+);
+
+-- Dimension: universities (derived from program rows)
+CREATE TABLE IF NOT EXISTS sa_universities (
+    university_id INTEGER PRIMARY KEY,      -- lead_params.college_id
+    name          TEXT,
+    country_code  TEXT,
+    city          TEXT,
+    university_url TEXT,                     -- canonical collegedunia URL (for enrichment)
+    logo_url      TEXT,
+    raw_json      TEXT, scraped_at REAL, source_job_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS sa_idx_univ_country ON sa_universities(country_code);
+
+-- Fact: programs (course @ university). Captures MAXIMUM fields.
+CREATE TABLE IF NOT EXISTS sa_programs (
+    program_id       INTEGER PRIMARY KEY,   -- course_id
+    name             TEXT,                  -- head_one
+    name_secondary   TEXT,                  -- head_two
+    course_tags      TEXT,                  -- e.g. 'MBA'
+    program_type     TEXT,                  -- 'on-campus'/online (attendance/mode)
+    duration_text    TEXT,                  -- 'course_duration' raw
+    duration_months  INTEGER,               -- parsed
+    languages        TEXT,
+    is_stem          INTEGER,
+    is_partner       INTEGER,
+    -- fees: BOTH native currency AND INR-normalized, with currency captured
+    fee_native_raw   TEXT,                  -- 'GBP 88,800'
+    fee_currency     TEXT,                  -- 'GBP'  (captured currency)
+    fee_native_amount INTEGER,              -- 88800
+    fee_inr_raw      TEXT,                  -- 'INR 1.2 Cr/Yr'
+    fee_inr_amount   INTEGER,               -- 12000000
+    fee_period       TEXT,                  -- 'per_year'
+    application_end_date TEXT,
+    -- identity / relationships
+    university_id    INTEGER,
+    university_name  TEXT,
+    university_url   TEXT,
+    country_code     TEXT,
+    -- URLs for later enrichment
+    program_url      TEXT,                  -- <-- program detail URL (enrichment target)
+    logo_url         TEXT,
+    -- ranking (embedded)
+    ranking_rank     INTEGER,
+    ranking_out_of   INTEGER,
+    ranking_scope    TEXT,
+    ranking_agency   TEXT,
+    ranking_year     INTEGER,
+    description      TEXT,
+    raw_json         TEXT, scraped_at REAL, source_job_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS sa_idx_prog_univ    ON sa_programs(university_id);
+CREATE INDEX IF NOT EXISTS sa_idx_prog_country ON sa_programs(country_code);
+CREATE INDEX IF NOT EXISTS sa_idx_prog_tags    ON sa_programs(course_tags);
+
+-- Child: exam requirements (IELTS/TOEFL/GRE...)
+CREATE TABLE IF NOT EXISTS sa_program_exams (
+    program_id  INTEGER,
+    exam_name   TEXT,
+    short_form  TEXT,
+    exam_score  TEXT,
+    out_of      TEXT,
+    median      TEXT,
+    url         TEXT,
+    PRIMARY KEY (program_id, short_form)
+);
+
+-- Per-partition progress for resumable, partitioned crawling.
+CREATE TABLE IF NOT EXISTS sa_program_progress (
+    partition_key TEXT PRIMARY KEY,         -- e.g. 'country=13|course_type=Bachelor'
+    status        TEXT,                     -- 'partial'|'done'
+    last_page     INTEGER DEFAULT 0,
+    found         INTEGER DEFAULT 0,
+    updated_at    REAL
+);
+
+-- Own jobs / logs (isolated bookkeeping)
+CREATE TABLE IF NOT EXISTS sa_jobs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    vertical      TEXT,
+    phase         TEXT,
+    status        TEXT,
+    config_json   TEXT,
+    total_units   INTEGER DEFAULT 0,
+    done_units    INTEGER DEFAULT 0,
+    items_written INTEGER DEFAULT 0,
+    req_count     INTEGER DEFAULT 0,
+    bytes_count   INTEGER DEFAULT 0,
+    message       TEXT,
+    stop_requested INTEGER DEFAULT 0,
+    pid           INTEGER,
+    started_at    REAL, updated_at REAL, finished_at REAL
+);
+CREATE TABLE IF NOT EXISTS sa_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, ts REAL, message TEXT
+);
+CREATE INDEX IF NOT EXISTS sa_idx_logs_job ON sa_logs(job_id, id);
+
+CREATE TABLE IF NOT EXISTS sa_settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS sa_facets (
+    filter_name TEXT, value_id TEXT, label TEXT, count INTEGER,
+    updated_at REAL, PRIMARY KEY (filter_name, value_id)
+);
+"""
+
+
+def init_db(db_path: str = SA_DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.executescript(SCHEMA)
+
+
+# ---------------------------------------------------------------------------
+# Upserts (idempotent — unique keys make duplicates impossible)
+# ---------------------------------------------------------------------------
+def _upsert(conn, table: str, cols: List[str], key_cols: List[str],
+            rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    ph = ",".join("?" for _ in cols)
+    setc = ",".join(f"{c}=excluded.{c}" for c in cols if c not in key_cols)
+    sql = (f"INSERT INTO {table} ({','.join(cols)}) VALUES ({ph}) "
+           f"ON CONFLICT({','.join(key_cols)}) DO UPDATE SET {setc}")
+    conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
+    return len(rows)
+
+
+_PROG_COLS = ["program_id", "name", "name_secondary", "course_tags", "program_type",
+              "duration_text", "duration_months", "languages", "is_stem", "is_partner",
+              "fee_native_raw", "fee_currency", "fee_native_amount", "fee_inr_raw",
+              "fee_inr_amount", "fee_period", "application_end_date", "university_id",
+              "university_name", "university_url", "country_code", "program_url",
+              "logo_url", "ranking_rank", "ranking_out_of", "ranking_scope",
+              "ranking_agency", "ranking_year", "description", "raw_json",
+              "scraped_at", "source_job_id"]
+_UNIV_COLS = ["university_id", "name", "country_code", "city", "university_url",
+              "logo_url", "raw_json", "scraped_at", "source_job_id"]
+_CTRY_COLS = ["country_code", "country_id", "name", "raw_json", "scraped_at", "source_job_id"]
+_EXAM_COLS = ["program_id", "exam_name", "short_form", "exam_score", "out_of", "median", "url"]
+
+
+def upsert_programs(rows, db_path: str = SA_DB_PATH) -> int:
+    rows = [r for r in rows if r.get("program_id")]
+    with connect(db_path) as conn:
+        return _upsert(conn, "sa_programs", _PROG_COLS, ["program_id"], rows)
+
+
+def upsert_universities(rows, db_path: str = SA_DB_PATH) -> int:
+    rows = [r for r in rows if r.get("university_id")]
+    with connect(db_path) as conn:
+        return _upsert(conn, "sa_universities", _UNIV_COLS, ["university_id"], rows)
+
+
+def upsert_countries(rows, db_path: str = SA_DB_PATH) -> int:
+    rows = [r for r in rows if r.get("country_code")]
+    with connect(db_path) as conn:
+        return _upsert(conn, "sa_countries", _CTRY_COLS, ["country_code"], rows)
+
+
+def upsert_program_exams(rows, db_path: str = SA_DB_PATH) -> int:
+    rows = [r for r in rows if r.get("program_id") and r.get("short_form")]
+    with connect(db_path) as conn:
+        return _upsert(conn, "sa_program_exams", _EXAM_COLS, ["program_id", "short_form"], rows)
+
+
+def save_facets(rows, db_path: str = SA_DB_PATH) -> int:
+    with connect(db_path) as conn:
+        return _upsert(conn, "sa_facets",
+                       ["filter_name", "value_id", "label", "count", "updated_at"],
+                       ["filter_name", "value_id"], rows)
+
+
+# ---------------------------------------------------------------------------
+# Progress (resume)
+# ---------------------------------------------------------------------------
+def set_progress(partition_key: str, status: str, last_page: int, found: int,
+                 db_path: str = SA_DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO sa_program_progress(partition_key,status,last_page,found,updated_at) "
+            "VALUES(?,?,?,?,?) ON CONFLICT(partition_key) DO UPDATE SET "
+            "status=excluded.status,last_page=excluded.last_page,found=excluded.found,"
+            "updated_at=excluded.updated_at",
+            (partition_key, status, last_page, found, time.time()))
+
+
+def get_progress(partition_key: str, db_path: str = SA_DB_PATH) -> Optional[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        r = conn.execute("SELECT * FROM sa_program_progress WHERE partition_key=?",
+                         (partition_key,)).fetchone()
+    return dict(r) if r else None
+
+
+def done_partitions(db_path: str = SA_DB_PATH) -> set:
+    with connect(db_path) as conn:
+        return {r[0] for r in conn.execute(
+            "SELECT partition_key FROM sa_program_progress WHERE status='done'")}
+
+
+# ---------------------------------------------------------------------------
+# Jobs / logs (isolated)
+# ---------------------------------------------------------------------------
+def create_job(phase: str, config: Dict[str, Any], db_path: str = SA_DB_PATH) -> int:
+    now = time.time()
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO sa_jobs(vertical,phase,status,config_json,started_at,updated_at) "
+            "VALUES('studyabroad',?,?,?,?,?)",
+            (phase, "queued", json.dumps(config), now, now))
+        return cur.lastrowid
+
+
+def update_job(job_id: int, db_path: str = SA_DB_PATH, **fields) -> None:
+    if not fields:
+        return
+    fields["updated_at"] = time.time()
+    sets = ",".join(f"{k}=?" for k in fields)
+    with connect(db_path) as conn:
+        conn.execute(f"UPDATE sa_jobs SET {sets} WHERE id=?",
+                     (*fields.values(), job_id))
+
+
+def get_job(job_id: int, db_path: str = SA_DB_PATH) -> Optional[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        r = conn.execute("SELECT * FROM sa_jobs WHERE id=?", (job_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def list_jobs(limit: int = 30, db_path: str = SA_DB_PATH) -> List[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM sa_jobs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
+
+
+def request_stop(job_id: int, db_path: str = SA_DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute("UPDATE sa_jobs SET stop_requested=1 WHERE id=?", (job_id,))
+
+
+def stop_requested(job_id: int, db_path: str = SA_DB_PATH) -> bool:
+    with connect(db_path) as conn:
+        r = conn.execute("SELECT stop_requested FROM sa_jobs WHERE id=?", (job_id,)).fetchone()
+    return bool(r and r[0])
+
+
+def add_log(job_id: int, message: str, db_path: str = SA_DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute("INSERT INTO sa_logs(job_id,ts,message) VALUES(?,?,?)",
+                     (job_id, time.time(), message))
+
+
+def get_logs(job_id: int, limit: int = 200, db_path: str = SA_DB_PATH) -> List[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM sa_logs WHERE job_id=? ORDER BY id DESC LIMIT ?",
+            (job_id, limit)).fetchall()]
+
+
+def get_setting(key: str, default=None, db_path: str = SA_DB_PATH):
+    with connect(db_path) as conn:
+        r = conn.execute("SELECT value FROM sa_settings WHERE key=?", (key,)).fetchone()
+    if not r:
+        return default
+    try:
+        return json.loads(r[0])
+    except Exception:  # noqa: BLE001
+        return r[0]
+
+
+def set_setting(key: str, value, db_path: str = SA_DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute("INSERT INTO sa_settings(key,value) VALUES(?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (key, json.dumps(value)))
+
+
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+def counts(db_path: str = SA_DB_PATH) -> Dict[str, int]:
+    with connect(db_path) as conn:
+        def one(q):
+            try:
+                return conn.execute(q).fetchone()[0]
+            except Exception:  # noqa: BLE001
+                return 0
+        return {
+            "programs": one("SELECT COUNT(*) FROM sa_programs"),
+            "universities": one("SELECT COUNT(*) FROM sa_universities"),
+            "countries": one("SELECT COUNT(*) FROM sa_countries"),
+            "program_exams": one("SELECT COUNT(*) FROM sa_program_exams"),
+            "programs_with_url": one("SELECT COUNT(*) FROM sa_programs WHERE program_url<>''"),
+            "programs_with_fee": one("SELECT COUNT(*) FROM sa_programs WHERE fee_native_amount IS NOT NULL"),
+            "distinct_currencies": one("SELECT COUNT(DISTINCT fee_currency) FROM sa_programs WHERE fee_currency<>''"),
+            "partitions_done": one("SELECT COUNT(*) FROM sa_program_progress WHERE status='done'"),
+        }
+
+
+if __name__ == "__main__":
+    init_db()
+    print(f"SA DB initialised at {SA_DB_PATH}")
+    print(counts())

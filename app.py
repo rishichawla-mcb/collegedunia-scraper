@@ -591,6 +591,24 @@ def render_system_bar() -> None:
 # ---------------------------------------------------------------------------
 # Sidebar: settings + proxies
 # ---------------------------------------------------------------------------
+# ============================ Vertical switch ============================
+# Additive & non-destructive: when Study Abroad is selected we render its module
+# and stop, so NONE of the domestic UI below runs. Otherwise the domestic app
+# renders exactly as before. Both verticals share this DB but Study Abroad only
+# ever touches its own `sa_`-prefixed tables (namespace isolation). Auth above
+# (require_login) already gates both verticals.
+_vertical = st.sidebar.radio(
+    "🧭 Vertical", ["🇮🇳 Domestic", "🌍 Study Abroad"], index=0,
+    help="Switch scraping verticals. Data is isolated in separate tables; "
+         "Study Abroad scrapes run as their own worker processes.")
+if _vertical == "🌍 Study Abroad":
+    try:
+        import sa_ui
+        sa_ui.render()
+    except Exception as _sa_err:  # error boundary: SA issues never crash the page
+        st.error(f"Study Abroad module error: {_sa_err}")
+    st.stop()
+
 st.sidebar.title("⚙️ Settings")
 
 st.sidebar.subheader("Rate limiting")
