@@ -176,6 +176,16 @@ CREATE INDEX IF NOT EXISTS sa_idx_staging_job ON sa_staging(job_id, table_name);
 def init_db(db_path: str = SA_DB_PATH) -> None:
     with connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        # Migrations: add columns to tables that pre-date them (CREATE TABLE IF NOT
+        # EXISTS does NOT alter an existing table). Guarded + additive.
+        jcols = {r[1] for r in conn.execute("PRAGMA table_info(sa_jobs)")}
+        for col, typ in (("quality_score", "REAL"), ("promote_status", "TEXT"),
+                         ("staged_rows", "INTEGER"), ("req_count", "INTEGER"),
+                         ("bytes_count", "INTEGER"), ("total_units", "INTEGER"),
+                         ("done_units", "INTEGER"), ("items_written", "INTEGER"),
+                         ("pid", "INTEGER"), ("finished_at", "REAL")):
+            if col not in jcols:
+                conn.execute(f"ALTER TABLE sa_jobs ADD COLUMN {col} {typ}")
 
 
 # ---------------------------------------------------------------------------

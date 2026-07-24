@@ -425,8 +425,9 @@ def render() -> None:
         st.info("**Use case:** every Study Abroad job with status, throughput, QC score and message.")
         jobs = sa_db.list_jobs(50)
         if jobs:
-            jdf = pd.DataFrame(jobs)[["id", "phase", "status", "items_written",
-                                      "quality_score", "message"]]
-            st.dataframe(jdf, use_container_width=True, height=420)
+            jdf = pd.DataFrame(jobs)
+            want = [c for c in ("id", "phase", "status", "items_written",
+                                "quality_score", "message") if c in jdf.columns]
+            st.dataframe(jdf[want], use_container_width=True, height=420)
         else:
             st.info("No jobs yet.")
