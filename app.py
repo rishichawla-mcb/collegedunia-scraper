@@ -603,6 +603,10 @@ _vertical = st.sidebar.radio(
          "Study Abroad scrapes run as their own worker processes.")
 if _vertical == "🌍 Study Abroad":
     try:
+        render_system_bar()   # shared host metrics (CPU/mem/disk) for SA too
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         import sa_ui
         sa_ui.render()
     except Exception as _sa_err:  # error boundary: SA issues never crash the page

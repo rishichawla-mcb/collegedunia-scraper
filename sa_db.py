@@ -135,6 +135,9 @@ CREATE TABLE IF NOT EXISTS sa_jobs (
     message       TEXT,
     stop_requested INTEGER DEFAULT 0,
     pid           INTEGER,
+    quality_score REAL,
+    promote_status TEXT,
+    staged_rows   INTEGER,
     started_at    REAL, updated_at REAL, finished_at REAL
 );
 CREATE TABLE IF NOT EXISTS sa_logs (
@@ -147,6 +150,26 @@ CREATE TABLE IF NOT EXISTS sa_facets (
     filter_name TEXT, value_id TEXT, label TEXT, count INTEGER,
     updated_at REAL, PRIMARY KEY (filter_name, value_id)
 );
+
+-- Change-log snapshots of dataset size over time.
+CREATE TABLE IF NOT EXISTS sa_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL,
+    programs INTEGER, universities INTEGER, countries INTEGER,
+    program_exams INTEGER, note TEXT
+);
+
+-- Governance: per-job staging buffer (stage -> validate -> promote), mirroring
+-- the domestic engine but with its OWN table and only sa_ targets.
+CREATE TABLE IF NOT EXISTS sa_staging (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id     INTEGER,
+    table_name TEXT,
+    pk         TEXT,
+    payload    TEXT,
+    staged_at  REAL,
+    UNIQUE(job_id, table_name, pk)
+);
+CREATE INDEX IF NOT EXISTS sa_idx_staging_job ON sa_staging(job_id, table_name);
 """
 
 
@@ -213,6 +236,183 @@ def save_facets(rows, db_path: str = SA_DB_PATH) -> int:
         return _upsert(conn, "sa_facets",
                        ["filter_name", "value_id", "label", "count", "updated_at"],
                        ["filter_name", "value_id"], rows)
+
+
+# ---------------------------------------------------------------------------
+# Governance: staging -> validate -> promote (own tables; sa_ targets only)
+# ---------------------------------------------------------------------------
+STAGE_PK = {
+    "sa_programs": lambda r: str(r.get("program_id")),
+    "sa_universities": lambda r: str(r.get("university_id")),
+    "sa_countries": lambda r: str(r.get("country_code")),
+    "sa_program_exams": lambda r: f"{r.get('program_id')}|{r.get('short_form')}",
+}
+_UPSERTERS = {
+    "sa_programs": upsert_programs,
+    "sa_universities": upsert_universities,
+    "sa_countries": upsert_countries,
+    "sa_program_exams": upsert_program_exams,
+}
+PROMOTE_CHUNK = int(os.environ.get("CD_SA_PROMOTE_CHUNK", "2500"))
+
+
+def stage_records(job_id: int, table: str, rows, db_path: str = SA_DB_PATH) -> int:
+    rows = list(rows)
+    if not rows:
+        return 0
+    pkf = STAGE_PK[table]
+    now = time.time()
+    with connect(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO sa_staging(job_id,table_name,pk,payload,staged_at) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(job_id,table_name,pk) DO UPDATE SET payload=excluded.payload",
+            [(job_id, table, pkf(r), json.dumps(r), now) for r in rows])
+    return len(rows)
+
+
+def write_rows(job_id: int, cfg: Dict[str, Any], table: str, rows) -> int:
+    """Route a runner's output: to staging (governance, default) or straight to
+    master when cfg['staging'] is False. Mirrors the domestic _write_rows."""
+    rows = list(rows)
+    if not rows:
+        return 0
+    if cfg.get("staging", True):
+        return stage_records(job_id, table, rows)
+    return _UPSERTERS[table](rows)
+
+
+def staged_summary(job_id: int, db_path: str = SA_DB_PATH) -> Dict[str, int]:
+    with connect(db_path) as conn:
+        return {r[0]: r[1] for r in conn.execute(
+            "SELECT table_name, COUNT(*) FROM sa_staging WHERE job_id=? GROUP BY table_name",
+            (job_id,)).fetchall()}
+
+
+def flush_job_staging(job_id: int, chunk: int = PROMOTE_CHUNK,
+                      db_path: str = SA_DB_PATH) -> Dict[str, int]:
+    """Promote staged rows to master in MEMORY-SAFE chunks, deleting each chunk as
+    it goes (incremental promotion). Returns {table: promoted}."""
+    summary: Dict[str, int] = {}
+    while True:
+        with connect(db_path) as conn:
+            batch = conn.execute(
+                "SELECT id, table_name, payload FROM sa_staging WHERE job_id=? "
+                "ORDER BY id LIMIT ?", (job_id, int(chunk))).fetchall()
+        if not batch:
+            break
+        by: Dict[str, list] = {}
+        ids = []
+        for r in batch:
+            ids.append(r["id"])
+            try:
+                by.setdefault(r["table_name"], []).append(json.loads(r["payload"]))
+            except (json.JSONDecodeError, TypeError):
+                continue
+        for tbl, rows in by.items():
+            _UPSERTERS[tbl](rows, db_path=db_path)
+            summary[tbl] = summary.get(tbl, 0) + len(rows)
+        with connect(db_path) as conn:
+            conn.execute(f"DELETE FROM sa_staging WHERE id IN ({','.join('?' * len(ids))})", ids)
+    return summary
+
+
+def validate_job(job_id: int, rules: Optional[Dict[str, Any]] = None,
+                 db_path: str = SA_DB_PATH) -> Dict[str, Any]:
+    """QC the staged programs: enough rows? too many missing fees? Returns a
+    score/pass flag mirroring the domestic validator."""
+    rules = rules or {}
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT payload FROM sa_staging WHERE job_id=? AND table_name='sa_programs'",
+            (job_id,)).fetchall()
+    progs = len(rows)
+    missing = 0
+    for r in rows:
+        try:
+            if not json.loads(r[0]).get("fee_native_amount"):
+                missing += 1
+        except Exception:  # noqa: BLE001
+            pass
+    miss_pct = (100.0 * missing / progs) if progs else 0.0
+    score = 100.0
+    if progs < int(rules.get("min_rows", 1)):
+        score -= 50
+    if miss_pct > float(rules.get("max_missing_fee_pct", 100)):
+        score -= 30
+    passed = score >= float(rules.get("pass_score", 70))
+    return {"score": score, "passed": passed, "programs": progs,
+            "missing_fee_pct": round(miss_pct, 1)}
+
+
+def promote_job(job_id: int, db_path: str = SA_DB_PATH) -> Dict[str, int]:
+    return flush_job_staging(job_id, db_path=db_path)
+
+
+def discard_staging(job_id: int, db_path: str = SA_DB_PATH) -> int:
+    with connect(db_path) as conn:
+        return conn.execute("DELETE FROM sa_staging WHERE job_id=?", (job_id,)).rowcount
+
+
+def staging_count(db_path: str = SA_DB_PATH) -> int:
+    with connect(db_path) as conn:
+        return conn.execute("SELECT COUNT(*) FROM sa_staging").fetchone()[0]
+
+
+def discard_all_staging(db_path: str = SA_DB_PATH) -> int:
+    with connect(db_path) as conn:
+        return conn.execute("DELETE FROM sa_staging").rowcount
+
+
+# ---------------------------------------------------------------------------
+# Ops: reset / logs / snapshots (SA-scoped, never touch domestic tables)
+# ---------------------------------------------------------------------------
+def clear_logs(job_id: Optional[int] = None, db_path: str = SA_DB_PATH) -> int:
+    with connect(db_path) as conn:
+        if job_id:
+            return conn.execute("DELETE FROM sa_logs WHERE job_id=?", (job_id,)).rowcount
+        return conn.execute("DELETE FROM sa_logs").rowcount
+
+
+def prune_logs(keep: int = 8000, db_path: str = SA_DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute("DELETE FROM sa_logs WHERE id NOT IN "
+                     "(SELECT id FROM sa_logs ORDER BY id DESC LIMIT ?)", (keep,))
+
+
+def wipe_sa(full: bool = False, db_path: str = SA_DB_PATH) -> Dict[str, int]:
+    """Delete ONLY sa_ data. Default wipes the dataset (programs/universities/
+    countries/exams/progress/staging); full=True also clears jobs/logs/facets/
+    snapshots. Never touches domestic tables."""
+    tables = ["sa_programs", "sa_universities", "sa_countries", "sa_program_exams",
+              "sa_program_progress", "sa_staging"]
+    if full:
+        tables += ["sa_jobs", "sa_logs", "sa_facets", "sa_snapshots"]
+    out: Dict[str, int] = {}
+    with connect(db_path) as conn:
+        for t in tables:
+            try:
+                out[t] = conn.execute(f"DELETE FROM {t}").rowcount
+            except Exception:  # noqa: BLE001
+                pass
+    if full:
+        set_setting("facets_captured", False, db_path)
+    return out
+
+
+def add_snapshot(note: str = "", db_path: str = SA_DB_PATH) -> None:
+    c = counts(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO sa_snapshots(ts,programs,universities,countries,program_exams,note) "
+            "VALUES(?,?,?,?,?,?)",
+            (time.time(), c["programs"], c["universities"], c["countries"],
+             c["program_exams"], note))
+
+
+def get_snapshots(limit: int = 100, db_path: str = SA_DB_PATH) -> List[Dict[str, Any]]:
+    with connect(db_path) as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM sa_snapshots ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
 
 
 # ---------------------------------------------------------------------------
