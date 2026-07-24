@@ -240,6 +240,7 @@ def _build_client(cfg: Dict[str, Any], log) -> "Client":
 # Facets (partition dimensions) — from the SSR __NEXT_DATA__
 # ---------------------------------------------------------------------------
 def run_facets(job_id: int, cfg: Dict[str, Any], log: Callable[[str], None]) -> None:
+    sa_db.update_job(job_id, status="running", message="fetching facets")
     client = _build_client(cfg, log)
     _ensure_facets(client, job_id, log, force=True)
     sa_db.update_job(job_id, status="completed", finished_at=time.time(),
