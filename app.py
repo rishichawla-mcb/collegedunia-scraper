@@ -2029,25 +2029,42 @@ with tab_data:
     st.caption("Exports are built only when you click Prepare (keeps memory low).")
     fmt = st.radio("Format", ["CSV", "JSON", "Excel (this table)", "Excel (all tables)"],
                    horizontal=True, key="expfmt")
+    # NOTE: defaults to True so exports are byte-identical to previous builds.
+    # Untick for much smaller files; flip `value=` to False to make lean the default.
+    inc_raw = st.checkbox(
+        "Include the `raw_json` source column", value=True, key="expraw",
+        help="raw_json is the complete original API object, stored for provenance. It is "
+             "typically 85-90% of an export's size (offerings CSV: ~132 MB with it, "
+             "~17 MB without). Spreadsheets cannot use it — Excel truncates any cell "
+             "over 32,767 characters — so untick it unless you specifically need the "
+             "raw payloads. The column always stays in the database either way.")
+    XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     if st.button("🛠️ Prepare download"):
+        st.session_state.pop("expdata", None)   # release the previous export first
         with st.spinner("Building export…"):
             if fmt == "CSV":
-                st.session_state["expdata"] = (export.to_csv(table),
-                                               f"collegedunia_{table}.csv", "text/csv")
+                st.session_state["expdata"] = (
+                    export.to_csv(table, include_raw=inc_raw),
+                    f"collegedunia_{table}.csv", "text/csv")
             elif fmt == "JSON":
-                st.session_state["expdata"] = (export.to_json(table),
-                                               f"collegedunia_{table}.json", "application/json")
+                st.session_state["expdata"] = (
+                    export.to_json(table, include_raw=inc_raw),
+                    f"collegedunia_{table}.json", "application/json")
             elif fmt == "Excel (this table)":
                 st.session_state["expdata"] = (
-                    export.to_xlsx((table,)), f"collegedunia_{table}.xlsx",
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    export.to_xlsx((table,), include_raw=inc_raw),
+                    f"collegedunia_{table}.xlsx", XLSX_MIME)
             else:
                 st.session_state["expdata"] = (
-                    export.to_xlsx(), "collegedunia_all.xlsx",
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    export.to_xlsx(include_raw=inc_raw),
+                    "collegedunia_all.xlsx", XLSX_MIME)
     if st.session_state.get("expdata"):
         data, fname, mime = st.session_state["expdata"]
+        st.caption(f"Ready: **{fname}** · {len(data)/1048576:.1f} MB")
         st.download_button(f"⬇️ Download {fname}", data=data, file_name=fname, mime=mime)
+        if st.button("🧹 Clear prepared export from memory", key="expclear"):
+            st.session_state.pop("expdata", None)
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------
