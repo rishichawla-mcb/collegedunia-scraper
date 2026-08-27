@@ -1248,16 +1248,38 @@ with tab_run:
         est_mb = target * 300 / 1024
         st.info(f"📊 ~{target:,} colleges → ~**{est_mb:.0f} MB** "
                 f"({est_mb/1024:.2f} GB) at ~300 KB each. Mind your proxy quota.")
+        with db.connect() as conn:
+            _dir_gap = conn.execute(
+                "SELECT COUNT(*) FROM colleges_directory d LEFT JOIN colleges k "
+                "ON k.college_id=d.college_id WHERE k.college_id IS NULL "
+                "AND COALESCE(d.link,'')<>''").fetchone()[0]
+        e_basic = st.checkbox(
+            "Also capture `basic_info` (recommended — free)", value=True, key="ebasic",
+            help="The college page's __NEXT_DATA__ carries ~30 more fields than the "
+                 "JSON-LD this phase reads today: year founded, college/university "
+                 "type, affiliating university, NAAC grade, approvals, every listed "
+                 "landline and mobile, pincode, area, map location and nearest "
+                 "station. Same page, no extra requests.")
+        e_dir = st.checkbox(
+            f"Include the {_dir_gap:,} directory-only colleges", value=False, key="edir",
+            help="The Directory phase writes to colleges_directory, but this phase's "
+                 "queue reads `colleges` — so these colleges can never be enriched. "
+                 "Ticking this copies their id/name/link into `colleges` first "
+                 "(insert-only; existing rows are never modified). It will increase "
+                 "your colleges count.")
         ec1, ec2 = st.columns(2)
         e_conc = ec1.number_input("Parallel workers", 1, 20, 3, key="econc")
         e_bud = ec2.number_input("Max bandwidth MB (0=∞)", 0, 100000, 0, step=100, key="ebud")
         e_force = st.checkbox("Re-enrich already-done", key="eforce")
-        if st.button("🏫 Start college enrichment", key="rune", disabled=n_total == 0):
+        if st.button("🏫 Start college enrichment", key="rune",
+                     disabled=(n_total == 0 and _dir_gap == 0)):
             cfg = proxy_config_from_ui()
             cfg.update(ecfg)
             cfg["concurrency"] = int(e_conc)
             cfg["budget_mb"] = float(e_bud)
             cfg["force_rescrape"] = e_force
+            cfg["basic_info"] = bool(e_basic)
+            cfg["include_directory"] = bool(e_dir)
             jid = db.create_job("enrichment", cfg)
             launch_worker(jid)
             st.session_state["watch_p3"] = jid

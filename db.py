@@ -336,6 +336,27 @@ DIRECTORY_EXTRA_COLS = [
 ]
 DIRECTORY_EXTRA_NAMES = [c for c, _ in DIRECTORY_EXTRA_COLS]
 
+# Phase-3 `basic_info` fields. They come off the SAME college page the JSON-LD
+# is read from, so they cost no extra request — roughly double the fields.
+# Purely additive; no existing column is touched.
+COLLEGE_BASIC_COLS = [
+    ("year_founded", "INTEGER"), ("university_type", "TEXT"),
+    ("type_of_college", "TEXT"), ("college_tier", "TEXT"),
+    ("is_distance", "INTEGER"), ("area_name", "TEXT"), ("city_id", "INTEGER"),
+    ("state_name", "TEXT"), ("basic_website", "TEXT"),
+    ("landline", "TEXT"), ("mobile", "TEXT"), ("phone_all", "TEXT"),
+    ("approved_by", "TEXT"), ("naac_grade", "TEXT"),
+    ("affiliated_to", "TEXT"), ("affiliated_to_url", "TEXT"),
+    ("major_stream_name", "TEXT"), ("major_stream_rating", "REAL"),
+    ("overall_admin_rating", "REAL"), ("cover_image", "TEXT"),
+    ("basic_address", "TEXT"), ("pincode", "TEXT"), ("map_location", "TEXT"),
+    ("nearest_train_station", "TEXT"), ("nearest_train_distance_m", "INTEGER"),
+    ("nearest_bus_station", "TEXT"), ("nearest_bus_distance_m", "INTEGER"),
+    ("nearest_airport", "TEXT"), ("basic_info_json", "TEXT"),
+    ("basic_scraped_at", "REAL"),
+]
+COLLEGE_BASIC_NAMES = [c for c, _ in COLLEGE_BASIC_COLS]
+
 
 def init_db(db_path: str = DB_PATH) -> None:
     with connect(db_path) as conn:
@@ -401,6 +422,11 @@ def init_db(db_path: str = DB_PATH) -> None:
         for col, typ in DIRECTORY_EXTRA_COLS:
             if col not in dcols:
                 conn.execute(f"ALTER TABLE colleges_directory ADD COLUMN {col} {typ}")
+        # Migration: Phase-3 basic_info columns on colleges.
+        bcols = {r[1] for r in conn.execute("PRAGMA table_info(colleges)")}
+        for col, typ in COLLEGE_BASIC_COLS:
+            if col not in bcols:
+                conn.execute(f"ALTER TABLE colleges ADD COLUMN {col} {typ}")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS college_rankings ("
             "college_id INTEGER, agency TEXT, agency_id INTEGER, year INTEGER, "
@@ -585,6 +611,49 @@ def update_college_details(college_id: int, fields: Dict[str, Any], db_path: str
     vals += [time.time(), college_id]
     with connect(db_path) as conn:
         conn.execute(f"UPDATE colleges SET {sets} WHERE college_id=?", vals)
+
+
+def update_college_basic(college_id: int, fields: Dict[str, Any],
+                         db_path: str = DB_PATH) -> None:
+    """Write Phase-3 `basic_info` onto a college row.
+
+    NON-DESTRUCTIVE, exactly like update_college_details: a blank incoming value
+    never replaces a stored one. basic_scraped_at is always refreshed."""
+    if not fields:
+        return
+    cols = [c for c in COLLEGE_BASIC_NAMES if c != "basic_scraped_at"]
+    sets = ", ".join(
+        f"{c}=CASE WHEN ? IS NULL OR ?='' THEN {c} ELSE ? END" for c in cols
+    ) + ", basic_scraped_at=?"
+    vals: List[Any] = []
+    for c in cols:
+        v = fields.get(c)
+        vals += [v, v, v]
+    vals += [time.time(), college_id]
+    with connect(db_path) as conn:
+        conn.execute(f"UPDATE colleges SET {sets} WHERE college_id=?", vals)
+
+
+def seed_colleges_from_directory(db_path: str = DB_PATH) -> int:
+    """Give every directory-only college a row in `colleges` so Phase 3 can reach it.
+
+    The Directory phase writes only to colleges_directory, while Phase 3's queue
+    reads `colleges` — so ~5,300 colleges were structurally un-enrichable. This
+    copies across identity + link ONLY, using INSERT ... ON CONFLICT DO NOTHING:
+    existing college rows are never modified and nothing is ever deleted.
+    Returns the number of new rows."""
+    with connect(db_path) as conn:
+        before = conn.execute("SELECT COUNT(*) FROM colleges").fetchone()[0]
+        conn.execute(
+            "INSERT INTO colleges (college_id, name, short_form, city, state_id, "
+            "link, scraped_at) "
+            "SELECT d.college_id, d.name, d.short_form, d.city, d.state_id, "
+            "       d.link, ? "
+            "FROM colleges_directory d "
+            "WHERE d.college_id IS NOT NULL AND COALESCE(d.link,'')<>'' "
+            "ON CONFLICT(college_id) DO NOTHING", (time.time(),))
+        after = conn.execute("SELECT COUNT(*) FROM colleges").fetchone()[0]
+    return after - before
 
 
 def normalize_fees(db_path: str = DB_PATH) -> int:

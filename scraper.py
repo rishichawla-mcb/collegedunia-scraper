@@ -570,6 +570,93 @@ _LD_RE = re.compile(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script
                     re.DOTALL | re.IGNORECASE)
 
 
+def _phone_list(v: Any) -> List[str]:
+    """phone_no/landline/mobile arrive as a mix of plain strings and
+    {text, value} dicts. Flatten to a de-duplicated list of numbers."""
+    out: List[str] = []
+    for item in (v if isinstance(v, list) else [v]):
+        if isinstance(item, dict):
+            val = str(item.get("value") or "").strip()
+        elif item is None:
+            val = ""
+        else:
+            val = str(item).strip()
+        if val and val not in out:
+            out.append(val)
+    return out
+
+
+def _names(v: Any) -> str:
+    """['BCI'] or [{'name': 'UGC'}] -> 'BCI' / 'UGC'."""
+    if isinstance(v, str):
+        return v.strip()
+    if not isinstance(v, list):
+        return ""
+    parts = []
+    for x in v:
+        s = (x.get("name") if isinstance(x, dict) else x)
+        s = str(s or "").strip()
+        if s and s not in parts:
+            parts.append(s)
+    return ", ".join(parts)
+
+
+def parse_college_basic_info(html: str) -> Dict[str, Any]:
+    """Extract `basic_info` from a college page's __NEXT_DATA__.
+
+    This is on the SAME page Phase 3 already downloads for its JSON-LD, and
+    carries roughly double the fields: founding year, college/university type,
+    affiliating university, NAAC grade, approvals, every listed landline and
+    mobile, pincode, area, map location and nearest transport. No extra request.
+    """
+    pp = _nextdata_pageprops(html)
+    bi = ((pp or {}).get("data") or {}).get("basic_info")
+    if not isinstance(bi, dict) or not bi:
+        return {}
+
+    addr = bi.get("address") if isinstance(bi.get("address"), dict) else {}
+    naac = bi.get("naac_approval") if isinstance(bi.get("naac_approval"), dict) else {}
+    affil = bi.get("affiliated_to") if isinstance(bi.get("affiliated_to"), dict) else {}
+    train = addr.get("nearest_train_station") if isinstance(addr.get("nearest_train_station"), dict) else {}
+    bus = addr.get("nearest_bus_station") if isinstance(addr.get("nearest_bus_station"), dict) else {}
+
+    landline = _phone_list(bi.get("landline"))
+    mobile = _phone_list(bi.get("mobile"))
+    allph = _phone_list(bi.get("phone_no")) or (landline + mobile)
+
+    return {
+        "year_founded": _to_int(bi.get("year_founded")),
+        "university_type": str(bi.get("university_type") or ""),
+        "type_of_college": str(bi.get("type_of_college") or ""),
+        "college_tier": str(bi.get("college_tier") or ""),
+        "is_distance": 1 if bi.get("is_distance") else 0,
+        "area_name": str(bi.get("area_name") or ""),
+        "city_id": _to_int(bi.get("city_id")),
+        "state_name": str(bi.get("state") or ""),
+        "basic_website": str(bi.get("website") or ""),
+        "landline": ", ".join(landline),
+        "mobile": ", ".join(mobile),
+        "phone_all": ", ".join(allph),
+        "approved_by": _names(bi.get("approved_by")),
+        "naac_grade": str(naac.get("grade") or ""),
+        "affiliated_to": str(affil.get("name") or ""),
+        "affiliated_to_url": abs_url(affil.get("url")) if affil.get("url") else "",
+        "major_stream_name": str(bi.get("major_stream_name") or ""),
+        "major_stream_rating": _to_float(bi.get("major_stream_rating")),
+        "overall_admin_rating": _to_float(bi.get("overall_admin_rating")),
+        "cover_image": _img(bi.get("cover_image")) if bi.get("cover_image") else "",
+        "basic_address": str(addr.get("address") or "").replace("<br>", " ").strip(),
+        "pincode": str(addr.get("pincode") or ""),
+        "map_location": str(addr.get("map_location") or ""),
+        "nearest_train_station": str(train.get("name") or ""),
+        "nearest_train_distance_m": _to_int(train.get("distance")),
+        "nearest_bus_station": str(bus.get("name") or ""),
+        "nearest_bus_distance_m": _to_int(bus.get("distance")),
+        "nearest_airport": str(addr.get("nearest_airport") or ""),
+        "basic_info_json": json.dumps(bi, ensure_ascii=False),
+    }
+
+
 def parse_college_ld(html: str) -> Dict[str, Any]:
     """Extract structured college fields from the page's JSON-LD. Deliberately
     ignores UserComments/reviews."""
@@ -1413,6 +1500,19 @@ def run_enrichment(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
     budget_bytes = int(float(cfg.get("budget_mb", 0)) * 1024 * 1024)
     budget_requests = int(cfg.get("budget_requests", 0))
 
+    # The Directory phase writes only to colleges_directory, but this queue reads
+    # `colleges` — so directory-only colleges could never be enriched. Seeding
+    # copies identity + link across (INSERT ... DO NOTHING; nothing is modified
+    # or deleted) and brings them into scope.
+    if cfg.get("include_directory"):
+        try:
+            seeded = db.seed_colleges_from_directory(db_path=db_path)
+            if seeded:
+                log(f"Seeded {seeded:,} directory-only colleges into `colleges` "
+                    f"so they can be enriched.")
+        except Exception as err:  # noqa: BLE001
+            log(f"  ! could not seed directory colleges: {err}")
+
     colleges = db.list_colleges_to_enrich(
         db_path=db_path, where=cfg.get("college_where", ""),
         params=tuple(cfg.get("college_where_params", [])),
@@ -1473,13 +1573,20 @@ def run_enrichment(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
                 # was never retried again.
                 html = client.get_text(cobj["link"])
                 fields = parse_college_ld(html)
+                # The same page also carries __NEXT_DATA__.data.basic_info, with
+                # roughly double the fields (founding year, college type, NAAC
+                # grade, affiliation, all phone numbers, pincode, transport).
+                # Free: no extra request.
+                basic = parse_college_basic_info(html) if cfg.get("basic_info", True) else {}
                 with db_lock:
                     # A page that fetched cleanly but genuinely has no JSON-LD is
                     # still marked done (fields == {}), so it isn't re-fetched
-                    # forever. update_college_details never overwrites an existing
-                    # value with a blank one.
+                    # forever. Neither writer overwrites an existing value with a
+                    # blank one.
                     db.update_college_details(cobj["college_id"], fields, db_path=db_path)
-                ok = bool(fields)
+                    if basic:
+                        db.update_college_basic(cobj["college_id"], basic, db_path=db_path)
+                ok = bool(fields or basic)
             except Exception as err:  # noqa: BLE001
                 log(f"  college {cobj['college_id']} err: {str(err)[:60]}")
             with prog_lock:
