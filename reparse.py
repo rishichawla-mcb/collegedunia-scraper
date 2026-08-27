@@ -10,8 +10,9 @@ What it recovers, per directory college:
   * top_course_fees  — the parser probed 'fees'/'amount'/'value'/'total_fees'
                        but the API sends 'fee'/'fee_formatted', so this column
                        was 0% filled on every row.
-  * placement (avg + highest salary, placement %), facilities, review
-    aggregates, major_stream_rating, media counts, tagline, logo/cover URLs.
+  * placement (avg + highest salary, placement %), facilities,
+    major_stream_rating, media counts, tagline, logo/cover URLs.
+    Reviews are deliberately NOT extracted or stored.
   * availableTabs   — which sub-pages exist per college (admission, placement,
                       scholarship, hostel, faculty, news, ranking...). This is
                       the discovery list for future modules.

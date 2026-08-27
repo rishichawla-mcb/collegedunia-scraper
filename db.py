@@ -322,10 +322,8 @@ DIRECTORY_EXTRA_COLS = [
     ("placement_percentage", "REAL"),
     ("facilities", "TEXT"), ("facilities_count", "INTEGER"),
     ("major_stream_rating", "REAL"), ("stream_ranking_count", "INTEGER"),
-    ("reviews_avg_rating", "REAL"), ("reviews_students", "INTEGER"),
-    ("reviews_total", "INTEGER"), ("reviews_academic", "REAL"),
-    ("reviews_faculty", "REAL"), ("reviews_infrastructure", "REAL"),
-    ("reviews_accommodation", "REAL"), ("reviews_social_life", "REAL"),
+    # Reviews are intentionally not captured — no reviews_* columns are created,
+    # and parse_directory_extras never reads reviewsData.
     ("available_tabs", "TEXT"),
     ("has_scholarship_page", "INTEGER"), ("has_placement_page", "INTEGER"),
     ("has_ranking_page", "INTEGER"), ("has_faculty_page", "INTEGER"),

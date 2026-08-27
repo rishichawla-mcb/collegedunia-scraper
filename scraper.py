@@ -2010,9 +2010,9 @@ def parse_directory_extras(c: Dict[str, Any]) -> Dict[str, Any]:
         top_fee_display = ""
 
     pl = _as_dict(c.get("placement"))
-    rv = _as_dict(c.get("reviewsData"))
-    urd = _as_dict(rv.get("userReviewsData"))
-    stats = _as_dict(urd.get("rating_stats"))
+    # NOTE: the payload also carries reviewsData — aggregate ratings plus one
+    # named student's review text. Reviews are deliberately NOT extracted or
+    # stored anywhere; the key is left untouched in raw_json.
     tabs = c.get("availableTabs")
     tab_keys = sorted(tabs.keys()) if isinstance(tabs, dict) else []
     fac = c.get("facilities")
@@ -2033,17 +2033,6 @@ def parse_directory_extras(c: Dict[str, Any]) -> Dict[str, Any]:
         "facilities_count": len(fac_list),
         "major_stream_rating": _to_float(c.get("major_stream_rating")),
         "stream_ranking_count": _to_int(sr.get("count")),
-        # Aggregate review statistics only. The payload also carries one named
-        # student's review text (reviewsData.student / .defaultDesc); that is an
-        # identifiable individual's words, so it is deliberately NOT stored here.
-        "reviews_avg_rating": _to_float(rv.get("avgRating")),
-        "reviews_students": _to_int(rv.get("totalStudent")),
-        "reviews_total": _to_int(stats.get("total")),
-        "reviews_academic": _to_float(urd.get("avg_reviews_academic_rating")),
-        "reviews_faculty": _to_float(urd.get("avg_reviews_faculty_rating")),
-        "reviews_infrastructure": _to_float(urd.get("avg_reviews_infrastructure_rating")),
-        "reviews_accommodation": _to_float(urd.get("avg_reviews_accommodation_food_rating")),
-        "reviews_social_life": _to_float(urd.get("avg_reviews_social_life_rating")),
         "available_tabs": ", ".join(tab_keys),
         "has_scholarship_page": 1 if "scholarship" in tab_keys else 0,
         "has_placement_page": 1 if "placement" in tab_keys else 0,
