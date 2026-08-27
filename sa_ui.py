@@ -20,6 +20,7 @@ import vertical_base as vb
 import sa_vertical  # noqa: F401  registers 'studyabroad'
 import sa_db
 import sa_scraper
+import sa_export
 import db as _core  # to display the SHARED proxy config (read-only)
 import scraper as _eng  # reuse analyze_page/extract_* for the Live scraper
 
@@ -49,6 +50,77 @@ def _shared_proxy_line() -> str:
         n = len([p for p in (_core.get_setting("proxy_list_text", "") or "").splitlines() if p.strip()])
         return f"list ({n} proxies)"
     return "direct (no proxy)"
+
+
+# A download costs ~2x its size in server RAM (st.session_state + Streamlit's
+# MediaFileManager, which holds the payload for the session). On a 2 GB host a
+# 330 MB CSV therefore OOM-kills the container, which drops every session and
+# bounces you back to the login screen — looking exactly like "the button does
+# nothing". Cap it, and build to disk first so the size is known BEFORE the
+# payload is ever loaded into memory. Override with CD_MAX_DOWNLOAD_MB.
+MAX_DL_MB = float(os.environ.get("CD_MAX_DOWNLOAD_MB", "150"))
+
+
+def _prepare(build, suffix):
+    """Build an export to a temp file, then load it only if it is under the cap.
+    Returns (bytes | None, size_in_bytes); None means 'too large to serve'."""
+    import tempfile
+    fd, tmp = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    try:
+        build(tmp)
+        size = os.path.getsize(tmp)
+        if size > MAX_DL_MB * 1048576:
+            return None, size
+        with open(tmp, "rb") as fh:
+            return fh.read(), size
+    except Exception as err:  # noqa: BLE001
+        st.error(f"Export failed: {str(err)[:300]}")
+        return None, -1
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _offer(container, data, size, fname, key, mime):
+    if data is None:
+        if size >= 0:
+            container.error(
+                f"**{fname} would be {size/1048576:.0f} MB — too big to hand to the "
+                f"browser** (cap {MAX_DL_MB:.0f} MB). Streamlit keeps two copies of a "
+                f"download in RAM, which would OOM this host and log you out. "
+                f"Untick `raw_json`, or use the **.xlsx** export — it is zip-compressed "
+                f"and typically ~20x smaller.")
+        st.session_state.pop(key, None)
+        return
+    st.session_state[key] = (fname, data, size)
+
+
+def _render_pending(container, key, mime):
+    item = st.session_state.get(key)
+    if not item:
+        return
+    fname, data, size = item
+    container.caption(f"Ready: **{fname}** · {size/1048576:.1f} MB")
+    container.download_button(f"⬇️ Download {fname}", data=data, file_name=fname,
+                              mime=mime, key=f"dl_{key}")
+
+
+def _estimate_mb(db_path, table, include_raw):
+    """Rough uncompressed size of a table, from SQLite's own string lengths."""
+    try:
+        with sa_db.connect(db_path) as conn:
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+            if not cols:
+                return None
+            keep = [c for c in cols if include_raw or c != "raw_json"]
+            expr = "+".join(f"COALESCE(LENGTH(CAST({c} AS TEXT)),0)" for c in keep)
+            n = conn.execute(f"SELECT COALESCE(SUM({expr}),0) FROM {table}").fetchone()[0]
+        return (n or 0) / 1048576
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def render() -> None:
@@ -348,27 +420,50 @@ def render() -> None:
                     df = df.drop(columns=[col])
             st.caption(f"{len(df):,} shown (max 500)")
             st.dataframe(df, use_container_width=True, height=360)
+        st.markdown("**Export**")
+        inc_raw = st.checkbox(
+            "Include the `raw_json` source column", value=False, key="sa_expraw",
+            help="raw_json is the full original API object. On a 107k-programme "
+                 "dataset it is ~78% of a CSV export (330 MB with it, 73 MB without) "
+                 "and no spreadsheet can use it. The column stays in the database.")
+        st.caption(
+            f"Downloads are capped at **{MAX_DL_MB:.0f} MB**. Streamlit holds a download "
+            "in server memory twice (session state + its media store), so an "
+            "oversized payload OOM-kills the host and drops your session — which "
+            "logs you out and loses the export. **.xlsx is zip-compressed and is by "
+            "far the smallest option** for big tables (sa_programs: ~17 MB as xlsx "
+            "vs ~330 MB as CSV).")
+        est = _estimate_mb(V.db_path, tbl, inc_raw) if tbl else None
+        if est is not None:
+            st.caption(f"Estimated uncompressed size of `{tbl}`: ~{est:.0f} MB "
+                       f"(xlsx will be far smaller).")
+
         e1, e2 = st.columns(2)
         if e1.button("🛠️ Build .xlsx (all SA tables)", key="sa_xlsx_btn"):
             with st.spinner("Building…"):
-                st.session_state["sa_xlsx"] = V.export_xlsx()
-        if st.session_state.get("sa_xlsx"):
-            e1.download_button("⬇️ Download SA .xlsx", data=st.session_state["sa_xlsx"],
-                               file_name="study_abroad_export.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        if tbl and e2.button(f"⬇️ CSV of {tbl}", key="sa_csv_btn"):
-            import sa_export
-            st.session_state["sa_csv"] = (tbl, sa_export.to_csv(tbl))
-        if st.session_state.get("sa_csv"):
-            nm, data = st.session_state["sa_csv"]
-            e2.download_button(f"⬇️ {nm}.csv", data=data, file_name=f"{nm}.csv", mime="text/csv")
-        if tbl and st.button(f"⬇️ JSON of {tbl}", key="sa_json_btn"):
-            import sa_export
-            st.session_state["sa_json"] = (tbl, sa_export.to_json(tbl))
-        if st.session_state.get("sa_json"):
-            nm, data = st.session_state["sa_json"]
-            st.download_button(f"⬇️ {nm}.json", data=data, file_name=f"{nm}.json",
-                               mime="application/json")
+                data, size = _prepare(
+                    lambda p: sa_export.to_xlsx(sa_export.TABLES, V.db_path,
+                                                include_raw=inc_raw, out_path=p), ".xlsx")
+            _offer(e1, data, size, "study_abroad_export.xlsx", "sa_xlsx",
+                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        _render_pending(e1, "sa_xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        if tbl and e2.button(f"🛠️ Build CSV of {tbl}", key="sa_csv_btn"):
+            with st.spinner("Building…"):
+                data, size = _prepare(
+                    lambda p: sa_export.to_csv(tbl, V.db_path, include_raw=inc_raw,
+                                               out_path=p), ".csv")
+            _offer(e2, data, size, f"{tbl}.csv", "sa_csv", "text/csv")
+        _render_pending(e2, "sa_csv", "text/csv")
+
+        if tbl and st.button(f"🛠️ Build JSON of {tbl}", key="sa_json_btn"):
+            with st.spinner("Building…"):
+                data, size = _prepare(
+                    lambda p: sa_export.to_json(tbl, V.db_path, include_raw=inc_raw,
+                                                out_path=p), ".json")
+            _offer(st, data, size, f"{tbl}.json", "sa_json", "application/json")
+        _render_pending(st, "sa_json", "application/json")
 
         st.divider()
         with st.expander("⚠️ Maintenance / reset (SA only — never touches domestic)"):

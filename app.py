@@ -226,6 +226,38 @@ def proxy_config_from_ui() -> dict:
     }
 
 
+# Streamlit holds a download twice in server RAM (st.session_state + its
+# MediaFileManager). On a 2 GB host an oversized payload OOM-kills the container,
+# which drops every session and bounces the user back to the login screen —
+# indistinguishable from "the download button does nothing". Build to disk first
+# so the size is known BEFORE anything is loaded into memory, and refuse over the
+# cap. Override with CD_MAX_DOWNLOAD_MB.
+MAX_DL_MB = float(os.environ.get("CD_MAX_DOWNLOAD_MB", "150"))
+
+
+def prepare_export(build, suffix):
+    """Run `build(tmp_path)`, then load the result only if it is under the cap.
+    Returns (bytes | None, size_in_bytes); None means 'too large to serve'."""
+    import tempfile
+    fd, tmp = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    try:
+        build(tmp)
+        size = os.path.getsize(tmp)
+        if size > MAX_DL_MB * 1048576:
+            return None, size
+        with open(tmp, "rb") as fh:
+            return fh.read(), size
+    except Exception as err:  # noqa: BLE001
+        st.error(f"Export failed: {str(err)[:300]}")
+        return None, -1
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
 def human_mb(byts) -> str:
     try:
         return f"{(byts or 0)/1048576:.1f} MB"
@@ -2039,28 +2071,41 @@ with tab_data:
              "over 32,767 characters — so untick it unless you specifically need the "
              "raw payloads. The column always stays in the database either way.")
     XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    st.caption(f"Downloads are capped at **{MAX_DL_MB:.0f} MB** — Streamlit holds a "
+               "download in server memory twice, so an oversized one OOM-kills the "
+               "host and drops your session. **Excel is zip-compressed and by far the "
+               "smallest option** for big tables.")
     if st.button("🛠️ Prepare download"):
         st.session_state.pop("expdata", None)   # release the previous export first
         with st.spinner("Building export…"):
             if fmt == "CSV":
-                st.session_state["expdata"] = (
-                    export.to_csv(table, include_raw=inc_raw),
-                    f"collegedunia_{table}.csv", "text/csv")
+                fname, mime = f"collegedunia_{table}.csv", "text/csv"
+                data, size = prepare_export(
+                    lambda p: export.to_csv(table, include_raw=inc_raw, out_path=p), ".csv")
             elif fmt == "JSON":
-                st.session_state["expdata"] = (
-                    export.to_json(table, include_raw=inc_raw),
-                    f"collegedunia_{table}.json", "application/json")
+                fname, mime = f"collegedunia_{table}.json", "application/json"
+                data, size = prepare_export(
+                    lambda p: export.to_json(table, include_raw=inc_raw, out_path=p), ".json")
             elif fmt == "Excel (this table)":
-                st.session_state["expdata"] = (
-                    export.to_xlsx((table,), include_raw=inc_raw),
-                    f"collegedunia_{table}.xlsx", XLSX_MIME)
+                fname, mime = f"collegedunia_{table}.xlsx", XLSX_MIME
+                data, size = prepare_export(
+                    lambda p: export.to_xlsx((table,), include_raw=inc_raw, out_path=p), ".xlsx")
             else:
-                st.session_state["expdata"] = (
-                    export.to_xlsx(include_raw=inc_raw),
-                    "collegedunia_all.xlsx", XLSX_MIME)
+                fname, mime = "collegedunia_all.xlsx", XLSX_MIME
+                data, size = prepare_export(
+                    lambda p: export.to_xlsx(include_raw=inc_raw, out_path=p), ".xlsx")
+        if data is None:
+            if size >= 0:
+                st.error(
+                    f"**{fname} would be {size/1048576:.0f} MB — too big to hand to the "
+                    f"browser** (cap {MAX_DL_MB:.0f} MB). Untick `raw_json` above, or "
+                    f"switch to an Excel format — it is zip-compressed and typically "
+                    f"~20x smaller than the same data as CSV or JSON.")
+        else:
+            st.session_state["expdata"] = (data, fname, mime, size)
     if st.session_state.get("expdata"):
-        data, fname, mime = st.session_state["expdata"]
-        st.caption(f"Ready: **{fname}** · {len(data)/1048576:.1f} MB")
+        data, fname, mime, size = st.session_state["expdata"]
+        st.caption(f"Ready: **{fname}** · {size/1048576:.1f} MB")
         st.download_button(f"⬇️ Download {fname}", data=data, file_name=fname, mime=mime)
         if st.button("🧹 Clear prepared export from memory", key="expclear"):
             st.session_state.pop("expdata", None)

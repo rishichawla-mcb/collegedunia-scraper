@@ -123,6 +123,25 @@ def _iter_csv(table: str, db_path: str, include_raw: bool) -> Iterator[str]:
             yield tail
 
 
+def _via_tempfile(write_chunks, suffix: str) -> bytes:
+    """Spool to disk then read back once — 1x the payload in RAM instead of 2x.
+    See the note in export.py._via_tempfile."""
+    import os, tempfile
+    fd, tmp = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            for chunk in write_chunks:
+                fh.write(chunk)
+        with open(tmp, "rb") as fh:
+            return fh.read()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
 def to_csv(table, db_path=sa_db.SA_DB_PATH, include_raw: bool = True,
            out_path: Optional[str] = None):
     if out_path:
@@ -130,7 +149,7 @@ def to_csv(table, db_path=sa_db.SA_DB_PATH, include_raw: bool = True,
             for chunk in _iter_csv(table, db_path, include_raw):
                 fh.write(chunk)
         return out_path
-    return "".join(_iter_csv(table, db_path, include_raw)).encode("utf-8")
+    return _via_tempfile(_iter_csv(table, db_path, include_raw), ".csv")
 
 
 def _iter_json(table: str, db_path: str, include_raw: bool) -> Iterator[str]:
@@ -154,4 +173,4 @@ def to_json(table, db_path=sa_db.SA_DB_PATH, include_raw: bool = True,
             for chunk in _iter_json(table, db_path, include_raw):
                 fh.write(chunk)
         return out_path
-    return "".join(_iter_json(table, db_path, include_raw)).encode("utf-8")
+    return _via_tempfile(_iter_json(table, db_path, include_raw), ".json")
