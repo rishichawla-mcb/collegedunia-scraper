@@ -527,10 +527,22 @@ def list_colleges_to_enrich(db_path: str = DB_PATH, where: str = "", params: tup
 
 
 def update_college_details(college_id: int, fields: Dict[str, Any], db_path: str = DB_PATH) -> None:
+    """Write Phase-3 enrichment onto a college row.
+
+    NON-DESTRUCTIVE: a blank/NULL incoming value never overwrites an existing
+    non-empty one. A re-run against a page that has lost its JSON-LD (or a
+    partially-parsed one) can therefore only ever add detail, never erase it.
+    enriched_at is always refreshed so the college leaves the pending queue."""
     cols = ["website", "email", "phone", "rating_value", "rating_count",
             "pros", "cons", "address"]
-    sets = ", ".join(f"{c}=?" for c in cols) + ", enriched_at=?"
-    vals = [fields.get(c) for c in cols] + [time.time(), college_id]
+    sets = ", ".join(
+        f"{c}=CASE WHEN ? IS NULL OR ?='' THEN {c} ELSE ? END" for c in cols
+    ) + ", enriched_at=?"
+    vals: List[Any] = []
+    for c in cols:
+        v = fields.get(c)
+        vals += [v, v, v]
+    vals += [time.time(), college_id]
     with connect(db_path) as conn:
         conn.execute(f"UPDATE colleges SET {sets} WHERE college_id=?", vals)
 

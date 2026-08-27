@@ -139,6 +139,37 @@ class BlockedError(Exception):
     """Raised when the site appears to be blocking us (403/429/HTML challenge)."""
 
 
+# Bot-interstitials return HTTP 200 with an HTML body, so status codes alone
+# don't catch them. fetch() spots them because it expects JSON; get_text() had no
+# equivalent check, so Phase 3 / Phase 4 / the Directory HTML fallback silently
+# parsed challenge pages as if they were real (a blocked college was then written
+# with NULL contacts and permanently marked 'enriched'). These markers are
+# deliberately narrow — the title-based ones and the Cloudflare/Incapsula tokens
+# do not occur in genuine Collegedunia markup.
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.S | re.I)
+_CHALLENGE_TITLES = ("just a moment", "attention required", "access denied",
+                     "security check", "are you a robot", "ddos-guard")
+_CHALLENGE_TOKENS = ("cf-browser-verification", "__cf_chl_", "cf_chl_opt",
+                     "request unsuccessful. incapsula",
+                     "please enable cookies and reload the page")
+
+
+def is_block_page(text: Optional[str]) -> bool:
+    """True when an HTTP-200 body is really a bot challenge / interstitial."""
+    if text is None:
+        return True
+    head = text[:20000]
+    if not head.strip():
+        return True                      # empty 200 is not a real page either
+    m = _TITLE_RE.search(head)
+    if m:
+        title = m.group(1).strip().lower()
+        if any(t in title for t in _CHALLENGE_TITLES):
+            return True
+    low = head.lower()
+    return any(tok in low for tok in _CHALLENGE_TOKENS)
+
+
 class BudgetExceeded(Exception):
     """Raised when a configured request/bandwidth budget is hit."""
 
@@ -419,6 +450,11 @@ class Client:
                 if resp.status_code in (403, 429, 503):
                     raise BlockedError(f"HTTP {resp.status_code}")
                 resp.raise_for_status()
+                # A challenge page arrives as HTTP 200 + HTML. Treat it as a block
+                # so it is retried / IP-rotated, instead of being handed to a
+                # parser that will quietly extract nothing from it.
+                if is_block_page(resp.text):
+                    raise BlockedError("challenge/interstitial page (HTTP 200)")
                 self.pm.report_success(proxy)
                 if self.adaptive:
                     self.adaptive.on_success()
@@ -822,6 +858,16 @@ def _staged_or_master_count(job_id: int, cfg: Dict[str, Any], db_path: str) -> i
     return sum(db.counts(db_path=db_path).values())
 
 
+def _written_count(job_id: int, cfg: Dict[str, Any], table: str, db_path: str) -> int:
+    """Rows this job has produced, whether they are still in staging or have
+    already been promoted. Counting staging alone breaks the moment incremental
+    promotion empties it — the progress counter would fall back to 0 mid-run."""
+    if not cfg.get("staging", True):
+        return db.counts(db_path=db_path).get(table, 0)
+    return (db.count_promoted(job_id, table, db_path=db_path)
+            + db.staged_summary(job_id, db_path=db_path).get(table, 0))
+
+
 def _maybe_flush(job_id: int, cfg: Dict[str, Any], db_path: str) -> None:
     """Incremental promotion: move staged rows to master mid-run (in memory-safe
     chunks) so the data survives an interrupted/OOM-killed job and staging stays
@@ -873,9 +919,14 @@ def run_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
     if cfg.get("partition"):
         return _run_courses_partitioned(job_id, cfg, db_path, log)
     pm = ProxyManager.from_config(cfg)
-    client = Client(pm, log=log, max_retries=int(cfg.get("max_retries", 5)),
-                    backoff=float(cfg.get("backoff", 4)))
     delay = float(cfg.get("delay", 1.0))
+    # Share Stats/AdaptiveDelay with the client so this phase reports its request
+    # count and bandwidth like every other phase (it previously reported 0/0, so
+    # the UI's Bandwidth metric and budget forecasts were wrong for Phase 1).
+    stats = Stats()
+    adaptive = AdaptiveDelay(delay, enabled=bool(cfg.get("adaptive", True)))
+    client = Client(pm, log=log, max_retries=int(cfg.get("max_retries", 5)),
+                    backoff=float(cfg.get("backoff", 4)), stats=stats, adaptive=adaptive)
     max_pages = cfg.get("max_pages")
     start_page = int(cfg.get("start_page", 1))
 
@@ -897,7 +948,7 @@ def run_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
     total = None
     try:
         # Seed the running total from what's already in the DB (for resume).
-        written = (db.staged_summary(job_id, db_path=db_path).get("courses", 0) if cfg.get("staging", True) else db.counts(db_path=db_path).get("courses", 0))
+        written = _written_count(job_id, cfg, "courses", db_path)
         while True:
             if db.stop_requested(job_id, db_path=db_path):
                 db.set_setting("courses_resume_page", page, db_path=db_path)
@@ -947,11 +998,18 @@ def run_courses(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
 
             parsed = [parse_course(c) for c in courses if (c.get("lead_params") or {}).get("course_id")]
             _write_rows(job_id, cfg, "courses", parsed, db_path)
-            written = (db.staged_summary(job_id, db_path=db_path).get("courses", 0) if cfg.get("staging", True) else db.counts(db_path=db_path).get("courses", 0))
+            # Promote staged rows to master as we go (as every other phase does).
+            # Without this, Phase-1 data stays in staging for the whole job, so
+            # run_pipeline's Phase-2 leg reads an empty/stale master courses table
+            # — and an interrupted Phase-1 job leaves everything unpromoted.
+            _maybe_flush(job_id, cfg, db_path)
+            written = _written_count(job_id, cfg, "courses", db_path)
             pages_done += 1
             page += 1
+            reqs, byts, _ = stats.snapshot()
             db.set_setting("courses_resume_page", page, db_path=db_path)
             db.update_job(job_id, done_units=written, items_written=written,
+                          req_count=reqs, bytes_count=byts,
                           message=f"page {page-1}: {written}/{total} courses", db_path=db_path)
             log(f"  page {page-1}: +{len(parsed)} (total {written}/{total})")
 
@@ -999,7 +1057,8 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
 
     def push() -> None:
         reqs, byts, blocks = stats.snapshot()
-        written = (db.staged_summary(job_id, db_path=db_path).get("courses", 0) if cfg.get("staging", True) else db.counts(db_path=db_path).get("courses", 0))
+        _maybe_flush(job_id, cfg, db_path)   # incremental promote (see run_courses)
+        written = _written_count(job_id, cfg, "courses", db_path)
         db.update_job(job_id, done_units=written, items_written=written,
                       total_units=(grand_total["v"] or 0), req_count=reqs, bytes_count=byts,
                       message=f"{written}/{grand_total['v']} courses · {leaves_done['v']} chunks · "
@@ -1087,7 +1146,7 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
     facets = [("course_tag_id", tag_ids)] + SUB_FACETS
     try:
         recurse({}, 0, "all")
-        written = (db.staged_summary(job_id, db_path=db_path).get("courses", 0) if cfg.get("staging", True) else db.counts(db_path=db_path).get("courses", 0))
+        written = _written_count(job_id, cfg, "courses", db_path)
         reqs, byts, _ = stats.snapshot()
         if stopped():
             msg = f"stopped by user — {written}/{grand_total['v']} courses so far"
@@ -1119,6 +1178,18 @@ def run_pipeline(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
     job = db.get_job(job_id, db_path=db_path)
     if job and job["status"] == "error":
         return
+    # Phase 2 selects its work from the MASTER courses table (db.list_course_ids),
+    # so every course Phase 1 just scraped must be promoted out of staging before
+    # it starts — otherwise Phase 2 runs against a stale/empty list and reports
+    # "0 courses, 0 offerings" while looking like a success.
+    if cfg.get("staging", True):
+        try:
+            promoted = db.flush_job_staging(job_id, db_path=db_path)
+            if promoted:
+                log("  promoted phase-1 staging → master: "
+                    + ", ".join(f"{k}={v:,}" for k, v in promoted.items()))
+        except Exception as err:  # noqa: BLE001
+            log(f"  ! could not promote phase-1 staging before phase 2: {err}")
     log("=== PIPELINE: Phase 2 (colleges per course) ===")
     db.update_job(job_id, status="running", message="phase 1 done — starting phase 2",
                   db_path=db_path)
@@ -1395,9 +1466,18 @@ def run_enrichment(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
                 stop_event.set(); return
             ok = False
             try:
+                # get_text now raises BlockedError on a challenge page, so a
+                # blocked college never reaches the write below and keeps
+                # enriched_at NULL — i.e. it stays in the queue for a later run.
+                # Previously it was stamped 'enriched' with all-NULL contacts and
+                # was never retried again.
                 html = client.get_text(cobj["link"])
                 fields = parse_college_ld(html)
                 with db_lock:
+                    # A page that fetched cleanly but genuinely has no JSON-LD is
+                    # still marked done (fields == {}), so it isn't re-fetched
+                    # forever. update_college_details never overwrites an existing
+                    # value with a blank one.
                     db.update_college_details(cobj["college_id"], fields, db_path=db_path)
                 ok = bool(fields)
             except Exception as err:  # noqa: BLE001
@@ -1523,7 +1603,10 @@ def parse_courses_fees(page_html: str) -> Dict[str, Any]:
                     "total_pages": cd.get("total_pages")}
     tbl = _parse_cf_tables(page_html)
     tbl.setdefault("groups", [])
-    tbl.setdefault("hostel", "")
+    # The hostel fee is only ever in the HTML tables, so it must be read on this
+    # path too — the fallback previously returned "" and silently dropped it,
+    # i.e. exactly when the __NEXT_DATA__ JSON was missing and we needed it most.
+    tbl["hostel"] = tbl.get("hostel") or _hostel_from_tables(page_html)
     tbl.setdefault("total_pages", 1)
     return tbl
 
