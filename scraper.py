@@ -1960,27 +1960,147 @@ def _flatten_colleges(x: Any, out: Optional[List[Dict[str, Any]]] = None) -> Lis
     return out
 
 
+DIR_IMG_BASE = "https://image-static.collegedunia.com/"
+
+
+def _as_dict(v: Any) -> Dict[str, Any]:
+    """This API uses [] to mean 'absent' and a dict to mean 'present' for several
+    keys (placement, reviewsData, sa reviews). Normalise both to a dict."""
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, list):
+        for x in v:
+            if isinstance(x, dict):
+                return x
+    return {}
+
+
+def _img(path: Any) -> str:
+    p = str(path or "").strip()
+    if not p:
+        return ""
+    return p if p.startswith("http") else DIR_IMG_BASE + p.lstrip("/")
+
+
+def parse_directory_extras(c: Dict[str, Any]) -> Dict[str, Any]:
+    """Fields the india-colleges listing already returns on every row but which
+    nothing captured — placement, facilities, review aggregates, media, and the
+    availableTabs map that says which sub-pages exist for this college.
+
+    All of it is already inside raw_json for previously-scraped rows, so this can
+    be replayed offline with no further requests (see reparse.py)."""
+    # `fees` arrives in several shapes: the listing API sends a list of dicts
+    # keyed 'fee'/'fee_formatted' (the original parser probed 'fees'/'amount'/
+    # 'value'/'total_fees' and so returned "" on every row), while the tiny-state
+    # HTML fallback can send a plain list of strings. Handle all of them.
+    fees = c.get("fees")
+    if isinstance(fees, dict):
+        fees = [fees]
+    first = fees[0] if isinstance(fees, list) and fees else None
+    top: Dict[str, Any] = first if isinstance(first, dict) else {}
+    if isinstance(first, str):
+        top_fee_display = first.strip()          # already formatted upstream
+    elif top:
+        fmt = str(top.get("fee_formatted") or top.get("fees") or top.get("amount")
+                  or top.get("value") or top.get("total_fees") or "").strip()
+        top_fee_display = fmt if (not fmt or fmt.startswith("₹")) else "₹" + fmt
+    elif first is not None:
+        top_fee_display = str(first).strip()
+    else:
+        top_fee_display = ""
+
+    pl = _as_dict(c.get("placement"))
+    rv = _as_dict(c.get("reviewsData"))
+    urd = _as_dict(rv.get("userReviewsData"))
+    stats = _as_dict(urd.get("rating_stats"))
+    tabs = c.get("availableTabs")
+    tab_keys = sorted(tabs.keys()) if isinstance(tabs, dict) else []
+    fac = c.get("facilities")
+    fac_list = [str(f) for f in fac if f] if isinstance(fac, list) else []
+    sr = _as_dict(c.get("stream_ranking"))
+
+    return {
+        "top_course_fees": top_fee_display,
+        "top_course_name": str(top.get("name") or top.get("short_form") or ""),
+        "top_course_id": str(top.get("course_id") or ""),
+        "top_course_fee_inr": _to_int(top.get("fee")) if top else None,
+        "top_course_link": abs_url(top.get("link")) if top.get("link") else "",
+        "courses_fees_json": json.dumps(fees, ensure_ascii=False) if fees else "",
+        "placement_avg_salary": _to_int(pl.get("average_salary")),
+        "placement_highest_salary": _to_int(pl.get("highest_salary")),
+        "placement_percentage": _to_float(c.get("placement_percentage")),
+        "facilities": ", ".join(fac_list),
+        "facilities_count": len(fac_list),
+        "major_stream_rating": _to_float(c.get("major_stream_rating")),
+        "stream_ranking_count": _to_int(sr.get("count")),
+        # Aggregate review statistics only. The payload also carries one named
+        # student's review text (reviewsData.student / .defaultDesc); that is an
+        # identifiable individual's words, so it is deliberately NOT stored here.
+        "reviews_avg_rating": _to_float(rv.get("avgRating")),
+        "reviews_students": _to_int(rv.get("totalStudent")),
+        "reviews_total": _to_int(stats.get("total")),
+        "reviews_academic": _to_float(urd.get("avg_reviews_academic_rating")),
+        "reviews_faculty": _to_float(urd.get("avg_reviews_faculty_rating")),
+        "reviews_infrastructure": _to_float(urd.get("avg_reviews_infrastructure_rating")),
+        "reviews_accommodation": _to_float(urd.get("avg_reviews_accommodation_food_rating")),
+        "reviews_social_life": _to_float(urd.get("avg_reviews_social_life_rating")),
+        "available_tabs": ", ".join(tab_keys),
+        "has_scholarship_page": 1 if "scholarship" in tab_keys else 0,
+        "has_placement_page": 1 if "placement" in tab_keys else 0,
+        "has_ranking_page": 1 if "ranking" in tab_keys else 0,
+        "has_faculty_page": 1 if "faculty" in tab_keys else 0,
+        "has_hostel_page": 1 if "hostel" in tab_keys else 0,
+        "has_news_page": 1 if "news" in tab_keys else 0,
+        "has_admission_page": 1 if "admission" in tab_keys else 0,
+        "tagline": str(c.get("tagline") or ""),
+        "listing_name": str(c.get("listing_name") or ""),
+        "logo_url": _img(c.get("logo")),
+        "cover_url": _img(c.get("cover")),
+        "photo_count": _to_int(c.get("photoCount")),
+        "video_count": _to_int(c.get("videoCount")),
+        "cutoff_url": abs_url(c.get("view_all_course")) if c.get("view_all_course") else "",
+    }
+
+
+def parse_directory_rankings(c: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """rankingData[] -> one row per (agency, year, stream). Real ranking records
+    (NIRF / India Today / Collegedunia ...) that were previously discarded."""
+    cid = _to_int(c.get("college_id"))
+    out: List[Dict[str, Any]] = []
+    if cid is None:
+        return out
+    for r in (c.get("rankingData") or []):
+        if not isinstance(r, dict):
+            continue
+        agency = str(r.get("agency") or "").strip()
+        year = _to_int(r.get("year"))
+        if not agency and year is None:
+            continue
+        out.append({
+            "college_id": cid,
+            "agency": agency,
+            "agency_id": _to_int(r.get("agencyId")),
+            "year": year,
+            "stream": str(r.get("stream") or ""),
+            "rank": _to_int(r.get("rankingOfCollege")),
+            "out_of": _to_int(r.get("rankingOutOfTotalNoOfCollege")),
+            "category_ranking": str(r.get("category_ranking") or ""),
+            "logo": _img(r.get("logo")) if r.get("logo") else "",
+            "scraped_at": time.time(),
+        })
+    return out
+
+
 def parse_directory_college(c: Dict[str, Any], source_slug: str = "") -> Dict[str, Any]:
     """Flatten one directory college object (identical shape from the listing API
     and the tiny-state HTML) into a colleges_directory row."""
-    fees = c.get("fees")
-    top_fee = ""
-    if isinstance(fees, list) and fees:
-        f0 = fees[0]
-        if isinstance(f0, str):
-            top_fee = f0
-        elif isinstance(f0, dict):
-            top_fee = str(f0.get("fees") or f0.get("amount") or f0.get("value")
-                          or f0.get("total_fees") or "")
-        else:
-            top_fee = str(f0)
     approvals = c.get("approvals")
     if isinstance(approvals, list):
         approvals = ", ".join(
             str(a.get("name") if isinstance(a, dict) else a) for a in approvals if a)
     elif not isinstance(approvals, str):
         approvals = ""
-    return {
+    row = {
         "college_id": _to_int(c.get("college_id")),
         "name": c.get("college_name", "") or "",
         "short_form": c.get("college_short_form", "") or "",
@@ -1991,13 +2111,14 @@ def parse_directory_college(c: Dict[str, Any], source_slug: str = "") -> Dict[st
         "link": abs_url(c.get("url")),
         "rating": _to_float(c.get("rating")),
         "naac_grading": c.get("naac_grading", "") or "",
-        "top_course_fees": top_fee,
         "course_count": _to_int(c.get("courseCount")),
         "approvals": approvals,
         "source_slug": source_slug,
         "raw_json": json.dumps(c, ensure_ascii=False),
         "scraped_at": time.time(),
     }
+    row.update(parse_directory_extras(c))   # incl. the fixed top_course_fees
+    return row
 
 
 def fetch_state_filters(client: "Client") -> List[Dict[str, Any]]:

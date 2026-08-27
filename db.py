@@ -312,6 +312,33 @@ CREATE INDEX IF NOT EXISTS idx_staging_job ON staging(job_id, table_name);
 """
 
 
+# Directory fields the listing API always returned but which the original parser
+# never read. Added by migration; every existing column is left untouched.
+DIRECTORY_EXTRA_COLS = [
+    ("top_course_name", "TEXT"), ("top_course_id", "TEXT"),
+    ("top_course_fee_inr", "INTEGER"), ("top_course_link", "TEXT"),
+    ("courses_fees_json", "TEXT"),
+    ("placement_avg_salary", "INTEGER"), ("placement_highest_salary", "INTEGER"),
+    ("placement_percentage", "REAL"),
+    ("facilities", "TEXT"), ("facilities_count", "INTEGER"),
+    ("major_stream_rating", "REAL"), ("stream_ranking_count", "INTEGER"),
+    ("reviews_avg_rating", "REAL"), ("reviews_students", "INTEGER"),
+    ("reviews_total", "INTEGER"), ("reviews_academic", "REAL"),
+    ("reviews_faculty", "REAL"), ("reviews_infrastructure", "REAL"),
+    ("reviews_accommodation", "REAL"), ("reviews_social_life", "REAL"),
+    ("available_tabs", "TEXT"),
+    ("has_scholarship_page", "INTEGER"), ("has_placement_page", "INTEGER"),
+    ("has_ranking_page", "INTEGER"), ("has_faculty_page", "INTEGER"),
+    ("has_hostel_page", "INTEGER"), ("has_news_page", "INTEGER"),
+    ("has_admission_page", "INTEGER"),
+    ("tagline", "TEXT"), ("listing_name", "TEXT"),
+    ("logo_url", "TEXT"), ("cover_url", "TEXT"),
+    ("photo_count", "INTEGER"), ("video_count", "INTEGER"),
+    ("cutoff_url", "TEXT"),
+]
+DIRECTORY_EXTRA_NAMES = [c for c, _ in DIRECTORY_EXTRA_COLS]
+
+
 def init_db(db_path: str = DB_PATH) -> None:
     with connect(db_path) as conn:
         conn.executescript(SCHEMA)
@@ -369,6 +396,21 @@ def init_db(db_path: str = DB_PATH) -> None:
                          ("staged_rows", "INTEGER")):
             if col not in jcols2:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
+        # Migration: directory fields the listing API always returned but which
+        # nothing extracted (placement, facilities, review aggregates, media, and
+        # the availableTabs map). Purely additive — no column is ever dropped.
+        dcols = {r[1] for r in conn.execute("PRAGMA table_info(colleges_directory)")}
+        for col, typ in DIRECTORY_EXTRA_COLS:
+            if col not in dcols:
+                conn.execute(f"ALTER TABLE colleges_directory ADD COLUMN {col} {typ}")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS college_rankings ("
+            "college_id INTEGER, agency TEXT, agency_id INTEGER, year INTEGER, "
+            "stream TEXT, rank INTEGER, out_of INTEGER, category_ranking TEXT, "
+            "logo TEXT, scraped_at REAL, "
+            "PRIMARY KEY (college_id, agency, year, stream))")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_crank_college "
+                     "ON college_rankings(college_id)")
 
 
 # ---------------------------------------------------------------------------
@@ -682,7 +724,7 @@ def upsert_colleges_directory(rows: Iterable[Dict[str, Any]], db_path: str = DB_
     cols = ["college_id", "name", "short_form", "city", "city_id", "state",
             "state_id", "link", "rating", "naac_grading", "top_course_fees",
             "course_count", "approvals", "source_slug", "raw_json", "scraped_at",
-            "source_job_id"]
+            "source_job_id"] + DIRECTORY_EXTRA_NAMES
     ph = ",".join("?" for _ in cols)
     sql = (f"INSERT INTO colleges_directory ({','.join(cols)}) VALUES ({ph}) "
            f"ON CONFLICT(college_id) DO UPDATE SET "
@@ -690,6 +732,45 @@ def upsert_colleges_directory(rows: Iterable[Dict[str, Any]], db_path: str = DB_
     with connect(db_path) as conn:
         conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
     return len(rows)
+
+
+_RANK_COLS = ["college_id", "agency", "agency_id", "year", "stream", "rank",
+              "out_of", "category_ranking", "logo", "scraped_at"]
+
+
+def upsert_college_rankings(rows: Iterable[Dict[str, Any]], db_path: str = DB_PATH) -> int:
+    """Ranking records lifted from the directory payload's rankingData[]."""
+    rows = [r for r in rows if r.get("college_id") is not None]
+    if not rows:
+        return 0
+    ph = ",".join("?" for _ in _RANK_COLS)
+    sql = (f"INSERT INTO college_rankings ({','.join(_RANK_COLS)}) VALUES ({ph}) "
+           f"ON CONFLICT(college_id, agency, year, stream) DO UPDATE SET "
+           + ",".join(f"{c}=excluded.{c}" for c in _RANK_COLS
+                      if c not in ("college_id", "agency", "year", "stream")))
+    with connect(db_path) as conn:
+        conn.executemany(sql, [tuple(r.get(c) for c in _RANK_COLS) for r in rows])
+    return len(rows)
+
+
+def fill_empty_directory_extras(updates: Iterable[Dict[str, Any]],
+                                db_path: str = DB_PATH) -> int:
+    """Write re-extracted directory fields, FILLING ONLY EMPTY COLUMNS.
+
+    A value already present in the table is never replaced, and no row is ever
+    deleted — this is a pure top-up of columns that were previously blank."""
+    updates = [u for u in updates if u.get("college_id") is not None]
+    if not updates:
+        return 0
+    cols = DIRECTORY_EXTRA_NAMES + ["top_course_fees"]
+    sets = ", ".join(
+        f"{c}=CASE WHEN {c} IS NULL OR CAST({c} AS TEXT)='' THEN ? ELSE {c} END"
+        for c in cols)
+    sql = f"UPDATE colleges_directory SET {sets} WHERE college_id=?"
+    with connect(db_path) as conn:
+        conn.executemany(
+            sql, [tuple(u.get(c) for c in cols) + (u["college_id"],) for u in updates])
+    return len(updates)
 
 
 def set_dir_progress(slug: str, status: str, found: int, last_page: int = 0,
