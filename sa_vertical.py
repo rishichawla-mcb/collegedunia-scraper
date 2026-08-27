@@ -46,7 +46,12 @@ STUDY_ABROAD = vb.Vertical(
                  "stream until each slice < ~10k cap). Captures max fields incl. currency and "
                  "program_url; derives universities + countries + exam requirements.",
                  sa_scraper.run_programs, depends_on=["facets"]),
-        # Future phases slot in here: program_details, university_enrich, scholarships,
+        vb.Phase("scholarships", "③ Scholarships",
+                 "Sweep collegedunia.com/scholarship (591 across ~29 pages), then read each "
+                 "scholarship's own page for highlights, eligibility, application, selection "
+                 "and description. Detail pass is self-draining, so it resumes automatically.",
+                 sa_scraper.run_scholarships),
+        # Future phases slot in here: program_details, university_enrich,
         # verification — each a Phase with its own runner. No framework change needed.
     ],
 )

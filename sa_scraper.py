@@ -42,8 +42,116 @@ MAX_PAGES = RESULT_CAP // PAGE_SIZE    # 500 — hard guard
 SPLIT_ORDER = ["country", "course_type", "stream", "head_short_form"]
 
 
+SCHOLARSHIP_URL = f"{SITE}/scholarship"
+SCHOLARSHIP_PAGE_SIZE = 21          # observed rows per listing page
+MAX_SCHOLARSHIP_PAGES = 200         # safety cap (29 pages observed)
+
+
 class StopRequested(Exception):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Scholarships (collegedunia.com/scholarship)
+# ---------------------------------------------------------------------------
+# Both the listing row's `content` and the detail page's `highlights` are
+# [{label, value}] blocks. One label map serves both.
+_SCHOL_LABELS = {
+    "amount": "amount_text",
+    "type": "scholarship_type",
+    "scholarship type": "scholarship_type",
+    "level of study": "level_of_study",
+    "offered by": "offered_by",
+    "organization": "organization",
+    "application deadline": "deadline",
+    "deadline": "deadline",
+    "number of scholarships": "num_scholarships",
+    "renewability": "renewability",
+    "international student eligible": "international_eligible",
+    "scholarship website link": "website_link",
+}
+_INR_RE = re.compile(r"₹\s*([\d,]+)")
+_PAREN_RE = re.compile(r"\(([^)]+)\)")
+
+
+def parse_scholarship_amount(text: Optional[str]):
+    """'₹1,436,100 ($15,000)' -> (1436100, 15000, 'USD')."""
+    if not text:
+        return None, None, None
+    inr = None
+    m = _INR_RE.search(text)
+    if m:
+        inr = parse_amount(m.group(1))
+    native_amt = native_cur = None
+    p = _PAREN_RE.search(text)
+    if p:
+        native_cur, native_amt = parse_native_fee(p.group(1))
+    return inr, native_amt, native_cur
+
+
+def _label_block(items) -> Dict[str, Any]:
+    """Flatten a [{label, value, url?}] block onto our column names."""
+    out: Dict[str, Any] = {}
+    for it in (items or []):
+        if not isinstance(it, dict):
+            continue
+        col = _SCHOL_LABELS.get(str(it.get("label") or "").strip().lower())
+        if not col:
+            continue
+        val = it.get("url") or it.get("value")
+        if val in (None, "", "N/A"):
+            continue
+        out[col] = str(val).strip()
+    if "num_scholarships" in out:
+        out["num_scholarships"] = _to_int(out["num_scholarships"])
+    if out.get("amount_text"):
+        inr, nat, cur = parse_scholarship_amount(out["amount_text"])
+        out["amount_inr"], out["amount_native"], out["amount_currency"] = inr, nat, cur
+    return out
+
+
+def sa_parse_scholarship(s: Dict[str, Any], job_id: Optional[int] = None) -> Dict[str, Any]:
+    """One listing row: {id, title, url, content:[{label,value}]}."""
+    row = {
+        "scholarship_id": _to_int(s.get("id")),
+        "title": (s.get("title") or "").strip(),
+        "url": abs_url(s.get("url")),
+        "raw_json": json.dumps(s, ensure_ascii=False),
+        "scraped_at": time.time(),
+        "source_job_id": job_id,
+    }
+    row.update(_label_block(s.get("content")))
+    return row
+
+
+def sa_parse_scholarship_detail(pageprops: Dict[str, Any]) -> Dict[str, Any]:
+    """Detail page -> highlights + the HTML eligibility/application/selection
+    blocks + the article description."""
+    r = (pageprops or {}).get("response") or {}
+    out = _label_block(r.get("highlights"))
+    art = r.get("article") or {}
+    if isinstance(art, dict) and art.get("description"):
+        out["description"] = str(art["description"])[:200000]
+    for key in ("eligibility", "application", "selection"):
+        v = r.get(key)
+        if isinstance(v, str) and v.strip():
+            out[key] = v[:200000]
+        elif isinstance(v, (list, dict)) and v:
+            out[key] = json.dumps(v, ensure_ascii=False)[:200000]
+    countries = r.get("by_countries")
+    if isinstance(countries, list) and countries:
+        out["countries"] = ", ".join(
+            str(c.get("name") or "").replace("Scholarships in ", "").strip()
+            for c in countries if isinstance(c, dict) and c.get("name"))
+    return out
+
+
+def fetch_scholarship_page(client: "Client", page: int) -> Dict[str, Any]:
+    """One listing page. Data is server-rendered into __NEXT_DATA__ (there is no
+    JSON endpoint for this section), so this reads pageProps.response."""
+    url = SCHOLARSHIP_URL if page <= 1 else f"{SCHOLARSHIP_URL}?page={int(page)}"
+    pp = _nextdata_pageprops(client.get_text(url))
+    return (pp or {}).get("response") or {}
 
 
 # ---------------------------------------------------------------------------
@@ -465,5 +573,146 @@ def run_programs(job_id: int, cfg: Dict[str, Any], log: Callable[[str], None]) -
     except Exception as e:  # noqa: BLE001
         sa_db.update_job(job_id, status="error", finished_at=time.time(),
                          message=f"{str(e)[:200]}")
+        log(f"ERROR: {e}")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Phase: Scholarships — listing sweep, then per-scholarship detail enrichment
+# ---------------------------------------------------------------------------
+def run_scholarships(job_id: int, cfg: Dict[str, Any], log: Callable[[str], None]) -> None:
+    """Two passes on one job:
+
+      1. LISTING  — walk /scholarship?page=N to the last page, staging one row
+                    per scholarship (id, title, url + the content label block).
+      2. DETAIL   — for every scholarship whose detail page has not been fetched,
+                    read /scholarship/<id>-<slug> for highlights, eligibility,
+                    application, selection and the description.
+
+    The detail pass is driven by a self-draining query (detail_scraped_at IS
+    NULL), so an interrupted run resumes with no separate progress table. Detail
+    writes never blank a value the listing already provided.
+    """
+    merged = {**shared_proxy_cfg(), **cfg}
+    stats = Stats()
+    adaptive = AdaptiveDelay(float(merged.get("delay", 1.0)),
+                             enabled=bool(merged.get("adaptive", True)))
+    client = Client(ProxyManager.from_config(merged), log=log,
+                    max_retries=int(merged.get("max_retries", 5)),
+                    backoff=float(merged.get("backoff", 4)),
+                    stats=stats, adaptive=adaptive)
+    budget_bytes = int(float(cfg.get("budget_mb", 0)) * 1024 * 1024)
+    budget_reqs = int(cfg.get("budget_requests", 0) or 0)
+    incremental = bool(cfg.get("incremental_promote", True)) and bool(cfg.get("staging", True))
+    want_details = bool(cfg.get("fetch_details", True))
+    max_pages = int(cfg.get("max_pages", MAX_SCHOLARSHIP_PAGES) or MAX_SCHOLARSHIP_PAGES)
+
+    def budget_hit() -> bool:
+        reqs, byts, _ = stats.snapshot()
+        return bool((budget_bytes and byts >= budget_bytes)
+                    or (budget_reqs and reqs >= budget_reqs))
+
+    def maybe_flush():
+        if incremental:
+            try:
+                sa_db.flush_job_staging(job_id)
+            except Exception:  # noqa: BLE001
+                pass
+
+    listed = detailed = 0
+    try:
+        # ---------------- pass 1: listing ----------------
+        sa_db.update_job(job_id, status="running", message="scholarships: listing…")
+        first = fetch_scholarship_page(client, 1)
+        total = _to_int(first.get("total_count")) or 0
+        last = _to_int((first.get("paginate") or {}).get("last")) or 1
+        last = min(last, max_pages)
+        sa_db.update_job(job_id, total_units=total,
+                         message=f"{total} scholarships across {last} pages")
+        log(f"Scholarships: {total} total, {last} listing pages.")
+
+        page, data = 1, first
+        while page <= last:
+            if sa_db.stop_requested(job_id):
+                raise StopRequested()
+            if budget_hit():
+                raise BudgetExceeded("budget reached")
+            if data is None:
+                data = fetch_scholarship_page(client, page)
+            rows = [sa_parse_scholarship(s, job_id)
+                    for s in (data.get("scholarships") or [])
+                    if isinstance(s, dict) and s.get("id")]
+            if rows:
+                sa_db.write_rows(job_id, cfg, "sa_scholarships", rows)
+                listed += len(rows)
+            maybe_flush()
+            reqs, byts, _ = stats.snapshot()
+            sa_db.update_job(job_id, done_units=listed, items_written=listed,
+                             req_count=reqs, bytes_count=byts,
+                             message=f"listing p{page}/{last} · {listed} scholarships")
+            log(f"  listing p{page}/{last}: +{len(rows)} (total {listed})")
+            if not rows:
+                break
+            page += 1
+            data = None
+            time.sleep(adaptive.value())
+
+        maybe_flush()   # details read from master, so promote the listing first
+
+        # ---------------- pass 2: detail ----------------
+        if want_details:
+            pending = sa_db.scholarships_pending_detail(limit=cfg.get("limit"))
+            log(f"Scholarship details: {len(pending)} pending.")
+            sa_db.update_job(job_id, total_units=len(pending) or listed,
+                             message=f"details: 0/{len(pending)}")
+            for i, s in enumerate(pending, start=1):
+                if sa_db.stop_requested(job_id):
+                    raise StopRequested()
+                if budget_hit():
+                    raise BudgetExceeded("budget reached")
+                try:
+                    pp = _nextdata_pageprops(client.get_text(s["url"]))
+                    fields = sa_parse_scholarship_detail(pp)
+                    sa_db.update_scholarship_details(s["scholarship_id"], fields)
+                    if fields:
+                        detailed += 1
+                except Exception as err:  # noqa: BLE001
+                    # Blocked/failed pages keep detail_scraped_at NULL, so they
+                    # stay in the queue for the next run rather than being lost.
+                    log(f"  scholarship {s['scholarship_id']} err: {str(err)[:70]}")
+                if i % 10 == 0:
+                    reqs, byts, _ = stats.snapshot()
+                    sa_db.update_job(job_id, done_units=i, items_written=detailed,
+                                     req_count=reqs, bytes_count=byts,
+                                     message=f"details {i}/{len(pending)} · {detailed} enriched")
+                time.sleep(adaptive.value())
+
+        reqs, byts, _ = stats.snapshot()
+        msg = (f"done: {listed} scholarships listed"
+               + (f", {detailed} detailed" if want_details else "")
+               + f", {byts/1048576:.1f} MB")
+        if cfg.get("staging", True):
+            try:
+                sa_db.flush_job_staging(job_id)
+            except Exception:  # noqa: BLE001
+                pass
+        sa_db.update_job(job_id, status="completed", finished_at=time.time(),
+                         req_count=reqs, bytes_count=byts, message=msg)
+        log(msg)
+        send_notification(cfg, "Study Abroad scholarships complete", msg, log)
+    except StopRequested:
+        maybe_flush()
+        sa_db.update_job(job_id, status="stopped", finished_at=time.time(),
+                         message=f"stopped by user ({listed} listed, {detailed} detailed)")
+        log("Stopped by user.")
+    except BudgetExceeded as e:
+        maybe_flush()
+        sa_db.update_job(job_id, status="stopped", finished_at=time.time(),
+                         message=f"budget reached ({listed} listed, {detailed} detailed); resume to continue")
+        log(f"Budget stop: {e}")
+    except Exception as e:  # noqa: BLE001
+        maybe_flush()
+        sa_db.update_job(job_id, status="error", finished_at=time.time(),
+                         message=str(e)[:200])
         log(f"ERROR: {e}")
         raise

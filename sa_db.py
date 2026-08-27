@@ -111,6 +111,37 @@ CREATE TABLE IF NOT EXISTS sa_program_exams (
     PRIMARY KEY (program_id, short_form)
 );
 
+-- Study-abroad scholarships (collegedunia.com/scholarship).
+-- Listing gives id/title/url + a label:value 'content' block; the detail page
+-- adds highlights plus HTML blocks for eligibility / application / selection.
+CREATE TABLE IF NOT EXISTS sa_scholarships (
+    scholarship_id  INTEGER PRIMARY KEY,
+    title           TEXT,
+    url             TEXT,
+    amount_text     TEXT,                   -- '₹1,436,100 ($15,000)'
+    amount_inr      INTEGER,
+    amount_native   INTEGER,
+    amount_currency TEXT,
+    scholarship_type TEXT,                  -- 'College-Specific, Merit-Based'
+    level_of_study  TEXT,
+    offered_by      TEXT,
+    organization    TEXT,
+    deadline        TEXT,
+    num_scholarships INTEGER,
+    renewability    TEXT,
+    international_eligible TEXT,
+    website_link    TEXT,
+    countries       TEXT,
+    description     TEXT,                   -- article.description (HTML)
+    eligibility     TEXT,                   -- HTML block
+    application     TEXT,                   -- HTML block
+    selection       TEXT,                   -- HTML block
+    detail_scraped_at REAL,
+    raw_json        TEXT, scraped_at REAL, source_job_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS sa_idx_schol_type ON sa_scholarships(scholarship_type);
+CREATE INDEX IF NOT EXISTS sa_idx_schol_level ON sa_scholarships(level_of_study);
+
 -- Per-partition progress for resumable, partitioned crawling.
 CREATE TABLE IF NOT EXISTS sa_program_progress (
     partition_key TEXT PRIMARY KEY,         -- e.g. 'country=13|course_type=Bachelor'
@@ -192,11 +223,22 @@ def init_db(db_path: str = SA_DB_PATH) -> None:
 # Upserts (idempotent — unique keys make duplicates impossible)
 # ---------------------------------------------------------------------------
 def _upsert(conn, table: str, cols: List[str], key_cols: List[str],
-            rows: List[Dict[str, Any]]) -> int:
+            rows: List[Dict[str, Any]], preserve_nonempty: bool = False) -> int:
+    """preserve_nonempty=True makes the upsert non-destructive: an incoming NULL
+    or '' never replaces a value already stored. Needed where more than one pass
+    writes the same row — e.g. the scholarship listing pass carries no
+    description/eligibility, and would otherwise blank what the detail pass
+    wrote (and reset detail_scraped_at, re-queuing every row forever)."""
     if not rows:
         return 0
     ph = ",".join("?" for _ in cols)
-    setc = ",".join(f"{c}=excluded.{c}" for c in cols if c not in key_cols)
+    if preserve_nonempty:
+        setc = ",".join(
+            f"{c}=CASE WHEN excluded.{c} IS NULL OR CAST(excluded.{c} AS TEXT)='' "
+            f"THEN {table}.{c} ELSE excluded.{c} END"
+            for c in cols if c not in key_cols)
+    else:
+        setc = ",".join(f"{c}=excluded.{c}" for c in cols if c not in key_cols)
     sql = (f"INSERT INTO {table} ({','.join(cols)}) VALUES ({ph}) "
            f"ON CONFLICT({','.join(key_cols)}) DO UPDATE SET {setc}")
     conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
@@ -241,6 +283,66 @@ def upsert_program_exams(rows, db_path: str = SA_DB_PATH) -> int:
         return _upsert(conn, "sa_program_exams", _EXAM_COLS, ["program_id", "short_form"], rows)
 
 
+_SCHOL_COLS = ["scholarship_id", "title", "url", "amount_text", "amount_inr",
+               "amount_native", "amount_currency", "scholarship_type",
+               "level_of_study", "offered_by", "organization", "deadline",
+               "num_scholarships", "renewability", "international_eligible",
+               "website_link", "countries", "description", "eligibility",
+               "application", "selection", "detail_scraped_at", "raw_json",
+               "scraped_at", "source_job_id"]
+
+# Columns the DETAIL pass may fill. Never blanked — see update_scholarship_details.
+_SCHOL_DETAIL_COLS = ["scholarship_type", "level_of_study", "offered_by",
+                      "organization", "deadline", "num_scholarships",
+                      "renewability", "international_eligible", "website_link",
+                      "countries", "description", "eligibility", "application",
+                      "selection", "amount_text", "amount_inr", "amount_native",
+                      "amount_currency"]
+
+
+def upsert_scholarships(rows, db_path: str = SA_DB_PATH) -> int:
+    """Listing-pass writer. Non-destructive: re-running the listing must not
+    blank the description/eligibility/application/selection the detail pass
+    filled, nor reset detail_scraped_at (which would re-queue every row)."""
+    rows = [r for r in rows if r.get("scholarship_id")]
+    with connect(db_path) as conn:
+        return _upsert(conn, "sa_scholarships", _SCHOL_COLS, ["scholarship_id"],
+                       rows, preserve_nonempty=True)
+
+
+def update_scholarship_details(scholarship_id: int, fields: Dict[str, Any],
+                               db_path: str = SA_DB_PATH) -> None:
+    """Merge detail-page fields onto an existing scholarship row.
+
+    NON-DESTRUCTIVE: an empty incoming value never replaces a value already
+    stored (the listing pass fills some of these first). Only detail_scraped_at
+    is unconditionally refreshed, so the row leaves the pending queue."""
+    sets = ", ".join(
+        f"{c}=CASE WHEN ? IS NULL OR ?='' THEN {c} ELSE ? END"
+        for c in _SCHOL_DETAIL_COLS) + ", detail_scraped_at=?"
+    vals: List[Any] = []
+    for c in _SCHOL_DETAIL_COLS:
+        v = fields.get(c)
+        vals += [v, v, v]
+    vals += [time.time(), scholarship_id]
+    with connect(db_path) as conn:
+        conn.execute(f"UPDATE sa_scholarships SET {sets} WHERE scholarship_id=?", vals)
+
+
+def scholarships_pending_detail(db_path: str = SA_DB_PATH,
+                                limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Self-draining work list: every scholarship whose detail page has not been
+    fetched yet. A row drops out the moment it is filled, so a restart resumes
+    automatically with no separate progress table."""
+    sql = ("SELECT scholarship_id, url FROM sa_scholarships "
+           "WHERE detail_scraped_at IS NULL AND COALESCE(url,'')<>'' "
+           "ORDER BY scholarship_id")
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    with connect(db_path) as conn:
+        return [dict(r) for r in conn.execute(sql).fetchall()]
+
+
 def save_facets(rows, db_path: str = SA_DB_PATH) -> int:
     with connect(db_path) as conn:
         return _upsert(conn, "sa_facets",
@@ -256,12 +358,14 @@ STAGE_PK = {
     "sa_universities": lambda r: str(r.get("university_id")),
     "sa_countries": lambda r: str(r.get("country_code")),
     "sa_program_exams": lambda r: f"{r.get('program_id')}|{r.get('short_form')}",
+    "sa_scholarships": lambda r: str(r.get("scholarship_id")),
 }
 _UPSERTERS = {
     "sa_programs": upsert_programs,
     "sa_universities": upsert_universities,
     "sa_countries": upsert_countries,
     "sa_program_exams": upsert_program_exams,
+    "sa_scholarships": upsert_scholarships,
 }
 PROMOTE_CHUNK = int(os.environ.get("CD_SA_PROMOTE_CHUNK", "2500"))
 
@@ -394,7 +498,7 @@ def wipe_sa(full: bool = False, db_path: str = SA_DB_PATH) -> Dict[str, int]:
     countries/exams/progress/staging); full=True also clears jobs/logs/facets/
     snapshots. Never touches domestic tables."""
     tables = ["sa_programs", "sa_universities", "sa_countries", "sa_program_exams",
-              "sa_program_progress", "sa_staging"]
+              "sa_scholarships", "sa_program_progress", "sa_staging"]
     if full:
         tables += ["sa_jobs", "sa_logs", "sa_facets", "sa_snapshots"]
     out: Dict[str, int] = {}
@@ -548,6 +652,8 @@ def counts(db_path: str = SA_DB_PATH) -> Dict[str, int]:
             "programs_with_fee": one("SELECT COUNT(*) FROM sa_programs WHERE fee_native_amount IS NOT NULL"),
             "distinct_currencies": one("SELECT COUNT(DISTINCT fee_currency) FROM sa_programs WHERE fee_currency<>''"),
             "partitions_done": one("SELECT COUNT(*) FROM sa_program_progress WHERE status='done'"),
+            "scholarships": one("SELECT COUNT(*) FROM sa_scholarships"),
+            "scholarships_detailed": one("SELECT COUNT(*) FROM sa_scholarships WHERE detail_scraped_at IS NOT NULL"),
         }
 
 
