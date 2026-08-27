@@ -575,13 +575,21 @@ def get_done_course_ids(db_path: str = DB_PATH) -> set:
 
 
 def list_colleges_to_enrich(db_path: str = DB_PATH, where: str = "", params: tuple = (),
-                            include_done: bool = False, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+                            include_done: bool = False, limit: Optional[int] = None,
+                            need_basic: bool = False) -> List[Dict[str, Any]]:
+    """Colleges still needing Phase 3.
+
+    need_basic=True also returns colleges that were enriched by an older build
+    and therefore have JSON-LD data but no `basic_info`. Without it those rows
+    are permanently invisible to the phase (enriched_at is already set), and the
+    only way to collect basic_info would be a full force-rescrape."""
     sql = "SELECT college_id, link FROM colleges"
     conds = []
     if where:
         conds.append(where)
     if not include_done:
-        conds.append("(enriched_at IS NULL)")
+        conds.append("(enriched_at IS NULL OR basic_scraped_at IS NULL)"
+                     if need_basic else "(enriched_at IS NULL)")
     conds.append("link IS NOT NULL AND link<>''")
     if conds:
         sql += " WHERE " + " AND ".join(conds)

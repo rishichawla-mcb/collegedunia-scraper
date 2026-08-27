@@ -1227,11 +1227,27 @@ with tab_run:
             n_total = conn.execute("SELECT COUNT(*) FROM colleges").fetchone()[0]
             n_done = conn.execute(
                 "SELECT COUNT(*) FROM colleges WHERE enriched_at IS NOT NULL").fetchone()[0]
+            try:
+                n_basic = conn.execute(
+                    "SELECT COUNT(*) FROM colleges "
+                    "WHERE basic_scraped_at IS NOT NULL").fetchone()[0]
+            except Exception:
+                n_basic = 0
         pending = n_total - n_done
-        e1, e2, e3 = st.columns(3)
+        e1, e2, e3, e4 = st.columns(4)
         e1.metric("Colleges", f"{n_total:,}")
-        e2.metric("Enriched", f"{n_done:,}")
+        e2.metric("Enriched (JSON-LD)", f"{n_done:,}")
         e3.metric("Pending", f"{pending:,}")
+        e4.metric("With basic_info", f"{n_basic:,}",
+                  help="Colleges that also have the richer __NEXT_DATA__ fields "
+                       "(year founded, NAAC grade, affiliation, all phone numbers, "
+                       "pincode…). Colleges enriched by an older build have none, "
+                       "and are re-queued automatically when basic_info is enabled.")
+        if n_basic < n_total:
+            st.caption(f"ℹ️ **{n_total - n_basic:,} colleges have no `basic_info` yet.** "
+                       "With the option below ticked they are re-queued — each is a "
+                       "~300 KB page fetch, so set a bandwidth cap and run in chunks; "
+                       "the queue is self-draining and resumes where it stopped.")
         if n_total == 0:
             st.info("Run Phase 2 first so there are colleges to enrich.")
         escope = st.radio("Scope", ["All not-yet-enriched", "Filter by city", "Test (50)"],

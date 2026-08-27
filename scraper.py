@@ -1516,7 +1516,8 @@ def run_enrichment(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
     colleges = db.list_colleges_to_enrich(
         db_path=db_path, where=cfg.get("college_where", ""),
         params=tuple(cfg.get("college_where_params", [])),
-        include_done=bool(cfg.get("force_rescrape")), limit=cfg.get("limit"))
+        include_done=bool(cfg.get("force_rescrape")), limit=cfg.get("limit"),
+        need_basic=bool(cfg.get("basic_info", True)))
     total = len(colleges)
     db.update_job(job_id, status="running", total_units=total,
                   message=f"{total} colleges to enrich", db_path=db_path)
