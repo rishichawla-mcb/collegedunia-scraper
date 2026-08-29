@@ -33,6 +33,7 @@ from collections import Counter
 import html as _html
 import itertools
 import json
+import os
 import random
 import re
 import threading
@@ -136,7 +137,49 @@ def sticky_gateway(url: str, session_id: Optional[str]) -> str:
 
 
 class BlockedError(Exception):
-    """Raised when the site appears to be blocking us (403/429/HTML challenge)."""
+    """Raised when the site appears to be blocking us (403/429/HTML challenge).
+
+    Carries the HTTP status and any `Retry-After` the server asked for, so the
+    retry loop can honour the server's own pacing instead of guessing."""
+
+    def __init__(self, message: str, status: Optional[int] = None,
+                 retry_after: Optional[float] = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+
+# Upper bound on any single backoff sleep. Without a cap, exponential growth on
+# max_retries=8 would park a worker for over an hour on one URL.
+BACKOFF_CAP = float(os.environ.get("CD_BACKOFF_CAP", "120"))
+
+
+def retry_after_seconds(resp) -> Optional[float]:
+    """Parse a Retry-After header. Accepts delta-seconds or an HTTP-date.
+    Returns None when absent or unparseable."""
+    raw = ""
+    try:
+        raw = (resp.headers.get("Retry-After") or "").strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        when = parsedate_to_datetime(raw)
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            from datetime import timezone as _tz
+            when = when.replace(tzinfo=_tz.utc)
+        from datetime import datetime as _dt, timezone as _tz
+        return max(0.0, (when - _dt.now(_tz.utc)).total_seconds())
+    except Exception:
+        return None
 
 
 # Bot-interstitials return HTTP 200 with an HTML body, so status codes alone
@@ -378,19 +421,76 @@ class Client:
         self.session_id: Optional[str] = None  # set for sticky-IP pagination
         self.verbose = True                    # per-request live logging (bounded by log prune)
 
-    def _maybe_rotate(self, err: Exception) -> bool:
-        """A dead proxy tunnel (502 NO_HOST_CONNECTION / 'Unable to connect to
-        proxy') won't recover by retrying the SAME sticky IP. On a proxy
-        connection error, rotate the sticky session id so the next attempt gets
-        a fresh upstream IP. Site blocks (403/429) keep the same IP."""
-        is_proxy_err = isinstance(err, requests.exceptions.ProxyError) or (
-            isinstance(err, requests.exceptions.ConnectionError)
-            and ("NO_HOST_CONNECTION" in str(err) or "Unable to connect to proxy" in str(err)))
-        if self.session_id and is_proxy_err:
-            base = self.session_id.split("~")[0]
-            self.session_id = f"{base}~{random.randint(0, 10**6)}"
-            return True
-        return False
+    @staticmethod
+    def _classify(err: Exception) -> str:
+        """'proxy' = dead tunnel, 'block' = the SITE refused us, else 'other'."""
+        if isinstance(err, requests.exceptions.ProxyError):
+            return "proxy"
+        if isinstance(err, requests.exceptions.ConnectionError) and (
+                "NO_HOST_CONNECTION" in str(err)
+                or "Unable to connect to proxy" in str(err)):
+            return "proxy"
+        if isinstance(err, BlockedError):
+            return "block"
+        return "other"
+
+    def _rotate(self, kind: str) -> bool:
+        """Get a fresh upstream IP by changing the sticky session id.
+
+        Both failure kinds need this. A dead tunnel obviously won't heal on the
+        same IP — but neither will a site block: once collegedunia has decided
+        an IP is a bot, every retry through that same IP is spent for nothing.
+        That is exactly how Phase 1 died ('Failed after 5 attempts: HTTP 403' —
+        five attempts, one burned IP). Only possible when a sticky gateway is
+        configured; with a plain proxy list or no proxy there is nothing to
+        rotate and this is a no-op."""
+        if not self.session_id or kind not in ("proxy", "block"):
+            return False
+        base = self.session_id.split("~")[0]
+        self.session_id = f"{base}~{random.randint(0, 10**6)}"
+        return True
+
+    def _retry_wait(self, attempt: int, retry_after: Optional[float] = None) -> float:
+        """Exponential backoff with jitter, capped. A server-supplied
+        Retry-After always wins — if the site tells us how long to wait,
+        arguing with it just earns a longer ban."""
+        if retry_after is not None:
+            return max(1.0, min(float(retry_after), BACKOFF_CAP))
+        wait = self.backoff * (2 ** (attempt - 1))
+        return min(wait, BACKOFF_CAP) + random.uniform(0, 2)
+
+    def _on_failure(self, err: Exception, proxy, attempt: int, label: str) -> None:
+        """Shared failure path for every fetch loop: account, rotate, throttle,
+        log, sleep. Kept in one place so the four callers cannot drift apart."""
+        self.stats.add(blocks=1)
+        self.pm.report_failure(proxy)
+        kind = self._classify(err)
+        rotated = self._rotate(kind)
+        # Only a real site block should ramp the adaptive throttle. A dead proxy
+        # tunnel says nothing about how fast the site wants us to go.
+        if self.adaptive and kind == "block":
+            self.adaptive.on_block()
+        ra = getattr(err, "retry_after", None)
+        last = attempt >= self.max_retries
+        wait = 0.0 if last else self._retry_wait(attempt, ra)
+        via = proxy.url if proxy else "direct"
+        note = ""
+        if rotated:
+            note += " [fresh proxy IP]"
+        if ra is not None:
+            note += f" [server asked for {ra:.0f}s]"
+        self.log(f"  ! {label} attempt {attempt}/{self.max_retries} via {via} "
+                 f"failed: {err}{note}"
+                 + ("" if last else f" -> retry in {wait:.0f}s"))
+        if wait:
+            time.sleep(wait)
+
+    def _check_blocked(self, resp) -> None:
+        """Raise BlockedError for the statuses that mean 'the site refused',
+        capturing any Retry-After the server sent."""
+        if resp.status_code in (403, 429, 503):
+            raise BlockedError(f"HTTP {resp.status_code}", status=resp.status_code,
+                               retry_after=retry_after_seconds(resp))
 
     def fetch(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         params = {"data": encode_payload(payload)}
@@ -403,8 +503,7 @@ class Client:
                     proxies=proxy.as_dict() if proxy else None, timeout=self.timeout,
                 )
                 self.stats.add(requests=1, byts=len(resp.content or b""))
-                if resp.status_code in (403, 429, 503):
-                    raise BlockedError(f"HTTP {resp.status_code}")
+                self._check_blocked(resp)
                 resp.raise_for_status()
                 ctype = resp.headers.get("Content-Type", "")
                 if "json" not in ctype and not resp.text.lstrip().startswith("{"):
@@ -421,19 +520,7 @@ class Client:
                 return data
             except (BlockedError, requests.RequestException, ValueError) as err:
                 last_err = err
-                self.stats.add(blocks=1)
-                self.pm.report_failure(proxy)
-                rotated = self._maybe_rotate(err)
-                # Proxy-tunnel errors get a fresh IP, but must NOT ramp the
-                # adaptive throttle — that's only for real site rate-limiting.
-                if self.adaptive and not rotated:
-                    self.adaptive.on_block()
-                wait = self.backoff * attempt + random.uniform(0, 2)
-                via = proxy.url if proxy else "direct"
-                self.log(f"  ! attempt {attempt}/{self.max_retries} via {via} failed: "
-                         f"{err}{' [rotating to fresh proxy IP]' if rotated else ''} "
-                         f"-> retry in {wait:.0f}s")
-                time.sleep(wait)
+                self._on_failure(err, proxy, attempt, f"page {payload.get('page')}")
         raise RuntimeError(f"Failed after {self.max_retries} attempts: {last_err}")
 
     def get_text(self, url: str) -> str:
@@ -447,8 +534,7 @@ class Client:
                     url, headers=base_headers(),
                     proxies=proxy.as_dict() if proxy else None, timeout=self.timeout)
                 self.stats.add(requests=1, byts=len(resp.content or b""))
-                if resp.status_code in (403, 429, 503):
-                    raise BlockedError(f"HTTP {resp.status_code}")
+                self._check_blocked(resp)
                 resp.raise_for_status()
                 # A challenge page arrives as HTTP 200 + HTML. Treat it as a block
                 # so it is retried / IP-rotated, instead of being handed to a
@@ -463,11 +549,7 @@ class Client:
                 return resp.text
             except (BlockedError, requests.RequestException) as err:
                 last_err = err
-                self.stats.add(blocks=1)
-                self.pm.report_failure(proxy)
-                if not self._maybe_rotate(err) and self.adaptive:
-                    self.adaptive.on_block()
-                time.sleep(self.backoff * attempt + random.uniform(0, 2))
+                self._on_failure(err, proxy, attempt, f"GET …{url[-46:]}")
         raise RuntimeError(f"GET failed after {self.max_retries} attempts: {last_err}")
 
     def fetch_courses_list(self, college_id: Any, page: int) -> Dict[str, Any]:
@@ -486,8 +568,7 @@ class Client:
                     COURSES_LIST_API, params=params, headers=headers,
                     proxies=proxy.as_dict() if proxy else None, timeout=self.timeout)
                 self.stats.add(requests=1, byts=len(resp.content or b""))
-                if resp.status_code in (403, 429, 503):
-                    raise BlockedError(f"HTTP {resp.status_code}")
+                self._check_blocked(resp)
                 resp.raise_for_status()
                 ctype = resp.headers.get("Content-Type", "")
                 if "json" not in ctype and not resp.text.lstrip().startswith("{"):
@@ -505,16 +586,8 @@ class Client:
                 return data
             except (BlockedError, requests.RequestException, ValueError) as err:
                 last_err = err
-                self.stats.add(blocks=1)
-                self.pm.report_failure(proxy)
-                rotated = self._maybe_rotate(err)
-                if self.adaptive and not rotated:
-                    self.adaptive.on_block()
-                wait = self.backoff * attempt + random.uniform(0, 2)
-                self.log(f"  ! courses-list col {college_id} p{page} attempt "
-                         f"{attempt}/{self.max_retries} failed: {err}"
-                         f"{' [rotating IP]' if rotated else ''} -> retry in {wait:.0f}s")
-                time.sleep(wait)
+                self._on_failure(err, proxy, attempt,
+                                 f"courses-list col {college_id} p{page}")
         raise RuntimeError(f"courses-list failed after {self.max_retries} attempts: {last_err}")
 
     def fetch_listing(self, slug: str, page: int) -> Dict[str, Any]:
@@ -532,8 +605,7 @@ class Client:
                     LISTING_API, params=params, headers=headers,
                     proxies=proxy.as_dict() if proxy else None, timeout=self.timeout)
                 self.stats.add(requests=1, byts=len(resp.content or b""))
-                if resp.status_code in (403, 429, 503):
-                    raise BlockedError(f"HTTP {resp.status_code}")
+                self._check_blocked(resp)
                 resp.raise_for_status()
                 ctype = resp.headers.get("Content-Type", "")
                 if "json" not in ctype and not resp.text.lstrip().startswith("{"):
@@ -551,15 +623,7 @@ class Client:
                 return data
             except (BlockedError, requests.RequestException, ValueError) as err:
                 last_err = err
-                self.stats.add(blocks=1)
-                self.pm.report_failure(proxy)
-                rotated = self._maybe_rotate(err)
-                if self.adaptive and not rotated:
-                    self.adaptive.on_block()
-                wait = self.backoff * attempt + random.uniform(0, 2)
-                self.log(f"  ! listing {slug} p{page} attempt {attempt}/{self.max_retries} "
-                         f"failed: {err}{' [rotating IP]' if rotated else ''} -> retry in {wait:.0f}s")
-                time.sleep(wait)
+                self._on_failure(err, proxy, attempt, f"listing {slug} p{page}")
         raise RuntimeError(f"listing failed after {self.max_retries} attempts: {last_err}")
 
 
