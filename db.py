@@ -39,7 +39,9 @@ def fee_to_inr(value: Any) -> Optional[int]:
     if isinstance(value, (int, float)):
         return int(value)
     t = str(value).lower().replace(",", "").replace("₹", "").replace("inr", "").strip()
-    m = re.search(r"([\d.]+)\s*(lakhs?|crores?|cr|l|k|thousand)?", t)
+    # The number must START with a digit. Without this, a "Rs." prefix makes
+    # the old [\d.]+ match the bare "." and the whole string parse as None.
+    m = re.search(r"(\d[\d.]*)\s*(lakhs?|crores?|cr|l|k|thousand)?", t)
     if not m:
         return None
     try:
