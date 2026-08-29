@@ -18,6 +18,7 @@ import streamlit as st
 
 import vertical_base as vb
 import sa_vertical  # noqa: F401  registers 'studyabroad'
+_VERTICALS = (sa_vertical,)   # referenced so pyflakes keeps the self-registration import
 import sa_db
 import sa_scraper
 import sa_export
@@ -42,7 +43,7 @@ def _agg(sql: str, params=()):
 
 def _shared_proxy_line() -> str:
     mode = _core.get_setting("proxy_mode", "none")
-    gw = _core.get_setting("proxy_gateway", "") or ""
+    gw = _core.proxy_gateway()
     if mode == "gateway" and gw:
         host = gw.split("@")[-1]
         return f"gateway → `{host}`"

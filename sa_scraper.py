@@ -323,7 +323,7 @@ def shared_proxy_cfg() -> Dict[str, Any]:
         g = _core.get_setting
         return {
             "proxy_mode": g("proxy_mode", "none"),
-            "proxy_gateway": g("proxy_gateway", "") or "",
+            "proxy_gateway": _core.proxy_gateway(),
             "proxy_list": [p.strip() for p in (g("proxy_list_text", "") or "").splitlines() if p.strip()],
             "proxy_cooldown": g("proxy_cooldown", 120),
             "delay": float(g("delay", 1.0) or 1.0),

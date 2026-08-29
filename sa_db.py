@@ -16,9 +16,18 @@ BUILD = "2026-07-23a"
 import json
 import os
 import time
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 import db as _core  # reuse db.connect (generic WAL connection) + the SHARED db file.
+
+
+def _redact(config):
+    """Never persist credentials into sa_jobs.config_json — the worker puts them
+    back from env/settings at run time. Mirrors db.redact_secrets."""
+    try:
+        return _core.redact_secrets(config)
+    except Exception:
+        return config
 
 # SHARED database, SEPARATE tables. Study Abroad lives in the SAME data.db as the
 # domestic vertical but only ever touches its own `sa_`-prefixed tables — data
@@ -565,7 +574,7 @@ def create_job(phase: str, config: Dict[str, Any], db_path: str = SA_DB_PATH) ->
         cur = conn.execute(
             "INSERT INTO sa_jobs(vertical,phase,status,config_json,started_at,updated_at) "
             "VALUES('studyabroad',?,?,?,?,?)",
-            (phase, "queued", json.dumps(config), now, now))
+            (phase, "queued", json.dumps(_redact(config)), now, now))
         return cur.lastrowid
 
 

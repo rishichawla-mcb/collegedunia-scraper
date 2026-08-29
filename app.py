@@ -264,7 +264,7 @@ def _start_scheduler():
                 if s.get("enabled") and _t.time() >= float(s.get("next_run") or 0):
                     base = {
                         "proxy_mode": db.get_setting("proxy_mode", "none"),
-                        "proxy_gateway": db.get_setting("proxy_gateway", ""),
+                        "proxy_gateway": db.proxy_gateway(),
                         "proxy_list": [p.strip() for p in
                                        db.get_setting("proxy_list_text", "").splitlines() if p.strip()],
                         "delay": db.get_setting("delay", 1.0),
@@ -305,8 +305,10 @@ def proxy_config_from_ui() -> dict:
         "backoff": st.session_state.get("backoff", 4.0),
         "adaptive": st.session_state.get("adaptive", True),
         "long_cooldown_seconds": st.session_state.get("long_cooldown", 0),
-        "webhook_url": db.get_setting("webhook_url", "") or None,
-        "smtp": db.get_setting("smtp", {}) or {},
+        # Credentials are resolved from env (falling back to settings) and are
+        # stripped again by db.create_job before the config is persisted.
+        "webhook_url": db.webhook_url() or None,
+        "smtp": db.smtp_config(),
         # governance: stage -> validate -> promote
         "staging": st.session_state.get("staging", True),
         "auto_promote": st.session_state.get("auto_promote", True),
@@ -791,9 +793,24 @@ if st.session_state["proxy_mode"] == "list":
     st.session_state["proxy_cooldown"] = st.sidebar.number_input(
         "Cooldown after fail (sec)", 10, 1800, 120, step=10)
 elif st.session_state["proxy_mode"] == "gateway":
-    st.session_state["proxy_gateway"] = st.sidebar.text_input(
-        "Gateway URL", value=db.get_setting("proxy_gateway", ""),
-        placeholder="http://user:pass@gateway.provider.com:7777")
+    _gw_env = bool(os.environ.get("CD_PROXY_GATEWAY"))
+    if _gw_env:
+        # Configured via the environment: show only the host, never the
+        # credentials, and don't let the form overwrite it.
+        st.sidebar.success(f"Gateway from CD_PROXY_GATEWAY → "
+                           f"`{db.proxy_gateway().split('@')[-1]}`")
+        st.session_state["proxy_gateway"] = db.proxy_gateway()
+    else:
+        _gw_stored = db.get_setting("proxy_gateway", "") or ""
+        st.session_state["proxy_gateway"] = st.sidebar.text_input(
+            "Gateway URL", value=_gw_stored,
+            placeholder="http://user:pass@gateway.provider.com:7777")
+        if _gw_stored:
+            st.sidebar.warning(
+                "This URL contains your proxy password and is stored in the "
+                "database in cleartext. Set **CD_PROXY_GATEWAY** in Render, then "
+                "run `python scrub_secrets.py --apply` to clear the stored copy.",
+                icon="🔓")
 
 with st.sidebar.expander("🔔 Notifications"):
     wh = st.text_input("Webhook URL (Slack/Discord/generic)",
@@ -801,17 +818,34 @@ with st.sidebar.expander("🔔 Notifications"):
                        placeholder="https://hooks.slack.com/services/...")
     st.caption("Email (optional)")
     smtp = db.get_setting("smtp", {}) or {}
+    _pw_env = bool(os.environ.get("CD_SMTP_PASSWORD"))
     s_host = st.text_input("SMTP host", value=smtp.get("host", ""))
     c1, c2 = st.columns(2)
     s_port = c1.text_input("Port", value=str(smtp.get("port", 587)))
     s_to = c2.text_input("Send to", value=smtp.get("to", ""))
     s_user = st.text_input("SMTP user", value=smtp.get("user", ""))
-    s_pass = st.text_input("SMTP password", type="password", value=smtp.get("password", ""))
+    if _pw_env:
+        st.success("Password from **CD_SMTP_PASSWORD** (not stored in the database).")
+        s_pass = ""
+    else:
+        # Never render the stored password back into the page. Blank means
+        # "keep what is saved"; typing a value replaces it.
+        s_pass = st.text_input(
+            "SMTP password", type="password", value="",
+            placeholder="•••••• (unchanged)" if smtp.get("password") else "",
+            help="Leave blank to keep the saved password. Better: set "
+                 "CD_SMTP_PASSWORD in Render and clear the stored one with "
+                 "`python scrub_secrets.py --apply`.")
+        if smtp.get("password"):
+            st.warning("A password is stored in the database in cleartext.", icon="🔓")
     if st.button("Save notifications"):
         db.set_setting("webhook_url", wh.strip())
-        db.set_setting("smtp", {"host": s_host.strip(), "port": s_port.strip(),
-                                "to": s_to.strip(), "user": s_user.strip(),
-                                "password": s_pass, "from": s_user.strip()})
+        db.set_setting("smtp", {
+            "host": s_host.strip(), "port": s_port.strip(),
+            "to": s_to.strip(), "user": s_user.strip(),
+            # blank -> keep the existing secret rather than wiping it
+            "password": ("" if _pw_env else (s_pass or smtp.get("password", ""))),
+            "from": s_user.strip()})
         st.success("Notification settings saved.")
 
 if st.sidebar.button("💾 Save settings"):

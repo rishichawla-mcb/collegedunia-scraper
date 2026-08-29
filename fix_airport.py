@@ -77,7 +77,7 @@ def main(apply_changes=False, db_path=None):
             "WHERE basic_info_json IS NOT NULL AND basic_info_json<>''"
         ).fetchall()
 
-        scanned = broken = repaired = unrecoverable = already_ok = 0
+        scanned = broken = unrecoverable = already_ok = 0
         samples = []
         updates = []
 
@@ -120,7 +120,6 @@ def main(apply_changes=False, db_path=None):
             "UPDATE colleges SET nearest_airport=?, "
             "nearest_airport_distance_m=COALESCE(?, nearest_airport_distance_m) "
             "WHERE college_id=?", updates)
-        repaired = conn.total_changes
         conn.commit()
         print(f"\nwrote {len(updates):,} rows.")
 

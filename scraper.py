@@ -1044,14 +1044,26 @@ def _finalize_job(job_id: int, cfg: Dict[str, Any], log: Callable[[str], None],
                       finished_at=time.time(), db_path=db_path)
         return
     incremental = cfg.get("incremental_promote", True)
-    v = db.validate_job(job_id, cfg.get("validation_rules") or {}, db_path=db_path)
+    rules = cfg.get("validation_rules") or {}
     staged = sum(db.staged_summary(job_id, db_path=db_path).values())
-    db.update_job(job_id, quality_score=v["score"], staged_rows=staged, db_path=db_path)
     auto = cfg.get("auto_promote", True)
+
+    # Ordering matters. In STRICT mode the score gates promotion, so it must be
+    # computed from staging BEFORE anything is flushed. In INCREMENTAL mode the
+    # data is already in master and staging has been drained all run, so scoring
+    # it there would just measure the empty tail — score AFTER the final flush,
+    # against the rows this job actually promoted.
+    v = None if incremental else db.validate_job(job_id, rules, db_path=db_path)
+
     if incremental or (v["passed"] and auto):
         summ = db.flush_job_staging(job_id, db_path=db_path)
         db.update_job(job_id, promote_status="promoted", db_path=db_path)
-        tag = ("promoted (incremental, memory-safe)" if incremental
+        if incremental:
+            v = db.validate_job(job_id, rules, db_path=db_path)
+        db.update_job(job_id, quality_score=v["score"], staged_rows=staged,
+                      db_path=db_path)
+        tag = (f"promoted (incremental, memory-safe) · QC {v['score']:.0f}/100"
+               if incremental
                else f"QC {v['score']:.0f}/100 ✓ promoted ({sum(summ.values())} rows)")
         msg = f"{base_msg} · {tag}"
         db.update_job(job_id, status="completed", message=msg,
@@ -1059,6 +1071,8 @@ def _finalize_job(job_id: int, cfg: Dict[str, Any], log: Callable[[str], None],
         log(msg)
         send_notification(cfg, "Collegedunia job promoted", msg, log)
     else:
+        db.update_job(job_id, quality_score=v["score"], staged_rows=staged,
+                      db_path=db_path)
         why = "failed QC" if not v["passed"] else "auto-promote off"
         msg = f"{base_msg} · QC {v['score']:.0f}/100 — staged, awaiting approval ({why})"
         db.update_job(job_id, status="completed", promote_status="pending",

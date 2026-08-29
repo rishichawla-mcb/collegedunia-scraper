@@ -1066,13 +1066,74 @@ def course_enrichment_summary(db_path: str = DB_PATH) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Jobs
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Secrets
+#
+# The proxy gateway URL embeds user:pass, and the SMTP block holds a password.
+# Both used to live only in the `settings` table AND be copied verbatim into
+# every row of jobs.config_json — so a DB file (or an exported job history) was
+# a credential dump. Now:
+#   * an environment variable always wins over the stored value;
+#   * secrets are stripped before a job config is persisted (`redact_secrets`);
+#   * the worker puts them back at run time (`hydrate_secrets`).
+# The settings table stays readable as a fallback so nothing breaks before the
+# env vars are set; `scrub_secrets.py` clears it once they are.
+# ---------------------------------------------------------------------------
+SECRET_JOB_KEYS = ("proxy_gateway", "smtp", "webhook_url")
+
+
+def proxy_gateway(db_path: str = DB_PATH) -> str:
+    """Gateway URL: CD_PROXY_GATEWAY wins, else the stored setting."""
+    return (os.environ.get("CD_PROXY_GATEWAY")
+            or get_setting("proxy_gateway", "", db_path=db_path) or "")
+
+
+def smtp_config(db_path: str = DB_PATH) -> Dict[str, Any]:
+    """SMTP block with env vars layered over the stored values."""
+    cfg = dict(get_setting("smtp", {}, db_path=db_path) or {})
+    for env, key in (("CD_SMTP_HOST", "host"), ("CD_SMTP_PORT", "port"),
+                     ("CD_SMTP_USER", "user"), ("CD_SMTP_TO", "to"),
+                     ("CD_SMTP_PASSWORD", "password"), ("CD_SMTP_FROM", "from")):
+        v = os.environ.get(env)
+        if v:
+            cfg[key] = v
+    if cfg.get("user") and not cfg.get("from"):
+        cfg["from"] = cfg["user"]
+    return cfg
+
+
+def webhook_url(db_path: str = DB_PATH) -> str:
+    return (os.environ.get("CD_WEBHOOK_URL")
+            or get_setting("webhook_url", "", db_path=db_path) or "")
+
+
+def redact_secrets(config: Dict[str, Any]) -> Dict[str, Any]:
+    """A copy of `config` with credential-bearing keys removed. Used for
+    anything that gets written to disk or shown in the UI."""
+    return {k: v for k, v in (config or {}).items() if k not in SECRET_JOB_KEYS}
+
+
+def hydrate_secrets(config: Dict[str, Any], db_path: str = DB_PATH) -> Dict[str, Any]:
+    """Put the secrets back, from env or settings, just before a job runs."""
+    cfg = dict(config or {})
+    if cfg.get("proxy_mode") == "gateway" and not cfg.get("proxy_gateway"):
+        cfg["proxy_gateway"] = proxy_gateway(db_path)
+    if not cfg.get("smtp"):
+        smtp = smtp_config(db_path)
+        if smtp.get("host"):
+            cfg["smtp"] = smtp
+    if not cfg.get("webhook_url"):
+        cfg["webhook_url"] = webhook_url(db_path) or None
+    return cfg
+
+
 def create_job(job_type: str, config: Dict[str, Any], db_path: str = DB_PATH) -> int:
     now = time.time()
     with connect(db_path) as conn:
         cur = conn.execute(
             "INSERT INTO jobs(type, status, config_json, started_at, updated_at) "
             "VALUES(?,?,?,?,?)",
-            (job_type, "queued", json.dumps(config), now, now),
+            (job_type, "queued", json.dumps(redact_secrets(config)), now, now),
         )
         return cur.lastrowid
 
@@ -1181,25 +1242,45 @@ def get_staged_rows(job_id: int, table_name: str, limit: int = 1000,
 
 
 def diff_job(job_id: int, db_path: str = DB_PATH) -> Dict[str, Dict[str, int]]:
-    """For each staged table, how many rows are new vs already in master."""
+    """For each staged table, how many rows are new vs already in master.
+
+    Counted entirely inside SQLite. The previous version pulled every staged pk
+    into a list AND every master pk into a Python set — on `offerings` or
+    `college_courses` (hundreds of thousands of rows) that was hundreds of MB of
+    strings, the same failure mode that took the exporter down on the 2 GB host.
+    This version holds two integers."""
     out: Dict[str, Dict[str, int]] = {}
     with connect(db_path) as conn:
         for tbl, pkf in STAGE_PK.items():
-            staged = conn.execute(
-                "SELECT pk FROM staging WHERE job_id=? AND table_name=?",
-                (job_id, tbl)).fetchall()
-            if not staged:
+            staged_n = conn.execute(
+                "SELECT COUNT(*) FROM staging WHERE job_id=? AND table_name=?",
+                (job_id, tbl)).fetchone()[0]
+            if not staged_n:
                 continue
             mcols = {r[1] for r in conn.execute(f"PRAGMA table_info({tbl})")}
             if not all(f in mcols for f in pkf):
-                out[tbl] = {"staged": len(staged), "new": 0, "update": 0}
+                out[tbl] = {"staged": staged_n, "new": 0, "update": 0}
                 continue
-            existing = set()
-            sel = "||'|'||".join(f"CAST({f} AS TEXT)" for f in pkf) if len(pkf) > 1 else f"CAST({pkf[0]} AS TEXT)"
-            for r in conn.execute(f"SELECT {sel} FROM {tbl}"):
-                existing.add(r[0])
-            new = sum(1 for (pk,) in staged if pk not in existing)
-            out[tbl] = {"staged": len(staged), "new": new, "update": len(staged) - new}
+            key = ("||'|'||".join(f"CAST({f} AS TEXT)" for f in pkf)
+                   if len(pkf) > 1 else f"CAST({pkf[0]} AS TEXT)")
+            # The key is a CAST/concat expression, so no index on the master
+            # table can serve it — a correlated NOT EXISTS degrades to a full
+            # scan per staged row. Materialise the master keys ONCE into an
+            # indexed scratch table on disk instead: one scan of master, then
+            # indexed lookups. O(1) RAM and fast, unlike either extreme.
+            conn.execute("DROP TABLE IF EXISTS _diff_keys")
+            conn.execute("CREATE TABLE _diff_keys(k TEXT PRIMARY KEY) WITHOUT ROWID")
+            try:
+                conn.execute(f"INSERT OR IGNORE INTO _diff_keys(k) "
+                             f"SELECT {key} FROM {tbl}")
+                new = conn.execute(
+                    "SELECT COUNT(*) FROM staging s "
+                    "WHERE s.job_id=? AND s.table_name=? "
+                    "AND NOT EXISTS (SELECT 1 FROM _diff_keys k WHERE k.k=s.pk)",
+                    (job_id, tbl)).fetchone()[0]
+            finally:
+                conn.execute("DROP TABLE IF EXISTS _diff_keys")
+            out[tbl] = {"staged": staged_n, "new": new, "update": staged_n - new}
     return out
 
 
@@ -1214,6 +1295,7 @@ def validate_job(job_id: int, rules: Optional[Dict[str, Any]] = None,
     pass_score = float(rules.get("pass_score", 70))
 
     total = fee_rows = fee_missing = blanks = 0
+    source = "staging"
     with connect(db_path) as conn:
         for r in conn.execute(
                 "SELECT table_name, payload FROM staging WHERE job_id=?", (job_id,)):
@@ -1230,6 +1312,41 @@ def validate_job(job_id: int, rules: Optional[Dict[str, Any]] = None,
             if tbl in ("courses", "offerings") and not o.get("name") and not o.get("course_name"):
                 blanks += 1
 
+        # Incremental promotion (the default) drains staging DURING the run, so
+        # by the time a job finishes there is nothing left here to score — which
+        # is why every job read exactly 50/100: `total` was 0, costing the flat
+        # 50-point "too few rows" penalty regardless of what was actually
+        # scraped. Fall back to the rows this job promoted into master, which
+        # carry source_job_id. Counted in SQL, so memory stays flat.
+        if total == 0:
+            source = "promoted"
+            fee_tables = {"offerings": "COALESCE(fees_amount,0)=0 AND COALESCE(fees_text,'')=''",
+                          "college_courses": "COALESCE(total_fees,'')='' AND fees_inr IS NULL"}
+            name_cols = {"courses": "name", "offerings": "course_name"}
+            for tbl in STAGE_PK:
+                try:
+                    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({tbl})")}
+                    if "source_job_id" not in cols:
+                        continue
+                    n = conn.execute(
+                        f"SELECT COUNT(*) FROM {tbl} WHERE source_job_id=?",
+                        (job_id,)).fetchone()[0]
+                    if not n:
+                        continue
+                    total += n
+                    if tbl in fee_tables:
+                        fee_rows += n
+                        fee_missing += conn.execute(
+                            f"SELECT COUNT(*) FROM {tbl} WHERE source_job_id=? "
+                            f"AND ({fee_tables[tbl]})", (job_id,)).fetchone()[0]
+                    if tbl in name_cols:
+                        blanks += conn.execute(
+                            f"SELECT COUNT(*) FROM {tbl} WHERE source_job_id=? "
+                            f"AND COALESCE({name_cols[tbl]},'')=''",
+                            (job_id,)).fetchone()[0]
+                except Exception:  # noqa: BLE001 — a missing table must not fail QC
+                    continue
+
     checks = [{"check": "rows staged", "value": total, "ok": total >= min_rows}]
     score = 100.0
     if total < min_rows:
@@ -1245,7 +1362,8 @@ def validate_job(job_id: int, rules: Optional[Dict[str, Any]] = None,
         score -= min(20, blanks)
     score = max(0.0, round(score, 1))
     passed = total >= min_rows and score >= pass_score
-    return {"score": score, "passed": passed, "checks": checks, "total": total}
+    return {"score": score, "passed": passed, "checks": checks, "total": total,
+            "source": source}
 
 
 def flush_job_staging(job_id: int, db_path: str = DB_PATH,

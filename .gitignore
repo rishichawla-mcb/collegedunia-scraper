@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------------------
+# The database holds scraped data AND, until scrub_secrets.py has been run, the
+# proxy gateway URL (with user:pass) and the SMTP password in cleartext.
+# Never commit it.
+# ---------------------------------------------------------------------------
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+data.db*
+
+# Secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Scraper output / working files
+logs/
+exports/
+*.xlsx
+*.csv
+*.json.gz
+!package.json
+!package-lock.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Windows 8.3 short-name duplicates that some tools leave behind
+*~1.PY
+*~1.py

@@ -114,5 +114,10 @@ def run_job(vertical_name: str, job_id: int) -> None:
         raise RuntimeError(f"{vertical_name}: job {job_id} not found")
     cfg = job.get("config_json")
     cfg = _json.loads(cfg) if isinstance(cfg, str) else (cfg or {})
+    try:                       # re-inject credentials stripped at create time
+        import db as _coredb
+        cfg = _coredb.hydrate_secrets(cfg)
+    except Exception:
+        pass
     log = (v.make_logger(job_id) if v.make_logger else (lambda m: print(m, flush=True)))
     run_phase(vertical_name, job["phase"], job_id, cfg, log)

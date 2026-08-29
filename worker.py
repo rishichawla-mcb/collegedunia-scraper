@@ -62,7 +62,9 @@ def run_job(job_id: int) -> None:
     if not job:
         print(f"No such job: {job_id}", file=sys.stderr)
         sys.exit(1)
-    cfg = json.loads(job["config_json"] or "{}")
+    # Secrets are stripped before a job config is stored; put them back
+    # (from env, else the settings table) now that we are about to run.
+    cfg = db.hydrate_secrets(json.loads(job["config_json"] or "{}"))
     db.update_job(job_id, pid=os.getpid())
     log = _log_factory(job_id)
     log(f"Worker PID {os.getpid()} starting job {job_id} ({job['type']})")
