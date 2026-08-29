@@ -9,3 +9,8 @@ pyarrow==16.1.0
 requests==2.32.3
 openpyxl==3.1.5
 beautifulsoup4==4.12.3
+# Cookie component for "keep me signed in". Pinned to 0.1.71: it is the last
+# release that supports streamlit>=1.18, so it will NOT drag streamlit past the
+# 1.37.1 pin above. 0.1.80+ require streamlit>=1.40.1 — do not bump without
+# also re-testing the numpy/pyarrow dataframe path.
+extra-streamlit-components==0.1.71

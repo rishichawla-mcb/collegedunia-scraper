@@ -19,6 +19,7 @@ Run:  streamlit run app.py
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -56,6 +57,14 @@ db.init_db()
 # ---------------------------------------------------------------------------
 # Authentication (optional password gate)
 # ---------------------------------------------------------------------------
+AUTH_COOKIE = "cd_auth"
+# How long a login lasts before the password is asked for again.
+SESSION_DAYS = int(os.environ.get("CD_SESSION_DAYS", "30"))
+# Render terminates TLS, so the cookie is HTTPS-only by default. Set
+# CD_COOKIE_SECURE=0 when developing over plain http://localhost.
+COOKIE_SECURE = os.environ.get("CD_COOKIE_SECURE", "1") not in ("0", "false", "False")
+
+
 def _expected_password():
     """Password comes from the APP_PASSWORD env var (or Streamlit secrets).
     If none is set, the app runs open — handy for local development."""
@@ -68,38 +77,122 @@ def _expected_password():
         return None
 
 
-def _auth_token():
-    pw = _expected_password()
-    return hashlib.sha256(f"cd::{pw}".encode()).hexdigest()[:24] if pw else None
+def _sign(exp: int) -> str:
+    """Signature over the expiry, keyed by the password. Changing APP_PASSWORD
+    therefore invalidates every outstanding session."""
+    pw = _expected_password() or ""
+    return hashlib.sha256(f"cd::{pw}::{exp}".encode()).hexdigest()[:32]
+
+
+def _make_token(days: int = None) -> str:
+    exp = int(time.time()) + int((days or SESSION_DAYS) * 86400)
+    return f"{exp}.{_sign(exp)}"
+
+
+def _token_valid(tok) -> bool:
+    """Expiring, signed, constant-time compared. An old or tampered token fails."""
+    try:
+        exp_s, sig = str(tok).split(".", 1)
+        exp = int(exp_s)
+    except Exception:
+        return False
+    if exp < time.time():
+        return False
+    return hmac.compare_digest(sig, _sign(exp))
+
+
+def _cookie_jar():
+    """The cookie component, kept in session_state so one instance is reused
+    across reruns. NOT @st.cache_resource — this creates a widget, and caching
+    a widget makes Streamlit skip it on cache hits (the cookie then silently
+    never gets read or written)."""
+    jar = st.session_state.get("_cookie_jar")
+    if jar is None:
+        import extra_streamlit_components as stx
+        jar = stx.CookieManager(key="cd_auth_cookies")
+        st.session_state["_cookie_jar"] = jar
+    return jar
+
+
+def _read_cookie():
+    """Returns the stored token, or None. Never raises: if the component is
+    missing or misbehaves we simply fall back to asking for the password."""
+    try:
+        jar = _cookie_jar()
+        all_c = jar.get_all()
+        if all_c is None:
+            # First render: the browser hasn't answered yet. Rerun ONCE.
+            if not st.session_state.get("_cookie_probe"):
+                st.session_state["_cookie_probe"] = True
+                time.sleep(0.35)
+                st.rerun()
+            return None
+        return all_c.get(AUTH_COOKIE)
+    except Exception:
+        return None
+
+
+def _write_cookie(tok: str) -> bool:
+    try:
+        from datetime import datetime, timedelta, timezone
+        _cookie_jar().set(
+            AUTH_COOKIE, tok, key="cd_auth_set",
+            expires_at=datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS),
+            path="/", same_site="strict", secure=COOKIE_SECURE)
+        return True
+    except Exception:
+        return False
+
+
+def _clear_cookie():
+    try:
+        _cookie_jar().delete(AUTH_COOKIE, key="cd_auth_del")
+    except Exception:
+        pass
 
 
 def require_login() -> None:
     pw = _expected_password()
     if not pw:
         return  # no password configured -> open access
-    tok = _auth_token()
-    # Auto-login from a URL token so login survives idle reconnects / restarts.
-    try:
-        if st.query_params.get("t") == tok:
-            st.session_state["authed"] = True
-    except Exception:
-        pass
+
     if st.session_state.get("authed"):
         return
+
+    # 1. Already signed in in this browser? Restore silently.
+    if _token_valid(_read_cookie()):
+        st.session_state["authed"] = True
+        return
+
+    # 2. Otherwise ask. (A stale/expired cookie lands here too.)
     st.markdown("## 🔒 Collegedunia Scraper")
     st.caption("This app is password protected.")
     entered = st.text_input("Password", type="password")
+    remember = st.checkbox(f"Keep me signed in on this browser "
+                           f"for {SESSION_DAYS} days", value=True)
     if st.button("Log in"):
-        if entered == pw:
+        if hmac.compare_digest(entered or "", pw):
             st.session_state["authed"] = True
-            try:
-                st.query_params["t"] = tok   # keeps you logged in across reloads
-            except Exception:
-                pass
+            if remember and not _write_cookie(_make_token()):
+                st.warning("Signed in, but this browser wouldn't store the "
+                           "session cookie — you may be asked again on reload.")
             st.rerun()
         else:
             st.error("Incorrect password.")
     st.stop()
+
+
+def logout_button(where=None) -> None:
+    """Sign out of this browser: drops the cookie and the in-memory session."""
+    if not _expected_password():
+        return
+    target = where or st.sidebar
+    if target.button("🚪 Log out", key="cd_logout",
+                     help="Forget this browser and ask for the password again"):
+        _clear_cookie()
+        st.session_state.pop("authed", None)
+        st.session_state.pop("_cookie_probe", None)
+        st.rerun()
 
 
 require_login()
@@ -646,6 +739,7 @@ if _vertical == "🌍 Study Abroad":
     st.stop()
 
 st.sidebar.title("⚙️ Settings")
+logout_button()
 
 st.sidebar.subheader("Rate limiting")
 st.session_state["delay"] = st.sidebar.number_input(
