@@ -29,10 +29,43 @@ jobs:
         run: python -m compileall -q .
 
       - name: Static checks (undefined names, bad imports)
-        run: python -m pyflakes db.py scraper.py worker.py app.py export.py
+        run: |
+          python -m pyflakes db.py scraper.py worker.py app.py export.py \
+                             sa_db.py sa_scraper.py sa_ui.py sa_export.py \
+                             sa_vertical.py vertical_base.py platform_worker.py \
+                             freefix.py fix_airport.py scrub_secrets.py
 
       - name: Import smoke test (db + scraper load, schema builds)
         env:
           CD_DB_PATH: /tmp/ci.db
         run: |
           python -c "import db, scraper, export, worker; db.init_db('/tmp/ci.db'); print('imports OK, schema built')"
+
+      # The real regression suite. It exercises parsers, the staging ->
+      # validate -> promote path, exports and the wipe scopes against a
+      # temporary DB. Nothing here touches the network or production data.
+      - name: Module test suite
+        env:
+          CD_DB_PATH: /tmp/ci_modules.db
+          CD_SA_DB_PATH: /tmp/ci_modules.db
+        run: python test_modules.py
+
+      # Guard against the credential leak coming back: a job config must never
+      # be persisted with a proxy gateway or SMTP password in it.
+      - name: Secrets stay out of job configs
+        env:
+          CD_DB_PATH: /tmp/ci_secrets.db
+        run: |
+          python - <<'PY'
+          import json, db
+          db.init_db('/tmp/ci_secrets.db')
+          gw = "http://u:LEAKED_PW@gw.example:823"
+          jid = db.create_job("courses", {
+              "proxy_mode": "gateway", "proxy_gateway": gw,
+              "smtp": {"password": "LEAKED_SMTP"}, "max_retries": 5})
+          raw = db.get_job(jid)["config_json"]
+          assert "LEAKED_PW" not in raw, "proxy password leaked into config_json"
+          assert "LEAKED_SMTP" not in raw, "smtp password leaked into config_json"
+          assert json.loads(raw)["max_retries"] == 5, "non-secret config lost"
+          print("secrets correctly redacted from job config")
+          PY
