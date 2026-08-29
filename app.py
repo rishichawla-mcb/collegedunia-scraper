@@ -725,9 +725,21 @@ def render_system_bar() -> None:
 # ever touches its own `sa_`-prefixed tables (namespace isolation). Auth above
 # (require_login) already gates both verticals.
 _vertical = st.sidebar.radio(
-    "🧭 Vertical", ["🇮🇳 Domestic", "🌍 Study Abroad"], index=0,
+    "🧭 Vertical", ["🇮🇳 Domestic", "🌍 Study Abroad", "🔎 Course Finder"], index=0,
     help="Switch scraping verticals. Data is isolated in separate tables; "
          "Study Abroad scrapes run as their own worker processes.")
+if _vertical == "🔎 Course Finder":
+    try:
+        render_system_bar()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import cf_ui
+        cf_ui.render()
+    except Exception as _cf_err:  # error boundary: never crashes the page
+        st.error(f"Course Finder module error: {_cf_err}")
+    st.stop()
+
 if _vertical == "🌍 Study Abroad":
     try:
         render_system_bar()   # shared host metrics (CPU/mem/disk) for SA too
@@ -1196,9 +1208,17 @@ with tab_run:
         st.caption("The plain scrape above hits the site's ~1,700-result page limit "
                    "(~1,200 courses). This splits the catalog by stream/type/level to "
                    "pull **all ~21,500**. Needs the proxy on; takes longer.")
+        p1_conc = st.number_input(
+            "Parallel workers", 1, 20, 1, key="conc1",
+            help="Phase 1 used to run one request at a time. Each request costs "
+                 "~19s through the proxy, so this is the difference between hours "
+                 "and days. Tag probes and per-tag crawls are independent, so they "
+                 "parallelise cleanly — each worker gets its own sticky IP. "
+                 "Start at 4–8; higher risks more 403s.")
         if st.button("🧩 Scrape ALL courses (partitioned)", key="run1full"):
             cfg = proxy_config_from_ui()
             cfg["partition"] = True
+            cfg["concurrency"] = int(p1_conc)
             jid = db.create_job("courses", cfg)
             launch_worker(jid)
             st.session_state["watch_p1"] = jid

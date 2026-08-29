@@ -34,6 +34,7 @@ import html as _html
 import itertools
 import json
 import os
+import queue
 import random
 import re
 import threading
@@ -1209,19 +1210,29 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
     pm = ProxyManager.from_config(cfg)
     stats = Stats()
     adaptive = AdaptiveDelay(float(cfg.get("delay", 1.0)), enabled=bool(cfg.get("adaptive", True)))
-    client = Client(pm, log=log, max_retries=int(cfg.get("max_retries", 5)),
-                    backoff=float(cfg.get("backoff", 4)), stats=stats, adaptive=adaptive)
     soft_retries = int(cfg.get("soft_block_retries", 4))
     long_cooldown = float(cfg.get("long_cooldown_seconds", 0))
+    # Phase 1 was the ONLY phase without a worker pool — every other phase has
+    # had one for a while. One request costs ~19s through the proxy, so serial
+    # execution is what made a full catalogue crawl take days. Default stays 1
+    # so existing behaviour is unchanged unless concurrency is asked for.
+    concurrency = max(1, int(cfg.get("concurrency", 1)))
 
+    def _new_client() -> Client:
+        return Client(pm, log=log, max_retries=int(cfg.get("max_retries", 5)),
+                      backoff=float(cfg.get("backoff", 4)), stats=stats,
+                      adaptive=adaptive)
+
+    client = _new_client()          # used by the single-threaded path
     grand_total = {"v": None}
     leaves_done = {"v": 0}
+    _cnt_lock = threading.Lock()
 
     def stopped() -> bool:
         return db.stop_requested(job_id, db_path=db_path)
 
-    def fetch_page(filters: Dict[str, Any], page: int) -> Dict[str, Any]:
-        return client.fetch({"page": page, **filters})
+    def fetch_page(filters: Dict[str, Any], page: int, cl: Optional[Client] = None) -> Dict[str, Any]:
+        return (cl or client).fetch({"page": page, **filters})
 
     def push() -> None:
         reqs, byts, blocks = stats.snapshot()
@@ -1233,7 +1244,7 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
                               f"{byts/1048576:.1f} MB", db_path=db_path)
 
     def page_through(filters: Dict[str, Any], first: Optional[Dict[str, Any]],
-                     expected: int = 0) -> None:
+                     expected: int = 0, cl: Optional[Client] = None) -> None:
         """Page a slice, following its (often sparse/degrading) tail: keep going
         until MAX_EMPTY_PAGES consecutive empty pages, capturing every straggler.
         Anchoring on `count` doesn't work because the API rarely serves it all."""
@@ -1242,7 +1253,7 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
         consec_empty = 0
         while not stopped() and page <= MAX_CHUNK_PAGES:
             if data is None:
-                data = fetch_page(filters, page)
+                data = fetch_page(filters, page, cl)
             rows = data.get("courses") or []
             if rows:
                 consec_empty = 0
@@ -1258,62 +1269,134 @@ def _run_courses_partitioned(job_id: int, cfg: Dict[str, Any], db_path: str,
             if page % 10 == 0:
                 push()
             time.sleep(adaptive.value())
-        leaves_done["v"] += 1
+        with _cnt_lock:
+            leaves_done["v"] += 1
         push()
 
-    def recurse(filters: Dict[str, Any], idx: int, label: str) -> None:
+    def recurse(filters: Dict[str, Any], idx: int, label: str,
+                cl: Optional[Client] = None) -> None:
         if stopped():
             return
+        cl = cl or client
         # one sticky IP per slice so pagination stays consistent
-        client.session_id = f"cf{random.randint(0, 10**9)}"
+        cl.session_id = f"cf{random.randint(0, 10**9)}"
         # probe the size of this slice
         data = None
         for attempt in range(1, soft_retries + 1):
-            data = fetch_page(filters, 1)
+            data = fetch_page(filters, 1, cl)
             if (data.get("courses") or []) or data.get("count", 0) == 0:
                 break
             wait = long_cooldown if long_cooldown else 8 * attempt
             log(f"  ! probe '{label}' empty — retry {attempt}/{soft_retries} in {wait:.0f}s")
             time.sleep(wait)
         count = data.get("count") or 0
-        if grand_total["v"] is None:
-            grand_total["v"] = count  # root count = full universe
+        with _cnt_lock:
+            if grand_total["v"] is None:
+                grand_total["v"] = count  # root count = full universe
         if count == 0:
             return
         if count <= PAGINATION_CAP or idx >= len(facets):
             log(f"  → scraping chunk '{label}' (count {count})")
-            page_through(filters, first=data, expected=count)
+            page_through(filters, first=data, expected=count, cl=cl)
             return
         key, values = facets[idx]
         if key in filters:
-            recurse(filters, idx + 1, label)
+            recurse(filters, idx + 1, label, cl)
             return
         for v in values:
             if stopped():
                 return
-            recurse({**filters, key: v}, idx + 1, f"{label} {key}={v}")
+            recurse({**filters, key: v}, idx + 1, f"{label} {key}={v}", cl)
 
     db.update_job(job_id, status="running", message="discovering course tags…",
                   db_path=db_path)
     log("Phase 1 (complete/partitioned) [BUILD: tagid-v5] — "
         "partitioning by course_tag_id (stream breaks deep pagination).")
-    # Discover valid course_tag_id values (rotate IP per probe).
+    # Discover valid course_tag_id values (rotate IP per probe). These probes
+    # are completely independent of one another, so they parallelise cleanly —
+    # this is where a serial Phase 1 lost most of its time.
     tag_ids: List[int] = []
+    _tagq: "queue.Queue" = queue.Queue()
     for t in TAG_ID_RANGE:
-        if stopped():
-            break
-        client.session_id = f"d{t}"
-        try:
-            d = fetch_page({"course_tag_id": t}, 1)
-            if (d.get("count") or 0) > 0:
-                tag_ids.append(t)
-        except Exception:  # noqa: BLE001
-            pass
-        time.sleep(adaptive.value())
+        _tagq.put(t)
+
+    def _probe_worker():
+        cl = _new_client()
+        while not stopped():
+            try:
+                t = _tagq.get_nowait()
+            except queue.Empty:
+                return
+            cl.session_id = f"d{t}"
+            try:
+                d = fetch_page({"course_tag_id": t}, 1, cl)
+                if (d.get("count") or 0) > 0:
+                    with _cnt_lock:
+                        tag_ids.append(t)
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(adaptive.value())
+
+    if concurrency > 1:
+        log(f"Probing {_tagq.qsize()} course tags with {concurrency} workers…")
+        _pt = [threading.Thread(target=_probe_worker, daemon=True)
+               for _ in range(concurrency)]
+        for t_ in _pt:
+            t_.start()
+        for t_ in _pt:
+            t_.join()
+        tag_ids.sort()
+    else:
+        _probe_worker()
     log(f"Discovered {len(tag_ids)} course tags.")
     facets = [("course_tag_id", tag_ids)] + SUB_FACETS
     try:
-        recurse({}, 0, "all")
+        # If the WHOLE catalogue fits under the pagination ceiling there is
+        # nothing to partition — sweeping it once is both correct and cheaper
+        # than probing every tag. Only fan out when the root is genuinely too
+        # big, so concurrent and serial runs issue comparable request counts.
+        _root = fetch_page({}, 1) if concurrency > 1 and tag_ids else None
+        _root_count = (_root or {}).get("count") or 0
+        if _root is not None and 0 < _root_count <= PAGINATION_CAP:
+            log(f"  catalogue is {_root_count} (under the {PAGINATION_CAP} ceiling) "
+                f"— single sweep, no partitioning needed")
+            grand_total["v"] = _root_count
+            page_through({}, first=_root, expected=_root_count)
+        elif concurrency > 1 and tag_ids:
+            # Each worker owns a DISJOINT set of tags and recurses them with its
+            # own Client (its own sticky session), so no state is shared beyond
+            # the counters and the DB — which are locked / WAL respectively.
+            wq: "queue.Queue" = queue.Queue()
+            for t in tag_ids:
+                wq.put(t)
+            errs: List[BaseException] = []
+
+            def _tag_worker():
+                cl = _new_client()
+                while not stopped():
+                    try:
+                        t = wq.get_nowait()
+                    except queue.Empty:
+                        return
+                    try:
+                        recurse({"course_tag_id": t}, 1,
+                                f"all course_tag_id={t}", cl)
+                    except Exception as e:  # noqa: BLE001
+                        with _cnt_lock:
+                            errs.append(e)
+                        log(f"  ! course_tag_id={t} failed: {e}")
+
+            log(f"Scraping {len(tag_ids)} tags with {concurrency} workers…")
+            th = [threading.Thread(target=_tag_worker, daemon=True)
+                  for _ in range(concurrency)]
+            for t_ in th:
+                t_.start()
+            for t_ in th:
+                t_.join()
+            if errs and not stopped():
+                log(f"  ! {len(errs)} tag(s) errored; re-run to pick them up")
+        else:
+            recurse({}, 0, "all")
         written = _written_count(job_id, cfg, "courses", db_path)
         reqs, byts, _ = stats.snapshot()
         if stopped():
