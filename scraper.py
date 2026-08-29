@@ -619,6 +619,7 @@ def parse_college_basic_info(html: str) -> Dict[str, Any]:
     affil = bi.get("affiliated_to") if isinstance(bi.get("affiliated_to"), dict) else {}
     train = addr.get("nearest_train_station") if isinstance(addr.get("nearest_train_station"), dict) else {}
     bus = addr.get("nearest_bus_station") if isinstance(addr.get("nearest_bus_station"), dict) else {}
+    air = addr.get("nearest_airport") if isinstance(addr.get("nearest_airport"), dict) else {}
 
     landline = _phone_list(bi.get("landline"))
     mobile = _phone_list(bi.get("mobile"))
@@ -652,7 +653,9 @@ def parse_college_basic_info(html: str) -> Dict[str, Any]:
         "nearest_train_distance_m": _to_int(train.get("distance")),
         "nearest_bus_station": str(bus.get("name") or ""),
         "nearest_bus_distance_m": _to_int(bus.get("distance")),
-        "nearest_airport": str(addr.get("nearest_airport") or ""),
+        "nearest_airport": (str(air.get("name") or "") if air
+                            else str(addr.get("nearest_airport") or "")),
+        "nearest_airport_distance_m": _to_int(air.get("distance")) if air else None,
         "basic_info_json": json.dumps(bi, ensure_ascii=False),
     }
 

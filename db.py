@@ -352,7 +352,8 @@ COLLEGE_BASIC_COLS = [
     ("basic_address", "TEXT"), ("pincode", "TEXT"), ("map_location", "TEXT"),
     ("nearest_train_station", "TEXT"), ("nearest_train_distance_m", "INTEGER"),
     ("nearest_bus_station", "TEXT"), ("nearest_bus_distance_m", "INTEGER"),
-    ("nearest_airport", "TEXT"), ("basic_info_json", "TEXT"),
+    ("nearest_airport", "TEXT"), ("nearest_airport_distance_m", "INTEGER"),
+    ("basic_info_json", "TEXT"),
     ("basic_scraped_at", "REAL"),
 ]
 COLLEGE_BASIC_NAMES = [c for c, _ in COLLEGE_BASIC_COLS]
