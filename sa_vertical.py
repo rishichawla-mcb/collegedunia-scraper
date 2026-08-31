@@ -51,8 +51,17 @@ STUDY_ABROAD = vb.Vertical(
                  "scholarship's own page for highlights, eligibility, application, selection "
                  "and description. Detail pass is self-draining, so it resumes automatically.",
                  sa_scraper.run_scholarships),
-        # Future phases slot in here: program_details, university_enrich,
-        # verification — each a Phase with its own runner. No framework change needed.
+        vb.Phase("university_detail", "④ University detail",
+                 "Fetch each university's OWN page — one request per university "
+                 "(1,722 total). Adds ~35 fields the programme listing never "
+                 "carried (founding year, contact, coordinates, student and "
+                 "faculty counts, six sub-ratings), plus the full multi-agency "
+                 "ranking history, cost-of-living breakdown, nearby transport, "
+                 "and a per-course block with seven years of fee history. Also "
+                 "fills sa_program_exams.out_of, which the listing sends blank.",
+                 sa_scraper.run_university_detail, depends_on=["programs"]),
+        # Future phases slot in here: program_details, verification — each a
+        # Phase with its own runner. No framework change needed.
     ],
 )
 

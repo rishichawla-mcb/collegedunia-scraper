@@ -685,11 +685,22 @@ def render_system_bar() -> None:
         la1, la5, la15 = os.getloadavg()
     except Exception:
         la1 = la5 = la15 = None
+    # Count running jobs across EVERY vertical, not just the domestic one. The
+    # counter used to read db.jobs only, so a Course Finder or Study Abroad job
+    # showed "Active jobs 0" while it was plainly running.
+    running = 0
     try:
-        jobs = db.list_jobs(40)
-        running = sum(1 for j in jobs if j["status"] in ("running", "queued"))
-    except Exception:
-        running = 0
+        running += sum(1 for j in db.list_jobs(40)
+                       if j["status"] in ("running", "queued"))
+    except Exception:  # noqa: BLE001
+        pass
+    for _mod, _fn in (("sa_db", "list_jobs"), ("cf_db", "list_jobs")):
+        try:
+            _m = __import__(_mod)
+            running += sum(1 for j in getattr(_m, _fn)(40)
+                           if (j.get("status") or "") in ("running", "queued"))
+        except Exception:  # noqa: BLE001
+            pass
     threads = threading.active_count()
     cores = os.cpu_count() or 1
     uptime = now - _proc_start_time()

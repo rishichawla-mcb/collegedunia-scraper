@@ -716,3 +716,310 @@ def run_scholarships(job_id: int, cfg: Dict[str, Any], log: Callable[[str], None
                          message=str(e)[:200])
         log(f"ERROR: {e}")
         raise
+
+
+# ===========================================================================
+# Phase ④ — UNIVERSITY DETAIL
+#
+# `sa_universities` was only ever derived from programme rows: name, country,
+# URL, logo — with `city` 0% filled. Its own page carries ~40 more fields plus a
+# full multi-agency ranking history, a cost-of-living breakdown, nearby places,
+# and a per-course block with SEVEN YEARS of fee history and multi-stage
+# application deadlines.
+#
+# It also carries `exam_out_of_score`, which the programme listing sends blank —
+# the reason sa_program_exams.out_of is 0% filled across 314k rows.
+#
+# 1,722 universities, one request each.
+# ===========================================================================
+UNIV_RANK_STREAM_KEY = "parent"
+
+
+def _f(v):
+    try:
+        return float(str(v).strip())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _i(v):
+    try:
+        return int(float(str(v).strip()))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def sa_parse_university_detail(pp: Dict[str, Any], university_id: int,
+                               job_id: Optional[int] = None) -> Dict[str, Any]:
+    """Parse a university page's pageProps.response into
+    {fields, rankings, costs, nearby, courses, exam_scores}."""
+    r = (pp or {}).get("response") or {}
+    head = ((r.get("basic_info") or {}).get("head")) or {}
+    contact = r.get("contact_location") or {}
+    fac = r.get("faculty_stats") or {}
+    rating = r.get("college_rating") or r.get("review_stats") or {}
+    sub = rating.get("rating") or {}
+    now = time.time()
+
+    overview = {str(o.get("label", "")).lower(): o.get("value")
+                for o in (r.get("overview_data") or []) if isinstance(o, dict)}
+
+    fields = {
+        "name": head.get("college") or "",
+        "short_name": head.get("college_short") or "",
+        "city": head.get("city") or "",
+        "city_id": _i(head.get("city_id")),
+        "state": head.get("state") or "",
+        "state_id": _i(head.get("state_id")),
+        "country_id": _i(head.get("country_id")),
+        "country_name": head.get("country") or r.get("country_name") or "",
+        "established_year": _i(head.get("establish_year")),
+        "institution_type": head.get("institution_type") or "",
+        "school_type": head.get("school_type") or "",
+        "admin_rating": _f(head.get("admin_rating")),
+        "cover_image": head.get("cover_image") or "",
+        "website": contact.get("website") or "",
+        "address": contact.get("address") or "",
+        "email": contact.get("college_mail_id") or "",
+        "phone": contact.get("contact") or "",
+        "toll_free": contact.get("toll_free_number") or "",
+        "latitude": contact.get("latitude") or "",
+        "longitude": contact.get("longitude") or "",
+        "total_students": _i(head.get("total_students")),
+        "total_faculty": _i(fac.get("total_faculty")),
+        "faculty_full_time": _i(fac.get("full_time")),
+        "faculty_part_time": _i(fac.get("part_time")),
+        "graduate_assistants": _i(fac.get("graduate_assistants")),
+        "avg_rating": _f(rating.get("average_rating")),
+        "total_reviews": _i(rating.get("total_reviews")),
+        "rating_academic": _f(sub.get("avg_academic")),
+        "rating_accommodation": _f(sub.get("avg_accomodation")),
+        "rating_extracurricular": _f(sub.get("avg_extracurricular")),
+        "rating_faculty": _f(sub.get("avg_faculty")),
+        "rating_infrastructure": _f(sub.get("avg_infrastructure")),
+        "rating_placement": _f(sub.get("avg_placement")),
+        "attendance_cost": str((r.get("tuition_fees") or {}).get("attendance_cost") or ""),
+        "student_faculty_ratio": str(overview.get("student : faculty ratio") or ""),
+        "description": str((r.get("article") or {}).get("description") or ""),
+        "scholarship_count": len(r.get("scholarships") or []),
+        "course_count": len(r.get("important_dates") or []),
+    }
+
+    # ---- rankings: agencies x years x streams -----------------------------
+    agencies = (r.get("ranking_data") or {}).get("agencies") or {}
+    ywd = (r.get("ranking_data") or {}).get("year_wise_data") or {}
+    rankings: List[Dict[str, Any]] = []
+    for _year_key, entries in (ywd.items() if isinstance(ywd, dict) else []):
+        for e in (entries if isinstance(entries, list) else [entries]):
+            if not isinstance(e, dict):
+                continue
+            aid = _i(e.get("agencyId"))
+            yr = _i(e.get("year"))
+            streams = ((e.get("stream") or {}).get(UNIV_RANK_STREAM_KEY)) or {}
+            for sname, sv in (streams.items() if isinstance(streams, dict) else []):
+                if not isinstance(sv, dict):
+                    continue
+                rankings.append({
+                    "university_id": university_id, "agency_id": aid,
+                    "agency": str((agencies.get(str(aid)) or {}).get("name") or ""),
+                    "year": yr, "stream": str(sname),
+                    "scope": str(sv.get("scope") or ""),
+                    "rank": _i(sv.get("rank")),
+                    "rank_out_of": _i(sv.get("rank_out_of")),
+                    "country_rank": _i(sv.get("country_rank")),
+                    "country_rank_out_of": _i(sv.get("country_rank_out_of")),
+                    "score": str(sv.get("score") or ""),
+                    "score_out_of": str(sv.get("score_out_of") or ""),
+                    "scraped_at": now, "source_job_id": job_id})
+
+    # ---- cost of living ---------------------------------------------------
+    costs: List[Dict[str, Any]] = []
+    for kind, items in (r.get("accommodation_data") or {}).items():
+        for it in (items or []):
+            if isinstance(it, dict) and it.get("label"):
+                costs.append({"university_id": university_id, "kind": str(kind),
+                              "label": str(it["label"]), "value": str(it.get("value") or ""),
+                              "scraped_at": now, "source_job_id": job_id})
+    for label, value in overview.items():
+        costs.append({"university_id": university_id, "kind": "overview",
+                      "label": label, "value": str(value),
+                      "scraped_at": now, "source_job_id": job_id})
+
+    # ---- nearby -----------------------------------------------------------
+    nearby: List[Dict[str, Any]] = []
+    for cat, items in (r.get("nearby") or {}).items():
+        for it in (items or []):
+            if isinstance(it, dict) and it.get("name"):
+                nearby.append({"university_id": university_id, "category": str(cat),
+                               "name": str(it["name"]), "distance_km": _f(it.get("distance")),
+                               "lat": str(it.get("lat") or ""), "lng": str(it.get("lng") or ""),
+                               "scraped_at": now, "source_job_id": job_id})
+
+    # ---- per-course block + exam scores -----------------------------------
+    courses: List[Dict[str, Any]] = []
+    exam_scores: List[Dict[str, Any]] = []
+    for c in (r.get("important_dates") or []):
+        if not isinstance(c, dict):
+            continue
+        cid = _i(c.get("course_id"))
+        if cid is None:
+            continue
+        courses.append({
+            "university_id": university_id, "course_id": cid,
+            "head_one": str(c.get("head_one") or ""),
+            "head_two": str(c.get("head_two") or ""),
+            "head_short_form": str(c.get("head_short_form") or ""),
+            "degree_type": str(c.get("degree_type") or ""),
+            "course_duration": str(c.get("course_duration") or ""),
+            "course_duration_value": str(c.get("course_duration_value") or ""),
+            "total_fee_per_year": str(c.get("total_fee_per_year") or ""),
+            "default_fee_per_year": str(c.get("default_fee_per_year") or ""),
+            "fee_history_json": json.dumps(c.get("previous_year_course_fees_data") or {},
+                                           ensure_ascii=False),
+            "application_json": json.dumps(c.get("application") or [], ensure_ascii=False),
+            "application_cost": str(c.get("application_cost") or ""),
+            "short_entry_reqd": str(c.get("short_entry_reqd") or ""),
+            "available_campus": str(c.get("available_campus") or ""),
+            "program_url": abs_url(c.get("program_url")) if c.get("program_url") else "",
+            "scraped_at": now, "source_job_id": job_id})
+        for e in (c.get("exam_data") or []):
+            if isinstance(e, dict) and e.get("short_form"):
+                exam_scores.append({
+                    "program_id": cid, "short_form": str(e["short_form"]),
+                    "exam_score": str(e.get("exam_score") or ""),
+                    "out_of": str(e.get("exam_out_of_score") or "")})
+
+    return {"fields": fields, "rankings": rankings, "costs": costs,
+            "nearby": nearby, "courses": courses, "exam_scores": exam_scores}
+
+
+def run_university_detail(job_id: int, cfg: Dict[str, Any],
+                          log: Callable[[str], None]) -> None:
+    """Phase ④: fetch each university's own page. One request per university."""
+    import queue as _q
+    merged = {**shared_proxy_cfg(), **cfg}
+    pm = ProxyManager.from_config(merged)
+    stats = Stats()
+    adaptive = AdaptiveDelay(float(merged.get("delay", 1.0)),
+                             enabled=bool(merged.get("adaptive", True)))
+    concurrency = max(1, int(merged.get("concurrency", 4)))
+    delay = float(merged.get("delay", 1.0))
+    budget_requests = int(merged.get("budget_requests", 0))
+    budget_bytes = int(float(merged.get("budget_mb", 0)) * 1024 * 1024)
+    keep_desc = bool(merged.get("keep_description", True))
+
+    pending = sa_db.universities_pending_detail(limit=int(merged.get("max_units", 0)))
+    total = len(pending)
+    sa_db.update_job(job_id, status="running", total_units=total,
+                     message=f"{total:,} universities to enrich")
+    log(f"SA Phase ④ — university detail: {total:,} universities, "
+        f"concurrency={concurrency}")
+    if not total:
+        sa_db.update_job(job_id, status="completed", finished_at=time.time(),
+                         message="nothing pending — run ② Programs first")
+        log("nothing pending. Run ② Programs first so universities exist.")
+        return
+
+    q: "_q.Queue" = _q.Queue()
+    for u in pending:
+        q.put(u)
+    stop = threading.Event()
+    lock = threading.Lock()
+    st = {"done": 0, "ranks": 0, "courses": 0, "exams": 0, "err": 0}
+    _last_push = {"t": 0.0}
+
+    def budget_hit():
+        reqs, byts, _ = stats.snapshot()
+        if budget_requests and reqs >= budget_requests:
+            return f"request budget reached ({reqs})"
+        if budget_bytes and byts >= budget_bytes:
+            return f"bandwidth budget reached ({byts/1048576:.1f} MB)"
+        return None
+
+    def push():
+        reqs, byts, _ = stats.snapshot()
+        with lock:
+            d, rk, co, ex, er = (st["done"], st["ranks"], st["courses"],
+                                 st["exams"], st["err"])
+        sa_db.update_job(job_id, done_units=d, items_written=rk + co,
+                         req_count=reqs, bytes_count=byts,
+                         message=f"{d:,}/{total:,} universities · {rk:,} rankings · "
+                                 f"{co:,} course rows · {ex:,} exam scores filled · "
+                                 f"{byts/1048576:.1f} MB"
+                                 + (f" · {er} errors" if er else ""))
+
+    def worker(idx: int):
+        client = Client(pm, log=log, max_retries=int(merged.get("max_retries", 5)),
+                        backoff=float(merged.get("backoff", 4)), stats=stats,
+                        adaptive=adaptive)
+        while not stop.is_set():
+            try:
+                u = q.get_nowait()
+            except _q.Empty:
+                return
+            uid = int(u["university_id"])
+            if sa_db.stop_requested(job_id):
+                stop.set(); return
+            bh = budget_hit()
+            if bh:
+                log(f"  ⏸ {bh}"); stop.set(); return
+            client.session_id = f"sau{idx}_{uid}"
+            try:
+                html = client.get_text(u["university_url"])
+                pp = _nextdata_pageprops(html)
+                parsed = sa_parse_university_detail(pp, uid, job_id)
+                if not parsed["fields"].get("name") and not parsed["courses"]:
+                    raise ValueError("no basic_info on page")
+                f = dict(parsed["fields"])
+                if not keep_desc:
+                    f["description"] = ""
+                sa_db.update_university_detail(uid, f)
+                if parsed["rankings"]:
+                    sa_db.upsert_university_rankings(parsed["rankings"])
+                if parsed["costs"]:
+                    sa_db.upsert_university_costs(parsed["costs"])
+                if parsed["nearby"]:
+                    sa_db.upsert_university_nearby(parsed["nearby"])
+                if parsed["courses"]:
+                    sa_db.upsert_university_courses(parsed["courses"])
+                filled = (sa_db.fill_program_exam_scores(parsed["exam_scores"])
+                          if parsed["exam_scores"] else 0)
+                sa_db.set_university_progress(uid, "done", len(parsed["courses"]),
+                                              len(parsed["rankings"]))
+                with lock:
+                    st["ranks"] += len(parsed["rankings"])
+                    st["courses"] += len(parsed["courses"])
+                    st["exams"] += filled
+            except Exception as err:  # noqa: BLE001
+                # left NOT 'done', so the self-draining queue retries it later
+                sa_db.set_university_progress(uid, "error")
+                with lock:
+                    st["err"] += 1
+                log(f"  ! university {uid} failed: {str(err)[:140]}")
+            with lock:
+                st["done"] += 1
+                _d = st["done"]
+            _now = time.time()
+            if _now - _last_push["t"] >= 5 or _d >= total:
+                _last_push["t"] = _now
+                push()
+            if delay:
+                time.sleep(adaptive.value() if adaptive else delay)
+
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True)
+               for i in range(concurrency)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    push()
+    c = sa_db.counts()
+    left = len(sa_db.universities_pending_detail())
+    msg = (f"enriched {c.get('universities_detailed', 0):,}/{c.get('universities', 0):,} "
+           f"universities · {c.get('university_rankings', 0):,} rankings · "
+           f"{c.get('university_courses', 0):,} course rows · "
+           f"{st['exams']:,} exam scores filled"
+           + (f" · {left:,} still pending" if left else ""))
+    sa_db.update_job(job_id, status="completed", message=msg, finished_at=time.time())
+    log(msg)

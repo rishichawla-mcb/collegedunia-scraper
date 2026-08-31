@@ -17,7 +17,8 @@ from typing import Iterator, List, Optional, Sequence, Tuple
 import sa_db
 
 TABLES = ("sa_programs", "sa_universities", "sa_countries", "sa_program_exams",
-          "sa_scholarships")
+          "sa_scholarships", "sa_university_rankings", "sa_university_courses",
+          "sa_university_costs", "sa_university_nearby")
 
 XLSX_MAX_ROWS = 1_048_575
 _HEAVY_COLS = ("raw_json",)

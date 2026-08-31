@@ -411,6 +411,7 @@ def run_offerings(job_id: int, cfg: Dict[str, Any],
     stop = threading.Event()
     lock = threading.Lock()
     state = {"done": 0, "rows": 0, "empty": 0, "err": 0}
+    _last_push = {"t": 0.0}
 
     def budget_hit() -> Optional[str]:
         reqs, byts, _ = stats.snapshot()
@@ -482,7 +483,13 @@ def run_offerings(job_id: int, cfg: Dict[str, Any],
                     f"(kept {found} rows, will resume): {err}")
             with lock:
                 state["done"] += 1
-            if state["done"] % 25 == 0:
+                _d = state["done"]
+            # Push on a TIME cadence, not every-Nth-course. With N=25 an 84-course
+            # run showed "0/84 · 0 rows" for its whole first third, which reads as
+            # a hung job. Also always push the last item so the final state lands.
+            _now = time.time()
+            if _now - _last_push["t"] >= 5 or _d >= total:
+                _last_push["t"] = _now
                 push()
 
     threads = [threading.Thread(target=worker, args=(i,), daemon=True)
