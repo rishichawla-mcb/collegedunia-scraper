@@ -927,6 +927,7 @@ def run_university_detail(job_id: int, cfg: Dict[str, Any],
     lock = threading.Lock()
     st = {"done": 0, "ranks": 0, "courses": 0, "exams": 0, "err": 0}
     _last_push = {"t": 0.0}
+    halt = {"reason": None}
 
     def budget_hit():
         reqs, byts, _ = stats.snapshot()
@@ -959,10 +960,11 @@ def run_university_detail(job_id: int, cfg: Dict[str, Any],
                 return
             uid = int(u["university_id"])
             if sa_db.stop_requested(job_id):
+                halt["reason"] = "stopped by user"
                 stop.set(); return
             bh = budget_hit()
             if bh:
-                log(f"  ⏸ {bh}"); stop.set(); return
+                log(f"  ⏸ {bh}"); halt["reason"] = bh; stop.set(); return
             client.session_id = f"sau{idx}_{uid}"
             try:
                 html = client.get_text(u["university_url"])
@@ -1016,10 +1018,13 @@ def run_university_detail(job_id: int, cfg: Dict[str, Any],
     push()
     c = sa_db.counts()
     left = len(sa_db.universities_pending_detail())
-    msg = (f"enriched {c.get('universities_detailed', 0):,}/{c.get('universities', 0):,} "
+    msg = (f"{halt['reason'] + ' — ' if halt['reason'] else ''}"
+           f"enriched {c.get('universities_detailed', 0):,}/{c.get('universities', 0):,} "
            f"universities · {c.get('university_rankings', 0):,} rankings · "
            f"{c.get('university_courses', 0):,} course rows · "
            f"{st['exams']:,} exam scores filled"
-           + (f" · {left:,} still pending" if left else ""))
-    sa_db.update_job(job_id, status="completed", message=msg, finished_at=time.time())
+           + (f" · {left:,} still queued "
+              f"({'not attempted' if halt['reason'] else 'to retry'})" if left else ""))
+    sa_db.update_job(job_id, status="stopped" if halt["reason"] else "completed",
+                     message=msg, finished_at=time.time())
     log(msg)

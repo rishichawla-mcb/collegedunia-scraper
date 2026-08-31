@@ -279,6 +279,7 @@ def run_catalogue(job_id: int, cfg: Dict[str, Any],
     stop = threading.Event()
     lock = threading.Lock()
     state = {"done": 0, "rows": 0}
+    halt = {"reason": None}
 
     def budget_hit() -> Optional[str]:
         reqs, byts, _ = stats.snapshot()
@@ -305,11 +306,13 @@ def run_catalogue(job_id: int, cfg: Dict[str, Any],
             except _queue.Empty:
                 return
             if cf_db.stop_requested(job_id):
+                halt["reason"] = "stopped by user"
                 stop.set()
                 return
             bh = budget_hit()
             if bh:
                 log(f"  ⏸ {bh}")
+                halt["reason"] = bh
                 stop.set()
                 return
             # one sticky IP per partition so pagination stays on a single exit node
@@ -356,12 +359,13 @@ def run_catalogue(job_id: int, cfg: Dict[str, Any],
     push()
     c = cf_db.counts()
     fc = cf_db.phase_b_forecast()
-    msg = (f"catalogue: {c['courses']:,} courses "
+    msg = (f"{halt['reason'] + ' — ' if halt['reason'] else ''}"
+           f"catalogue: {c['courses']:,} courses "
            f"({c['courses_with_count']:,} with a college count) · "
            f"phase B forecast: {fc['expected_offerings']:,} offerings "
            f"in ~{fc['expected_pages']:,} requests")
-    cf_db.update_job(job_id, status="completed", message=msg,
-                     finished_at=time.time())
+    cf_db.update_job(job_id, status="stopped" if halt["reason"] else "completed",
+                     message=msg, finished_at=time.time())
     log(msg)
 
 
@@ -412,6 +416,10 @@ def run_offerings(job_id: int, cfg: Dict[str, Any],
     lock = threading.Lock()
     state = {"done": 0, "rows": 0, "empty": 0, "err": 0}
     _last_push = {"t": 0.0}
+    # WHY the run ended. Without this a user-stopped job reported "completed"
+    # with work still queued, which reads as "70 courses failed" when in fact
+    # they were never attempted.
+    halt = {"reason": None}
 
     def budget_hit() -> Optional[str]:
         reqs, byts, _ = stats.snapshot()
@@ -441,11 +449,13 @@ def run_offerings(job_id: int, cfg: Dict[str, Any],
             cid = int(row["course_id"])
             expected = int(row.get("colleges_count") or 0)
             if cf_db.stop_requested(job_id):
+                halt["reason"] = "stopped by user"
                 stop.set()
                 return
             bh = budget_hit()
             if bh:
                 log(f"  ⏸ {bh}")
+                halt["reason"] = bh
                 stop.set()
                 return
             client.session_id = f"cfb{idx}_{cid}"   # sticky IP for this course's pages
@@ -502,9 +512,13 @@ def run_offerings(job_id: int, cfg: Dict[str, Any],
     push()
     c = cf_db.counts()
     fc = cf_db.phase_b_forecast()
-    msg = (f"offerings: {c['offerings']:,} rows across "
+    status = "stopped" if halt["reason"] else "completed"
+    msg = (f"{halt['reason'] + ' — ' if halt['reason'] else ''}"
+           f"offerings: {c['offerings']:,} rows across "
            f"{c['distinct_colleges']:,} colleges · "
            f"{c['courses_scraped']:,}/{c['courses']:,} courses done"
-           + (f" · {fc['courses_left']:,} still pending" if fc["courses_left"] else ""))
-    cf_db.update_job(job_id, status="completed", message=msg, finished_at=time.time())
+           + (f" · {fc['courses_left']:,} still queued "
+              f"({'not attempted' if halt['reason'] else 'to retry'})"
+              if fc["courses_left"] else ""))
+    cf_db.update_job(job_id, status=status, message=msg, finished_at=time.time())
     log(msg)
