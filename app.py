@@ -589,13 +589,43 @@ def _proc_rss_bytes():
     return None
 
 
+def _cgroup_stat(path: str) -> dict:
+    out = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                k, _, v = line.partition(" ")
+                try:
+                    out[k.strip()] = int(v.strip())
+                except ValueError:
+                    pass
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def _cgroup_mem():
-    """Container memory (used, limit) in bytes — cgroup v2 then v1."""
+    """Container memory (used, limit) in bytes — cgroup v2 then v1.
+
+    Reports the WORKING SET, not memory.current. memory.current counts the page
+    cache, and SQLite reads/writes fill that with gigabytes of reclaimable file
+    pages — which made this read "98% · 2.0/2.0 GB" while Render's own dashboard
+    showed ~600 MB and nothing was remotely near an OOM. Subtracting the
+    reclaimable file cache is what container_memory_working_set_bytes does, and
+    it is the number that actually predicts an OOM kill."""
     lim = _read_int("/sys/fs/cgroup/memory.max")
     use = _read_int("/sys/fs/cgroup/memory.current")
+    if use is not None:
+        st = _cgroup_stat("/sys/fs/cgroup/memory.stat")
+        # inactive_file is trivially reclaimable; drop it from the working set.
+        use = max(0, use - int(st.get("inactive_file", 0)))
     if lim is None:
         lim = _read_int("/sys/fs/cgroup/memory/memory.limit_in_bytes")
         use = _read_int("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        if use is not None:
+            st = _cgroup_stat("/sys/fs/cgroup/memory/memory.stat")
+            use = max(0, use - int(st.get("total_inactive_file",
+                                         st.get("inactive_file", 0))))
     if lim and lim > (1 << 62):          # 'max' / unlimited sentinel
         lim = None
     if use is None or lim is None:       # fallback: /proc/meminfo (host-level)
@@ -709,7 +739,8 @@ def render_system_bar() -> None:
         st.caption("🖥️ System — live (refreshes on every rerun; live during a running job)")
         r1 = st.columns(6)
         r1[0].metric("CPU", f"{cpu:.0f}%" if cpu is not None else "—", f"{cores} cores")
-        r1[1].metric("Memory", f"{mem_pct:.0f}%" if mem_pct is not None else "—",
+        r1[1].metric("Memory (working set)",
+                     f"{mem_pct:.0f}%" if mem_pct is not None else "—",
                      f"{_fmt_bytes(mem_use)} / {_fmt_bytes(mem_lim)}")
         r1[2].metric("App RSS", _fmt_bytes(rss))
         r1[3].metric("Disk", f"{disk_pct:.0f}%" if disk_pct is not None else "—",
