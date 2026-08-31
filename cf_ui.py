@@ -17,11 +17,86 @@ import pandas as pd
 import streamlit as st
 
 import cf_db
+import cf_export
 import cf_vertical  # noqa: F401  registers 'coursefinder'
 _VERTICALS = (cf_vertical,)   # referenced so pyflakes keeps the registration import
 import db as _core
 
 SECS_PER_REQ = 19.0     # observed round-trip through the proxy
+
+# A download costs ~2x its size in server RAM (Streamlit holds one copy in
+# session_state and another to serve). On a 2 GB box that is what killed the
+# domestic export before it was fixed, so build to a temp file first and refuse
+# anything over the cap rather than OOM the host and log the user out.
+MAX_DL_MB = float(os.environ.get("CD_MAX_DOWNLOAD_MB", "150"))
+
+
+def _prepare(build, suffix):
+    """Build to a temp file, then load it only if it is under the cap.
+    Returns (bytes | None, size); None means 'too large to serve'."""
+    import tempfile
+    fd, tmp = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    try:
+        build(tmp)
+        size = os.path.getsize(tmp)
+        if size > MAX_DL_MB * 1048576:
+            return None, size
+        with open(tmp, "rb") as fh:
+            return fh.read(), size
+    except Exception as err:  # noqa: BLE001
+        st.error(f"Export failed: {str(err)[:300]}")
+        return None, -1
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _offer(container, data, size, fname, key):
+    if data is None:
+        if size >= 0:
+            container.error(
+                f"**{fname} would be {size/1048576:,.0f} MB — too big to hand to "
+                f"the browser** (cap {MAX_DL_MB:.0f} MB). Untick *include raw "
+                f"payload*, or use **.xlsx** — it is zip-compressed and typically "
+                f"far smaller.")
+        st.session_state.pop(key, None)
+        return
+    st.session_state[key] = (fname, data, size)
+
+
+def _render_pending(container, key, mime):
+    item = st.session_state.get(key)
+    if not item:
+        return
+    fname, data, size = item
+    container.caption(f"Ready: **{fname}** · {size/1048576:.1f} MB")
+    container.download_button(f"⬇️ Download {fname}", data=data, file_name=fname,
+                              mime=mime, key=f"dl_{key}")
+    if container.button("🧹 Clear from memory", key=f"clr_{key}"):
+        st.session_state.pop(key, None)
+        st.rerun()
+
+
+def _estimate_mb(table: str, include_raw: bool) -> float:
+    """Rough size before building, so the user isn't surprised."""
+    try:
+        with cf_db.connect() as conn:
+            n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            if not n:
+                return 0.0
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+            sel = ",".join(f"COALESCE(LENGTH(CAST({c} AS TEXT)),0)"
+                           for c in cols
+                           if include_raw or c != "raw_json") or "0"
+            avg = conn.execute(
+                f"SELECT AVG({sel}) FROM (SELECT * FROM {table} LIMIT 2000)"
+            ).fetchone()[0] or 0
+        return n * (float(avg) + len(cols)) / 1048576.0
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def _launch(job_id: int) -> None:
@@ -207,6 +282,56 @@ def render() -> None:
             if not top.empty:
                 st.markdown("**Biggest courses by college count**")
                 st.dataframe(top, use_container_width=True, hide_index=True)
+
+        # ------------------------------------------------------------ export
+        st.divider()
+        st.markdown("### ⬇️ Export")
+        raw = st.checkbox(
+            "Include raw payload (`raw_json`)", value=False, key="cfe_raw",
+            help="Off by default — the payloads are the bulk of the data and every "
+                 "parsed column is exported either way.")
+        st.caption(f"Builds to a temp file first, so a large export can't blow up "
+                   f"the server. Anything over {MAX_DL_MB:.0f} MB is refused rather "
+                   f"than served.")
+
+        e1, e2, e3 = st.columns(3)
+        est_t = _estimate_mb(which, raw)
+        e1.caption(f"`{which}` ≈ {est_t:,.1f} MB")
+
+        if e1.button(f"🛠️ Build {which}.csv", key="cfe_csv"):
+            with st.spinner("Building CSV…"):
+                d, s = _prepare(
+                    lambda p: cf_export.to_csv(which, include_raw=raw, out_path=p),
+                    ".csv")
+            _offer(st, d, s, f"{which}.csv", "cfe_csv_data")
+        _render_pending(st, "cfe_csv_data", "text/csv")
+
+        if e2.button(f"🛠️ Build {which}.json", key="cfe_json"):
+            with st.spinner("Building JSON…"):
+                d, s = _prepare(
+                    lambda p: cf_export.to_json(which, include_raw=raw, out_path=p),
+                    ".json")
+            _offer(st, d, s, f"{which}.json", "cfe_json_data")
+        _render_pending(st, "cfe_json_data", "application/json")
+
+        if e3.button("🛠️ Build course_finder.xlsx (all tables)", key="cfe_xlsx"):
+            with st.spinner("Building workbook…"):
+                d, s = _prepare(
+                    lambda p: cf_export.to_xlsx(include_raw=raw, out_path=p),
+                    ".xlsx")
+            _offer(st, d, s, "course_finder.xlsx", "cfe_xlsx_data")
+        _render_pending(st, "cfe_xlsx_data",
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet")
+
+        with cf_db.connect() as conn:
+            n_off = conn.execute("SELECT COUNT(*) FROM cf_offerings").fetchone()[0]
+        if n_off > cf_export.XLSX_MAX_ROWS:
+            st.warning(
+                f"`cf_offerings` has {n_off:,} rows — past Excel's "
+                f"{cf_export.XLSX_MAX_ROWS:,}-row sheet limit. The .xlsx export "
+                f"truncates that sheet; use CSV for the complete table.",
+                icon="⚠️")
 
     # ------------------------------------------------------------ History
     with tab_hist:

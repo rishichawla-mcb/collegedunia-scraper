@@ -10,6 +10,7 @@ BUILD = "2026-08-29a"
 
 import vertical_base as vb
 import cf_db
+import cf_export
 import cf_scraper
 
 
@@ -32,6 +33,7 @@ COURSE_FINDER = vb.Vertical(
     db_path=cf_db.CF_DB_PATH,
     init_db=cf_db.init_db,
     counts=cf_db.counts,
+    export_xlsx=cf_export.to_xlsx,
     get_job=cf_db.get_job,
     make_logger=_make_logger,
     phases=[
