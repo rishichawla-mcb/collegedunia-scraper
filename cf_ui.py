@@ -22,7 +22,12 @@ import cf_vertical  # noqa: F401  registers 'coursefinder'
 _VERTICALS = (cf_vertical,)   # referenced so pyflakes keeps the registration import
 import db as _core
 
-SECS_PER_REQ = 19.0     # observed round-trip through the proxy
+# Fallback only. The real figure is measured from this vertical's own completed
+# jobs (see _measured_rate) — a hardcoded constant was wildly wrong: it came from
+# a single-threaded, block-heavy Phase 1 log and predicted 6 hours for work that
+# actually takes 35 minutes.
+FALLBACK_SECS_PER_REQ = 4.0
+BYTES_PER_OFFERING = 2400      # measured: ~2.4 KB per row with raw_json on
 
 # A download costs ~2x its size in server RAM (Streamlit holds one copy in
 # session_state and another to serve). On a 2 GB box that is what killed the
@@ -121,15 +126,48 @@ def _proxy_line() -> str:
     return "direct (no proxy)"
 
 
-def _eta(requests: int, concurrency: int) -> str:
-    if not requests:
-        return "—"
-    secs = requests * SECS_PER_REQ / max(1, concurrency)
-    if secs < 3600:
+def _measured_rate():
+    """Requests/second actually achieved by this vertical's completed jobs.
+    Returns (rate, source_job_id) or (None, None) when there is no history."""
+    try:
+        for j in cf_db.list_jobs(limit=25):
+            if j.get("status") != "completed" or not (j.get("req_count") or 0):
+                continue
+            dur = (j.get("finished_at") or 0) - (j.get("started_at") or 0)
+            if dur > 60 and j["req_count"] > 200:
+                return j["req_count"] / dur, j["id"]
+    except Exception:  # noqa: BLE001
+        pass
+    return None, None
+
+
+def _fmt_dur(secs: float) -> str:
+    if secs < 90:
+        return f"~{secs:.0f}s"
+    if secs < 5400:
         return f"~{secs/60:.0f} min"
-    if secs < 86400:
+    if secs < 172800:
         return f"~{secs/3600:.1f} h"
     return f"~{secs/86400:.1f} days"
+
+
+def _eta(requests: int, concurrency: int) -> str:
+    """Prefer the measured throughput. That figure already includes whatever
+    concurrency produced it, so scale by the ratio of the two."""
+    if not requests:
+        return "—"
+    rate, _ = _measured_rate()
+    if rate:
+        return _fmt_dur(requests / rate)
+    return _fmt_dur(requests * FALLBACK_SECS_PER_REQ / max(1, concurrency))
+
+
+def _fmt_size(nbytes: float) -> str:
+    if nbytes < 1024**2:
+        return f"{nbytes/1024:,.0f} KB"
+    if nbytes < 1024**3:
+        return f"{nbytes/1024**2:,.0f} MB"
+    return f"{nbytes/1024**3:,.1f} GB"
 
 
 def _cfg(**extra):
@@ -204,8 +242,10 @@ def render() -> None:
                                    step=100, key="cfa_mb")
         force_a = a3.checkbox("Restart from scratch", value=False, key="cfa_force",
                               help="Off = resume, skipping partitions already done.")
+        _ra, _sa = _measured_rate()
         st.caption(f"~21,700 courses ≈ 2,200–3,500 requests → "
-                   f"**{_eta(3000, int(conc_a))}** at {int(conc_a)} workers.")
+                   f"**{_eta(3000, int(conc_a))}**"
+                   + (f" (measured {_ra:.2f} req/s)" if _ra else " (estimate)"))
         if st.button("▶️ Run catalogue sweep", type="primary", key="cfa_run"):
             jid = cf_db.create_job("catalogue", _cfg(
                 concurrency=int(conc_a), budget_mb=float(budget_a),
@@ -227,7 +267,8 @@ def render() -> None:
             f[0].metric("Courses pending", f"{fc['courses_left']:,}")
             f[1].metric("Offerings expected", f"{fc['offerings_left']:,}")
             f[2].metric("Requests needed", f"{fc['pages_left']:,}")
-            f[3].metric("Est. disk", f"{fc['offerings_left']*2.4/1000:,.1f} GB")
+            f[3].metric("Est. disk",
+                        _fmt_size(fc["offerings_left"] * BYTES_PER_OFFERING))
 
             b1, b2, b3 = st.columns(3)
             conc_b = b1.number_input("Parallel workers", 1, 20, 8, key="cfb_conc")
@@ -246,8 +287,13 @@ def render() -> None:
                                         "every parsed column is kept either way.")
             budget_b = st.number_input("Bandwidth budget (MB, 0 = none)", 0, 50000, 0,
                                        step=500, key="cfb_mb")
-            st.caption(f"**{_eta(fc['pages_left'], int(conc_b))}** at "
-                       f"{int(conc_b)} workers.")
+            _rate, _src = _measured_rate()
+            st.caption(
+                f"**{_eta(fc['pages_left'], int(conc_b))}** for "
+                f"{fc['pages_left']:,} requests"
+                + (f" — measured at {_rate:.2f} req/s from job #{_src}."
+                   if _rate else
+                   " — estimate only (no completed job to measure yet)."))
             if st.button("▶️ Run offerings crawl", type="primary", key="cfb_run"):
                 jid = cf_db.create_job("offerings", _cfg(
                     concurrency=int(conc_b), max_courses=int(maxc),
