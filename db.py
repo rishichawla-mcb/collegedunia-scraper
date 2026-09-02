@@ -438,6 +438,75 @@ def init_db(db_path: str = DB_PATH) -> None:
             "PRIMARY KEY (college_id, agency, year, stream))")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_crank_college "
                      "ON college_rankings(college_id)")
+        # Migration: entity_type on the two entity tables. Collegedunia mixes
+        # universities into what it calls "colleges" — 1,134 of 14,997 `colleges`
+        # rows and 1,391 directory rows point at /university/ URLs. The data was
+        # always there; nothing labelled it. Purely additive.
+        for tbl in ("colleges", "colleges_directory"):
+            ecols = {r[1] for r in conn.execute(f"PRAGMA table_info({tbl})")}
+            if "entity_type" not in ecols:
+                conn.execute(f"ALTER TABLE {tbl} ADD COLUMN entity_type TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_colleges_entity "
+                     "ON colleges(entity_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dir_entity "
+                     "ON colleges_directory(entity_type)")
+
+
+# ---------------------------------------------------------------------------
+# Entity typing
+# ---------------------------------------------------------------------------
+# Collegedunia's "colleges" listing is really a mix of colleges and
+# universities, distinguishable only by the URL: /university/<id>-slug versus
+# /college/<id>-slug. Nothing ever recorded which was which, so a consumer of
+# this data cannot tell a university from a college. The information costs zero
+# requests — it has been sitting in `link` since the first crawl.
+ENTITY_TABLES = ("colleges", "colleges_directory")
+
+
+def entity_type_report(db_path: str = DB_PATH) -> Dict[str, Dict[str, int]]:
+    """Count what the backfill would set, per table. Read-only."""
+    out: Dict[str, Dict[str, int]] = {}
+    with connect(db_path) as conn:
+        for tbl in ENTITY_TABLES:
+            def n(where: str, args=()) -> int:
+                try:
+                    return conn.execute(
+                        f"SELECT COUNT(*) FROM {tbl} WHERE {where}", args).fetchone()[0]
+                except Exception:  # noqa: BLE001  (table absent on a fresh DB)
+                    return 0
+            blank = "COALESCE(entity_type,'')=''"
+            out[tbl] = {
+                "total": n("1=1"),
+                "already_typed": n("COALESCE(entity_type,'')<>''"),
+                "university": n(f"{blank} AND link LIKE '%/university/%'"),
+                "college": n(f"{blank} AND link LIKE '%/college/%'"),
+                "unknown": n(f"{blank} AND COALESCE(link,'') NOT LIKE '%/university/%' "
+                             f"AND COALESCE(link,'') NOT LIKE '%/college/%'"),
+            }
+    return out
+
+
+def backfill_entity_type(db_path: str = DB_PATH) -> Dict[str, Dict[str, int]]:
+    """Derive entity_type from `link`. Returns rows changed per table/value.
+
+    Non-destructive in both directions: it only ever fills a blank, so a value
+    set by hand or by a later parser is never overwritten, and no row is
+    deleted or otherwise altered. Re-running it is a no-op. Rows whose `link`
+    matches neither pattern are left NULL rather than guessed at.
+    """
+    changed: Dict[str, Dict[str, int]] = {}
+    with connect(db_path) as conn:
+        for tbl in ENTITY_TABLES:
+            res = {}
+            for value, pattern in (("university", "%/university/%"),
+                                   ("college", "%/college/%")):
+                cur = conn.execute(
+                    f"UPDATE {tbl} SET entity_type=? "
+                    f"WHERE COALESCE(entity_type,'')='' AND link LIKE ?",
+                    (value, pattern))
+                res[value] = cur.rowcount or 0
+            changed[tbl] = res
+    return changed
 
 
 # ---------------------------------------------------------------------------
