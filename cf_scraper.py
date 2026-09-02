@@ -252,14 +252,37 @@ def run_catalogue(job_id: int, cfg: Dict[str, Any],
         facets = {}
     cf_db.set_setting("facets", facets)
 
-    # Slice by course_tag_id — 200 values, each comfortably under the ~1,700 cap.
-    dim = str(merged.get("partition_by", "course_tag_id"))
-    values = facets.get(dim) or []
-    if not values:
+    # Slice the listing so no single query hits the ~1,700-result ceiling.
+    #
+    # One dimension is never enough on its own. Sweeping by course_tag_id (200
+    # values) reached 16,239 of the catalogue's 21,689 courses: a course carrying
+    # no course_tag_id is invisible to every one of those 200 queries, so ~5,450
+    # courses could not be seen however many times the sweep ran. Sweeping a
+    # SECOND dimension (stream_id, level, ...) asks a different question and
+    # catches what the first could not. Partition keys are namespaced by
+    # dimension, so passes never collide, `done_partitions()` still resumes
+    # correctly, and upserts make the overlap free.
+    dims = merged.get("partition_by", "course_tag_id")
+    if isinstance(dims, str):
+        dims = [d.strip() for d in dims.split(",") if d.strip()]
+    dims = [d for d in (dims or ["course_tag_id"])]
+
+    partitions: List[tuple] = []
+    for dim in dims:
+        values = facets.get(dim) or []
+        if not values:
+            log(f"  ! '{dim}' has no facet values — skipped")
+            continue
+        partitions += [(f"{dim}={v}", {dim: v}) for v in values]
+    if not partitions:
         partitions = [("ALL", {})]
-        log("  no facet values — single unsliced partition (will hit the ~1,700 cap)")
+        log("  no facet values at all — single unsliced sweep "
+            f"(will stop at the {LISTING_CAP}-result cap)")
     else:
-        partitions = [(f"{dim}={v}", {dim: v}) for v in values]
+        log("  slicing by " + ", ".join(
+            f"{d} ({len(facets.get(d) or [])})" for d in dims
+            if facets.get(d)))
+
     if not merged.get("force_restart"):
         done = cf_db.done_partitions()
         skipped = len([p for p, _ in partitions if p in done])
@@ -270,7 +293,7 @@ def run_catalogue(job_id: int, cfg: Dict[str, Any],
     total = len(partitions)
     cf_db.update_job(job_id, total_units=total,
                      message=f"{total} partitions to sweep")
-    log(f"  {total} partitions to sweep by {dim}")
+    log(f"  {total} partitions to sweep")
 
     q: "_queue.Queue" = _queue.Queue()
     for p in partitions:

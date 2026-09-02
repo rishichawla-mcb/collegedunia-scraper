@@ -242,13 +242,42 @@ def render() -> None:
                                    step=100, key="cfa_mb")
         force_a = a3.checkbox("Restart from scratch", value=False, key="cfa_force",
                               help="Off = resume, skipping partitions already done.")
+
+        # Which facet(s) to slice by. One dimension is not enough: the
+        # course_tag_id sweep reached 16,239 of ~21,689 courses, because a course
+        # carrying no course_tag_id is invisible to all 200 of those queries.
+        # Sweeping a second dimension asks a different question and catches them.
+        _facets = cf_db.get_setting("facets", {}) or {}
+        _opts = [k for k, v in sorted(_facets.items()) if v]
+        if _opts:
+            _default = [d for d in ("course_tag_id",) if d in _opts] or _opts[:1]
+            dims_a = st.multiselect(
+                "Slice by", _opts, default=_default, key="cfa_dims",
+                help="Each dimension is a separate pass. Partitions are namespaced "
+                     "per dimension, so passes never collide and courses seen twice "
+                     "are upserted, not duplicated. Add a second dimension to reach "
+                     "courses the first cannot see.")
+            st.caption("available: " + " · ".join(
+                f"`{k}` {len(_facets.get(k) or []):,}" for k in _opts))
+            _npart = sum(len(_facets.get(d) or []) for d in dims_a)
+            if len(dims_a) > 1:
+                st.caption(f"{_npart:,} partitions across {len(dims_a)} passes. "
+                           "Courses found by more than one pass are deduplicated.")
+        else:
+            dims_a = ["course_tag_id"]
+            _npart = 200
+            st.caption("Facet list not yet known — it is read from the page on the "
+                       "first sweep. Defaulting to `course_tag_id`.")
+
         _ra, _sa = _measured_rate()
-        st.caption(f"~21,700 courses ≈ 2,200–3,500 requests → "
-                   f"**{_eta(3000, int(conc_a))}**"
+        _reqs = max(1000, _npart * 15)
+        st.caption(f"~{_npart:,} partitions ≈ {_reqs:,} requests → "
+                   f"**{_eta(_reqs, int(conc_a))}**"
                    + (f" (measured {_ra:.2f} req/s)" if _ra else " (estimate)"))
         if st.button("▶️ Run catalogue sweep", type="primary", key="cfa_run"):
             jid = cf_db.create_job("catalogue", _cfg(
                 concurrency=int(conc_a), budget_mb=float(budget_a),
+                partition_by=list(dims_a) or ["course_tag_id"],
                 force_restart=bool(force_a)))
             _launch(jid)
             st.success(f"Started catalogue sweep — job #{jid}")
