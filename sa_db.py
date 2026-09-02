@@ -268,6 +268,57 @@ CREATE TABLE IF NOT EXISTS sa_university_progress (
 );
 CREATE INDEX IF NOT EXISTS sa_idx_uprog_status ON sa_university_progress(status);
 
+-- ---------------------------------------------------------------------------
+-- Phase ⑤ — programme detail (one request per programme's own page)
+-- ---------------------------------------------------------------------------
+-- Measured on a stratified sample of the target population (programmes with a
+-- blank out_of that appear on no university page): 87% of pages carry an
+-- exams[] array, 95% of those rows have exam_out_of_score AND exam_score,
+-- 100% carry previous_fees, 100% carry sa_scholarships, 47% carry living_cost.
+
+-- Year-by-year fee history. Source: course_data.previous_fees[].
+CREATE TABLE IF NOT EXISTS sa_program_fees (
+    program_id  INTEGER,
+    year_added  TEXT,
+    fee_type    TEXT,          -- previous_fees[].type
+    fees        TEXT,
+    total_fee   TEXT,
+    number      TEXT,
+    college_id  INTEGER,
+    scraped_at  REAL, source_job_id INTEGER,
+    PRIMARY KEY (program_id, year_added, fee_type)
+);
+CREATE INDEX IF NOT EXISTS sa_idx_pfees_prog ON sa_program_fees(program_id);
+
+-- Scholarships attached to a specific programme. Source:
+-- course_data.sa_scholarships[]. Distinct from the sa_scholarships table,
+-- which is the site-wide scholarship directory from phase ③.
+CREATE TABLE IF NOT EXISTS sa_program_scholarships (
+    program_id           INTEGER,
+    scholarship_id       INTEGER,
+    title                TEXT,
+    name                 TEXT,
+    url                  TEXT,
+    amount               TEXT,
+    eligibility_criteria TEXT,
+    deadline             TEXT,
+    is_international     INTEGER,
+    content              TEXT,
+    scraped_at  REAL, source_job_id INTEGER,
+    PRIMARY KEY (program_id, scholarship_id)
+);
+CREATE INDEX IF NOT EXISTS sa_idx_pschol_prog ON sa_program_scholarships(program_id);
+
+-- Phase ⑤ progress. Self-draining queue: a programme leaves it once done.
+CREATE TABLE IF NOT EXISTS sa_program_detail_progress (
+    program_id   INTEGER PRIMARY KEY,
+    status       TEXT,         -- 'done' | 'error'
+    found_exams  INTEGER DEFAULT 0,
+    found_fees   INTEGER DEFAULT 0,
+    updated_at   REAL
+);
+CREATE INDEX IF NOT EXISTS sa_idx_pdprog_status ON sa_program_detail_progress(status);
+
 CREATE TABLE IF NOT EXISTS sa_settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS sa_facets (
     filter_name TEXT, value_id TEXT, label TEXT, count INTEGER,
@@ -315,6 +366,11 @@ def init_db(db_path: str = SA_DB_PATH) -> None:
         for col, typ in UNIVERSITY_DETAIL_COLS:
             if col not in ucols:
                 conn.execute(f"ALTER TABLE sa_universities ADD COLUMN {col} {typ}")
+        # Phase ⑤ — programme detail, from each programme's own page.
+        pcols = {r[1] for r in conn.execute("PRAGMA table_info(sa_programs)")}
+        for col, typ in PROGRAM_DETAIL_COLS:
+            if col not in pcols:
+                conn.execute(f"ALTER TABLE sa_programs ADD COLUMN {col} {typ}")
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +533,51 @@ UNIVERSITY_DETAIL_COLS = [
 ]
 UNIVERSITY_DETAIL_NAMES = [c for c, _ in UNIVERSITY_DETAIL_COLS]
 
+# Phase ⑤ — columns added to sa_programs from the programme's own page.
+# Every one of these was verified populated on a live sample before being added;
+# the percentage is the measured fill rate. Fields that measured 0% are listed
+# in PROGRAM_DETAIL_DEAD below and deliberately NOT stored.
+PROGRAM_DETAIL_COLS = [
+    ("delivery_type", "TEXT"),              # 100%
+    ("is_stem_flag", "INTEGER"),            # 100%
+    ("degree_type_detail", "TEXT"),         # 100%
+    ("course_duration_detail", "TEXT"),     # 100%
+    ("total_fees", "TEXT"),                 # 94%
+    ("native_currency_total_fees", "TEXT"),  # 94%
+    ("application_start_date", "TEXT"),     # 94%
+    ("application_end_date_detail", "TEXT"),  # 94%
+    ("current_fee_year", "INTEGER"),        # 94%
+    ("description_detail", "TEXT"),         # 89%
+    ("total_fee_per_year", "TEXT"),         # 89%
+    ("default_fee_per_year", "TEXT"),       # 89%
+    ("short_entry_reqd", "TEXT"),           # 61%
+    ("course_name_detail", "TEXT"),         # 56%
+    ("credits", "INTEGER"),                 # 50%
+    ("application_fees", "TEXT"),           # 39%
+    ("thesis_based", "INTEGER"),
+    ("course_based", "INTEGER"),
+    ("course_tags_detail", "TEXT"),
+    ("college_id", "INTEGER"),
+    # Structures whose element shape was not fully mapped in the browser pass.
+    # Stored verbatim so nothing is lost and they can be normalised later with
+    # ZERO extra requests, rather than guessed at now and got wrong.
+    ("living_cost_json", "TEXT"),           # 47% of pages
+    ("fee_data_json", "TEXT"),              # course_fees_data + combined_fee_data
+    ("application_dates_json", "TEXT"),     # 100%
+    ("course_languages_json", "TEXT"),      # 100%
+    ("detail_json", "TEXT"),                # whole course_data, when kept
+    ("program_detail_scraped_at", "REAL"),
+]
+PROGRAM_DETAIL_NAMES = [c for c, _ in PROGRAM_DETAIL_COLS]
+
+# Measured 0% (or near it) across the sample — the source does not carry them,
+# so no column exists. Recorded here so nobody re-adds them on a hunch.
+PROGRAM_DETAIL_DEAD = (
+    "required_documents", "ranking", "is_sop_required", "work_experience",
+    "avg_salary", "enrollment", "work_visa", "avg_student_age",
+    "grade_for_entrance", "is_lor_required (6%)", "career (6%)",
+)
+
 _URANK_COLS = ["university_id", "agency_id", "agency", "year", "stream", "scope",
                "rank", "rank_out_of", "country_rank", "country_rank_out_of",
                "score", "score_out_of", "scraped_at", "source_job_id"]
@@ -567,6 +668,96 @@ def fill_program_exam_scores(rows, db_path: str = SA_DB_PATH) -> int:
                 (r.get("out_of") or "", r.get("exam_score") or "", pid, sf))
             n += cur.rowcount or 0
     return n
+
+
+_PFEE_COLS = ["program_id", "year_added", "fee_type", "fees", "total_fee",
+              "number", "college_id", "scraped_at", "source_job_id"]
+_PSCHOL_COLS = ["program_id", "scholarship_id", "title", "name", "url", "amount",
+                "eligibility_criteria", "deadline", "is_international", "content",
+                "scraped_at", "source_job_id"]
+
+
+def update_program_detail(program_id: int, fields: Dict[str, Any],
+                          db_path: str = SA_DB_PATH) -> None:
+    """Write phase-⑤ columns onto an existing sa_programs row.
+
+    Non-destructive, exactly like update_university_detail: a blank incoming
+    value never overwrites a stored one. Phase ② wrote these rows first and its
+    values must survive a detail pass that happens to omit a field.
+    """
+    cols = [c for c in PROGRAM_DETAIL_NAMES if c in fields]
+    if not cols:
+        return
+    sets = ",".join(
+        f"{c}=CASE WHEN ? IS NULL OR CAST(? AS TEXT)='' THEN {c} ELSE ? END"
+        for c in cols)
+    args: List[Any] = []
+    for c in cols:
+        v = fields.get(c)
+        args += [v, v, v]
+    with connect(db_path) as conn:
+        conn.execute(f"UPDATE sa_programs SET {sets} WHERE program_id=?",
+                     (*args, int(program_id)))
+
+
+def upsert_program_fees(rows, db_path: str = SA_DB_PATH) -> int:
+    if not rows:
+        return 0
+    with connect(db_path) as conn:
+        return _upsert(conn, "sa_program_fees", _PFEE_COLS,
+                       ["program_id", "year_added", "fee_type"], rows,
+                       preserve_nonempty=True)
+
+
+def upsert_program_scholarships(rows, db_path: str = SA_DB_PATH) -> int:
+    if not rows:
+        return 0
+    with connect(db_path) as conn:
+        return _upsert(conn, "sa_program_scholarships", _PSCHOL_COLS,
+                       ["program_id", "scholarship_id"], rows,
+                       preserve_nonempty=True)
+
+
+def programs_pending_detail(limit: int = 0, only_missing_out_of: bool = False,
+                            skip_on_university_page: bool = True,
+                            db_path: str = SA_DB_PATH):
+    """Self-draining phase-⑤ queue: programmes whose own page has not been read.
+
+    `skip_on_university_page` excludes the ~33k programmes phase ④ already
+    covered via their university's page — those already have out_of filled, so
+    re-fetching them costs requests and gains nothing. `only_missing_out_of`
+    narrows further to programmes that actually have an exam row still blank,
+    which is the cheapest possible run if the exam denominators are all you want.
+    """
+    where = ["COALESCE(p.program_url,'')<>''",
+             "(d.program_id IS NULL OR d.status<>'done')"]
+    if skip_on_university_page:
+        where.append("p.program_id NOT IN "
+                     "(SELECT course_id FROM sa_university_courses "
+                     " WHERE course_id IS NOT NULL)")
+    if only_missing_out_of:
+        where.append("EXISTS (SELECT 1 FROM sa_program_exams e "
+                     "        WHERE e.program_id=p.program_id "
+                     "          AND COALESCE(e.out_of,'')='')")
+    sql = ("SELECT p.program_id, p.name, p.program_url FROM sa_programs p "
+           "LEFT JOIN sa_program_detail_progress d ON d.program_id=p.program_id "
+           "WHERE " + " AND ".join(where) + " ORDER BY p.program_id")
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    with connect(db_path) as conn:
+        return [dict(r) for r in conn.execute(sql)]
+
+
+def set_program_detail_progress(program_id: int, status: str, exams: int = 0,
+                                fees: int = 0, db_path: str = SA_DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO sa_program_detail_progress"
+            "(program_id,status,found_exams,found_fees,updated_at) "
+            "VALUES(?,?,?,?,?) ON CONFLICT(program_id) DO UPDATE SET "
+            "status=excluded.status,found_exams=excluded.found_exams,"
+            "found_fees=excluded.found_fees,updated_at=excluded.updated_at",
+            (int(program_id), status, int(exams), int(fees), time.time()))
 
 
 def set_university_progress(university_id: int, status: str, courses: int = 0,
@@ -901,6 +1092,12 @@ def counts(db_path: str = SA_DB_PATH) -> Dict[str, int]:
             "programs_with_fee": one("SELECT COUNT(*) FROM sa_programs WHERE fee_native_amount IS NOT NULL"),
             "distinct_currencies": one("SELECT COUNT(DISTINCT fee_currency) FROM sa_programs WHERE fee_currency<>''"),
             "partitions_done": one("SELECT COUNT(*) FROM sa_program_progress WHERE status='done'"),
+            "programs_detailed": one("SELECT COUNT(*) FROM sa_programs "
+                                     "WHERE program_detail_scraped_at IS NOT NULL"),
+            "program_fees": one("SELECT COUNT(*) FROM sa_program_fees"),
+            "program_scholarships": one("SELECT COUNT(*) FROM sa_program_scholarships"),
+            "exams_with_out_of": one("SELECT COUNT(*) FROM sa_program_exams "
+                                     "WHERE COALESCE(out_of,'')<>''"),
             "scholarships": one("SELECT COUNT(*) FROM sa_scholarships"),
             "scholarships_detailed": one("SELECT COUNT(*) FROM sa_scholarships WHERE detail_scraped_at IS NOT NULL"),
         }

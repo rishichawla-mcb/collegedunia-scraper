@@ -1028,3 +1028,274 @@ def run_university_detail(job_id: int, cfg: Dict[str, Any],
     sa_db.update_job(job_id, status="stopped" if halt["reason"] else "completed",
                      message=msg, finished_at=time.time())
     log(msg)
+
+
+# ---------------------------------------------------------------------------
+# Phase ⑤ — programme detail (one request per programme's own page)
+# ---------------------------------------------------------------------------
+# What the page carries, MEASURED on a stratified live sample of the target
+# population (programmes with a blank out_of, absent from every university
+# page) rather than assumed from the key list:
+#
+#   exams[] present on 87% of pages; where present, exam_out_of_score and
+#     exam_score are populated on 95% of rows -> this is the phase's purpose
+#   previous_fees      100%     sa_scholarships   100%
+#   living_cost         47%     application_dates 100%
+#
+# Fields that measured 0% and are therefore NOT stored: required_documents,
+# ranking, is_sop_required, work_experience, avg_salary, enrollment,
+# work_visa, avg_student_age, grade_for_entrance. (is_lor_required and career
+# measured 6% — also dropped.) See sa_db.PROGRAM_DETAIL_DEAD.
+#
+# Both programme URL shapes resolve to the same payload and are handled by one
+# parser: `.../<slug>-<program_id>` and `.../programs?course_id=<id>`.
+
+def sa_parse_program_detail(pp: Dict[str, Any], program_id: int,
+                            job_id: Optional[int] = None,
+                            keep_raw: bool = False) -> Dict[str, Any]:
+    """Parse a programme page's pageProps.response.course_data into
+    {fields, fees, scholarships, exam_scores}."""
+    r = (pp or {}).get("response") or {}
+    cd = r.get("course_data") or {}
+    now = time.time()
+
+    def s(key) -> str:
+        v = cd.get(key)
+        return "" if v is None else str(v)
+
+    def j(key):
+        v = cd.get(key)
+        return json.dumps(v, ensure_ascii=False) if v not in (None, [], {}) else ""
+
+    fields = {
+        "delivery_type": s("delivery_type"),
+        "is_stem_flag": 1 if cd.get("is_stem") else (0 if "is_stem" in cd else None),
+        "degree_type_detail": s("degree_type"),
+        "course_duration_detail": s("course_duration"),
+        "total_fees": s("total_fees"),
+        "native_currency_total_fees": s("native_currency_total_fees"),
+        "application_start_date": s("application_start_date"),
+        "application_end_date_detail": s("application_end_date"),
+        "current_fee_year": _i(cd.get("current_fee_year")),
+        "description_detail": s("description"),
+        "total_fee_per_year": s("total_fee_per_year"),
+        "default_fee_per_year": s("default_fee_per_year"),
+        "short_entry_reqd": s("short_entry_reqd"),
+        "course_name_detail": s("course_name"),
+        "credits": _i(cd.get("credits")),
+        "application_fees": s("application_fees"),
+        "thesis_based": _i(cd.get("thesis_based")),
+        "course_based": _i(cd.get("course_based")),
+        "course_tags_detail": s("course_tags"),
+        "college_id": _i(cd.get("college_id")),
+        "living_cost_json": j("living_cost"),
+        "application_dates_json": j("application_dates"),
+        "course_languages_json": j("course_languages"),
+        "program_detail_scraped_at": now,
+    }
+    # course_fees_data and combined_fee_data are nested arrays whose element
+    # shape was not fully mapped. Kept verbatim so they can be normalised later
+    # with zero extra requests instead of being guessed at now.
+    fee_blob = {k: cd.get(k) for k in
+                ("course_fees_data", "combined_fee_data",
+                 "previous_year_course_fees_data", "prev_combined_fee")
+                if cd.get(k) not in (None, [], {})}
+    fields["fee_data_json"] = (json.dumps(fee_blob, ensure_ascii=False)
+                               if fee_blob else "")
+    fields["detail_json"] = (json.dumps(cd, ensure_ascii=False) if keep_raw else "")
+
+    fees = []
+    for f in (cd.get("previous_fees") or []):
+        if not isinstance(f, dict):
+            continue
+        year = str(f.get("year_added") or "").strip()
+        if not year:
+            continue
+        fees.append({
+            "program_id": program_id,
+            "year_added": year,
+            "fee_type": str(f.get("type") or ""),
+            "fees": str(f.get("fees") or ""),
+            "total_fee": str(f.get("total_fee") or ""),
+            "number": str(f.get("number") or ""),
+            "college_id": _i(f.get("college_id")),
+            "scraped_at": now, "source_job_id": job_id,
+        })
+
+    schols = []
+    for sc in (cd.get("sa_scholarships") or []):
+        if not isinstance(sc, dict):
+            continue
+        sid = _i(sc.get("id"))
+        if sid is None:
+            continue
+        schols.append({
+            "program_id": program_id, "scholarship_id": sid,
+            "title": str(sc.get("title") or ""),
+            "name": str(sc.get("name") or ""),
+            "url": abs_url(sc.get("url")) if sc.get("url") else "",
+            "amount": str(sc.get("amount") or ""),
+            "eligibility_criteria": str(sc.get("eligibility_criteria") or ""),
+            "deadline": str(sc.get("deadline") or ""),
+            "is_international": 1 if sc.get("isInternational") else 0,
+            "content": str(sc.get("content") or ""),
+            "scraped_at": now, "source_job_id": job_id,
+        })
+
+    # The point of the phase. fill_program_exam_scores only ever fills a blank,
+    # so a value phase ④ already recovered is never overwritten.
+    exam_scores = []
+    for e in (cd.get("exams") or []):
+        if not isinstance(e, dict):
+            continue
+        # A sample page returned an exam row with no short_form. The upsert keys
+        # on (program_id, short_form), so such a row must be dropped, not
+        # written with a null key.
+        sf = str(e.get("short_form") or "").strip()
+        if not sf:
+            continue
+        exam_scores.append({
+            "program_id": program_id, "short_form": sf,
+            "out_of": str(e.get("exam_out_of_score") or ""),
+            "exam_score": str(e.get("exam_score") or ""),
+        })
+
+    return {"fields": fields, "fees": fees, "scholarships": schols,
+            "exam_scores": exam_scores}
+
+
+def run_program_detail(job_id: int, cfg: Dict[str, Any],
+                       log: Callable[[str], None]) -> None:
+    """Phase ⑤: fetch each programme's own page. One request per programme."""
+    import queue as _q
+    merged = {**shared_proxy_cfg(), **cfg}
+    pm = ProxyManager.from_config(merged)
+    stats = Stats()
+    adaptive = AdaptiveDelay(float(merged.get("delay", 1.0)),
+                             enabled=bool(merged.get("adaptive", True)))
+    concurrency = max(1, int(merged.get("concurrency", 4)))
+    delay = float(merged.get("delay", 1.0))
+    budget_requests = int(merged.get("budget_requests", 0))
+    budget_bytes = int(float(merged.get("budget_mb", 0)) * 1024 * 1024)
+    keep_raw = bool(merged.get("keep_raw", False))
+
+    pending = sa_db.programs_pending_detail(
+        limit=int(merged.get("max_units", 0)),
+        only_missing_out_of=bool(merged.get("only_missing_out_of", False)),
+        skip_on_university_page=bool(merged.get("skip_on_university_page", True)))
+    total = len(pending)
+    sa_db.update_job(job_id, status="running", total_units=total,
+                     message=f"{total:,} programmes to enrich")
+    log(f"SA Phase ⑤ — programme detail: {total:,} programmes, "
+        f"concurrency={concurrency}")
+    if not total:
+        sa_db.update_job(job_id, status="completed", finished_at=time.time(),
+                         message="nothing pending — run ② Programs first")
+        log("nothing pending. Run ② Programs first so programmes exist.")
+        return
+
+    q: "_q.Queue" = _q.Queue()
+    for p in pending:
+        q.put(p)
+    stop = threading.Event()
+    lock = threading.Lock()
+    st = {"done": 0, "fees": 0, "schol": 0, "exams": 0, "noexam": 0, "err": 0}
+    _last_push = {"t": 0.0}
+    halt = {"reason": None}
+
+    def budget_hit():
+        reqs, byts, _ = stats.snapshot()
+        if budget_requests and reqs >= budget_requests:
+            return f"request budget reached ({reqs})"
+        if budget_bytes and byts >= budget_bytes:
+            return f"bandwidth budget reached ({byts/1048576:.1f} MB)"
+        return None
+
+    def push():
+        reqs, byts, _ = stats.snapshot()
+        with lock:
+            d, fe, sc, ex, er = (st["done"], st["fees"], st["schol"],
+                                 st["exams"], st["err"])
+        sa_db.update_job(job_id, done_units=d, items_written=fe + sc,
+                         req_count=reqs, bytes_count=byts,
+                         message=f"{d:,}/{total:,} programmes · {ex:,} exam scores "
+                                 f"filled · {fe:,} fee rows · {sc:,} scholarships · "
+                                 f"{byts/1048576:.1f} MB"
+                                 + (f" · {er} errors" if er else ""))
+
+    def worker(idx: int):
+        client = Client(pm, log=log, max_retries=int(merged.get("max_retries", 5)),
+                        backoff=float(merged.get("backoff", 4)), stats=stats,
+                        adaptive=adaptive)
+        while not stop.is_set():
+            try:
+                p = q.get_nowait()
+            except _q.Empty:
+                return
+            pid = int(p["program_id"])
+            if sa_db.stop_requested(job_id):
+                halt["reason"] = "stopped by user"
+                stop.set(); return
+            bh = budget_hit()
+            if bh:
+                log(f"  ⏸ {bh}"); halt["reason"] = bh; stop.set(); return
+            client.session_id = f"sap{idx}_{pid}"
+            try:
+                html = client.get_text(p["program_url"])
+                pp = _nextdata_pageprops(html)
+                parsed = sa_parse_program_detail(pp, pid, job_id, keep_raw=keep_raw)
+                if not parsed["fields"].get("degree_type_detail") \
+                        and not parsed["fees"] and not parsed["exam_scores"]:
+                    raise ValueError("no course_data on page")
+                sa_db.update_program_detail(pid, parsed["fields"])
+                nf = sa_db.upsert_program_fees(parsed["fees"])
+                ns = sa_db.upsert_program_scholarships(parsed["scholarships"])
+                filled = (sa_db.fill_program_exam_scores(parsed["exam_scores"])
+                          if parsed["exam_scores"] else 0)
+                sa_db.set_program_detail_progress(pid, "done",
+                                                  len(parsed["exam_scores"]), nf)
+                with lock:
+                    st["fees"] += nf
+                    st["schol"] += ns
+                    st["exams"] += filled
+                    if not parsed["exam_scores"]:
+                        st["noexam"] += 1
+            except Exception as err:  # noqa: BLE001
+                # left NOT 'done', so the self-draining queue retries it later
+                sa_db.set_program_detail_progress(pid, "error")
+                with lock:
+                    st["err"] += 1
+                log(f"  ! programme {pid} failed: {str(err)[:140]}")
+            with lock:
+                st["done"] += 1
+                _d = st["done"]
+            _now = time.time()
+            if _now - _last_push["t"] >= 5 or _d >= total:
+                _last_push["t"] = _now
+                push()
+            if delay:
+                time.sleep(adaptive.value() if adaptive else delay)
+
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True)
+               for i in range(concurrency)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    push()
+    c = sa_db.counts()
+    left = len(sa_db.programs_pending_detail())
+    with lock:
+        _ne = st["noexam"]
+    msg = (f"{halt['reason'] + ' — ' if halt['reason'] else ''}"
+           f"programme detail: {c.get('programs_detailed', 0):,} programmes enriched · "
+           f"{c.get('exams_with_out_of', 0):,} exam rows now have out_of · "
+           f"{c.get('program_fees', 0):,} fee rows · "
+           f"{c.get('program_scholarships', 0):,} scholarships"
+           + (f" · {_ne:,} pages carried no exams" if _ne else "")
+           + (f" · {left:,} still queued "
+              f"({'not attempted' if halt['reason'] else 'to retry'})" if left else ""))
+    sa_db.update_job(job_id, status="stopped" if halt["reason"] else "completed",
+                     message=msg, finished_at=time.time())
+    log(msg)

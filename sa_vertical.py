@@ -62,6 +62,17 @@ STUDY_ABROAD = vb.Vertical(
                  "and a per-course block with seven years of fee history. Also "
                  "fills sa_program_exams.out_of, which the listing sends blank.",
                  sa_scraper.run_university_detail, depends_on=["programs"]),
+        vb.Phase("program_detail", "⑤ Programme detail",
+                 "Fetch each programme's OWN page — one request per programme. "
+                 "Phase ④ can only reach the ~33k programmes that appear on a "
+                 "university page; this reaches the other ~69k. Measured on a "
+                 "live sample of that target set: 87% of pages carry exam "
+                 "requirements and 95% of those rows have BOTH the score and "
+                 "the denominator, so this is the only route to the ~214k "
+                 "sa_program_exams rows still missing out_of. Also brings "
+                 "year-by-year fee history (100% of pages) and per-programme "
+                 "scholarships (100%). Self-draining: interrupted runs resume.",
+                 sa_scraper.run_program_detail, depends_on=["programs"]),
         # Future phases slot in here: program_details, verification — each a
         # Phase with its own runner. No framework change needed.
     ],
