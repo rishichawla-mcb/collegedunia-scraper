@@ -11,6 +11,7 @@ from __future__ import annotations
 
 BUILD = "2026-07-23a"
 
+import os
 import sys
 
 import vertical_base as vb
@@ -28,6 +29,15 @@ def main() -> None:
     vertical, job_id = sys.argv[1], int(sys.argv[2])
     v = vb.get(vertical)
     v.init_db()
+    # Record our pid so orphan recovery can tell a live run from a dead one.
+    # worker.py (domestic) has always done this; the vertical worker did not,
+    # which is exactly why cf_jobs/sa_jobs accumulated rows stuck at 'running'
+    # after container restarts. Best-effort: never block the run on bookkeeping.
+    if v.update_job:
+        try:
+            v.update_job(job_id, pid=os.getpid())
+        except Exception:  # noqa: BLE001
+            pass
     vb.run_job(vertical, job_id)
 
 

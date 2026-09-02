@@ -204,15 +204,31 @@ def _pid_alive(pid) -> bool:
     try:
         os.kill(int(pid), 0)
         return True
+    except PermissionError:
+        return True          # exists, just not ours to signal
     except Exception:
         return False
+
+
+# How long a row may go unchanged before we call its worker dead. A live worker
+# pushes progress every 5s, so 5 minutes of silence is unambiguous. Without this
+# guard a job launched moments ago — which has not yet recorded its pid — would
+# be reaped on sight.
+REAP_GRACE = float(os.environ.get("CD_REAP_GRACE", "300"))
+
+
+def _looks_dead(j) -> bool:
+    if _pid_alive(j.get("pid")):
+        return False
+    last = j.get("updated_at") or j.get("started_at") or 0
+    return not last or (time.time() - float(last)) >= REAP_GRACE
 
 
 # Recover jobs whose worker died (container restart / crash) — once per session.
 if not st.session_state.get("_recovered"):
     st.session_state["_recovered"] = True
     for _j in db.list_jobs(20):
-        if _j["status"] in ("running", "queued") and not _pid_alive(_j.get("pid")):
+        if _j["status"] in ("running", "queued") and _looks_dead(_j):
             # The worker died (crash / OOM-kill / restart). Save its staged data:
             # in incremental mode the bulk is already in master; flush the tail too
             # so nothing scraped is lost. (Strict-gate jobs keep their staging for
@@ -231,6 +247,22 @@ if not st.session_state.get("_recovered"):
                 pass
             db.update_job(_j["id"], status="stopped",
                           message=f"interrupted (worker not running){_saved}; resume to continue")
+
+    # Same recovery for every registered vertical (Study Abroad, Course Finder).
+    # These were NOT covered before: platform_worker.py never recorded a pid and
+    # nothing scanned sa_jobs/cf_jobs, so a container restart during a crawl left
+    # a row reading 'running' indefinitely with a Stop button that could not work.
+    # Imported lazily and fully guarded — a broken vertical must never stop the
+    # app from loading.
+    try:
+        import vertical_base as _vb
+        import sa_vertical
+        import cf_vertical
+        _ = (sa_vertical, cf_vertical)   # imported for their self-registration
+        _reaped = _vb.reap_all(REAP_GRACE)
+        st.session_state["_reaped"] = {k: v for k, v in _reaped.items() if v}
+    except Exception:  # noqa: BLE001
+        st.session_state["_reaped"] = {}
 
 
 # ---------------------------------------------------------------------------

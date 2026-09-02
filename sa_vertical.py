@@ -36,6 +36,8 @@ STUDY_ABROAD = vb.Vertical(
     export_xlsx=sa_export.to_xlsx,
     get_job=sa_db.get_job,
     make_logger=_make_logger,
+    list_jobs=sa_db.list_jobs,      # orphan recovery (vb.reap_stale_jobs)
+    update_job=sa_db.update_job,
     phases=[
         vb.Phase("facets", "① Facets",
                  "Capture all filter facets (country/level/stream/…) with counts from the "

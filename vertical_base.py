@@ -58,6 +58,12 @@ class Vertical:
     # knowing its internals. A vertical stores jobs/logs in its OWN db.
     get_job: Optional[Callable[[int], Dict[str, Any]]] = None       # (job_id) -> job dict
     make_logger: Optional[Callable[[int], Callable[[str], None]]] = None  # (job_id) -> log fn
+    # Needed for orphan recovery: a job whose worker process dies with the
+    # container leaves its row stuck at 'running' forever, and the UI then shows
+    # a Stop button that can never succeed (Stop only sets a DB flag; there is no
+    # process left to read it). See reap_stale_jobs().
+    list_jobs: Optional[Callable[..., List[Dict[str, Any]]]] = None  # (limit) -> [job dict]
+    update_job: Optional[Callable[..., None]] = None                 # (job_id, **fields)
 
     def phase(self, phase_id: str) -> Phase:
         for p in self.phases:
@@ -92,6 +98,82 @@ def all_verticals() -> List[Vertical]:
 
 def names() -> List[str]:
     return list(_REGISTRY.keys())
+
+
+# ---------------------------------------------------------------------------
+# Orphan recovery
+# ---------------------------------------------------------------------------
+# A worker runs as its own OS process. When the container restarts (a deploy,
+# an OOM-kill, a Render suspension) the process dies but its DB row is never
+# finalised: it stays 'running' forever. The UI then offers a Stop button that
+# can never work, because Stop only writes stop_requested=1 and nothing is left
+# alive to read it. This happened three times on 2026-09-02 across cf_jobs and
+# sa_jobs. No data is ever at risk — every queue is self-draining — but the
+# status is a lie, which is worse than a crash that announces itself.
+REAP_GRACE_SECONDS = 300
+
+
+def pid_alive(pid) -> bool:
+    """True if `pid` names a live process. Signal 0 checks existence only."""
+    if not pid:
+        return False
+    import os as _os
+    try:
+        _os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True          # exists, just not ours to signal
+    except Exception:        # noqa: BLE001  — ESRCH (gone), bad value, no os.kill
+        return False
+
+
+def reap_stale_jobs(v: "Vertical", grace: float = REAP_GRACE_SECONDS,
+                    limit: int = 25) -> List[int]:
+    """Finalise jobs whose worker is gone. Returns the ids changed.
+
+    Status is set to 'stopped', not a new 'interrupted' value, deliberately: the
+    UIs gate the Resume button on status in ('stopped','error'), so inventing a
+    status would leave these rows un-resumable. The message carries the reason.
+
+    Two guards keep this from ever touching a healthy job:
+      * the row must have gone `grace` seconds without an update — a live worker
+        pushes progress every 5s, so a running job is never quiet that long;
+      * if the row carries a pid and that pid is alive, it is left alone.
+
+    A NULL pid alone is NOT treated as dead: a job launched a moment ago has not
+    yet recorded one. Only metadata changes; scraped rows are never touched.
+    """
+    if not (v.list_jobs and v.update_job):
+        return []
+    import time as _time
+    now, changed = _time.time(), []
+    try:
+        jobs = v.list_jobs(limit)
+    except Exception:  # noqa: BLE001
+        return []
+    for j in jobs or []:
+        if j.get("status") not in ("running", "queued"):
+            continue
+        if pid_alive(j.get("pid")):
+            continue
+        last = j.get("updated_at") or j.get("started_at") or 0
+        if last and (now - float(last)) < grace:
+            continue        # too recent to call dead — let it breathe
+        try:
+            v.update_job(j["id"], status="stopped", finished_at=now,
+                         stop_requested=0,
+                         message="interrupted — worker process gone (container "
+                                 "restart or crash). Nothing was lost; Resume "
+                                 "continues from saved progress.")
+            changed.append(j["id"])
+        except Exception:  # noqa: BLE001
+            pass
+    return changed
+
+
+def reap_all(grace: float = REAP_GRACE_SECONDS) -> Dict[str, List[int]]:
+    """Reap every registered vertical. Safe to call on every app start."""
+    return {v.name: reap_stale_jobs(v, grace) for v in all_verticals()}
 
 
 def run_phase(vertical_name: str, phase_id: str, job_id: int,

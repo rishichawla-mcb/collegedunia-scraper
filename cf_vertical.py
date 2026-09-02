@@ -36,6 +36,8 @@ COURSE_FINDER = vb.Vertical(
     export_xlsx=cf_export.to_xlsx,
     get_job=cf_db.get_job,
     make_logger=_make_logger,
+    list_jobs=cf_db.list_jobs,      # orphan recovery (vb.reap_stale_jobs)
+    update_job=cf_db.update_job,
     phases=[
         vb.Phase("catalogue", "Ⓐ Catalogue",
                  "Sweep the course-finder listing sliced by course_tag_id (the "
