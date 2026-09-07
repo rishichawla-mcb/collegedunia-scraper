@@ -33,13 +33,24 @@ jobs:
           python -m pyflakes db.py scraper.py worker.py app.py export.py \
                              sa_db.py sa_scraper.py sa_ui.py sa_export.py \
                              sa_vertical.py vertical_base.py platform_worker.py \
+                             cf_db.py cf_scraper.py cf_ui.py cf_export.py \
+                             cf_vertical.py entity_backfill.py \
                              freefix.py fix_airport.py scrub_secrets.py
 
-      - name: Import smoke test (db + scraper load, schema builds)
+      - name: Import smoke test (all verticals load, every schema builds)
         env:
           CD_DB_PATH: /tmp/ci.db
+          CD_SA_DB_PATH: /tmp/ci.db
+          CD_CF_DB_PATH: /tmp/ci.db
         run: |
-          python -c "import db, scraper, export, worker; db.init_db('/tmp/ci.db'); print('imports OK, schema built')"
+          python -c "
+          import db, scraper, export, worker
+          import vertical_base as vb, sa_vertical, cf_vertical
+          db.init_db('/tmp/ci.db')
+          for v in vb.all_verticals():
+              v.init_db()
+              assert v.list_jobs and v.update_job, v.name + ' missing reaper hooks'
+          print('imports OK, schemas built, verticals:', vb.names())"
 
       # The real regression suite. It exercises parsers, the staging ->
       # validate -> promote path, exports and the wipe scopes against a
