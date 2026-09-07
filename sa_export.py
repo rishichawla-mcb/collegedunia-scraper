@@ -24,10 +24,25 @@ TABLES = ("sa_programs", "sa_universities", "sa_countries", "sa_program_exams",
 XLSX_MAX_ROWS = 1_048_575
 _HEAVY_COLS = ("raw_json",)
 
+# Long free-text and stored-JSON columns. Real data, not source noise — but on
+# `sa_programs` alone `description` is 230 MB and `description_detail` another
+# 77 MB (and the latter grows to ~340 MB once phase ⑤ finishes), which is what
+# pushed the full-SA xlsx past the 150 MB download cap. Excluded by default so
+# the ordinary export stays usable; tick the box when you actually want them.
+_LONGTEXT_COLS = (
+    "description", "description_detail",
+    "detail_json", "fee_data_json", "living_cost_json",
+    "application_dates_json", "course_languages_json",
+    "content", "eligibility_criteria", "highlights",
+)
 
-def _headers_and_keep(cur, include_raw: bool) -> Tuple[List[str], List[int]]:
+
+def _headers_and_keep(cur, include_raw: bool,
+                      include_longtext: bool = True) -> Tuple[List[str], List[int]]:
     headers = [d[0] for d in cur.description]
-    keep = [i for i, h in enumerate(headers) if include_raw or h not in _HEAVY_COLS]
+    keep = [i for i, h in enumerate(headers)
+            if (include_raw or h not in _HEAVY_COLS)
+            and (include_longtext or h not in _LONGTEXT_COLS)]
     return headers, keep
 
 
@@ -51,6 +66,7 @@ def _fetch(table, db_path=sa_db.SA_DB_PATH):
 
 def to_xlsx(tables: Sequence[str] = TABLES, db_path: str = sa_db.SA_DB_PATH,
             include_raw: bool = True, out_path: Optional[str] = None,
+            include_longtext: bool = True,
             max_rows_per_sheet: int = XLSX_MAX_ROWS):
     """One sheet per SA table. Streams; peak memory is independent of size.
     out_path=None -> return bytes (unchanged behaviour); otherwise write and
@@ -69,7 +85,7 @@ def to_xlsx(tables: Sequence[str] = TABLES, db_path: str = sa_db.SA_DB_PATH,
                 cur = conn.execute(f"SELECT * FROM {t}")
             except Exception:  # noqa: BLE001  (table absent)
                 continue
-            headers, keep = _headers_and_keep(cur, include_raw)
+            headers, keep = _headers_and_keep(cur, include_raw, include_longtext)
             ws = wb.create_sheet(t[:31])
             hdr = []
             for i in keep:
@@ -101,7 +117,8 @@ def to_xlsx(tables: Sequence[str] = TABLES, db_path: str = sa_db.SA_DB_PATH,
     return buf.getvalue()
 
 
-def _iter_csv(table: str, db_path: str, include_raw: bool) -> Iterator[str]:
+def _iter_csv(table: str, db_path: str, include_raw: bool,
+              include_longtext: bool = True) -> Iterator[str]:
     import csv
     buf = io.StringIO()
     w = csv.writer(buf)
@@ -114,7 +131,7 @@ def _iter_csv(table: str, db_path: str, include_raw: bool) -> Iterator[str]:
 
     with sa_db.connect(db_path) as conn:
         cur = conn.execute(f"SELECT * FROM {table}")
-        headers, keep = _headers_and_keep(cur, include_raw)
+        headers, keep = _headers_and_keep(cur, include_raw, include_longtext)
         w.writerow([headers[i] for i in keep])
         yield flush()
         for row in cur:
@@ -146,19 +163,20 @@ def _via_tempfile(write_chunks, suffix: str) -> bytes:
 
 
 def to_csv(table, db_path=sa_db.SA_DB_PATH, include_raw: bool = True,
-           out_path: Optional[str] = None):
+           out_path: Optional[str] = None, include_longtext: bool = True):
     if out_path:
         with open(out_path, "w", encoding="utf-8", newline="") as fh:
-            for chunk in _iter_csv(table, db_path, include_raw):
+            for chunk in _iter_csv(table, db_path, include_raw, include_longtext):
                 fh.write(chunk)
         return out_path
-    return _via_tempfile(_iter_csv(table, db_path, include_raw), ".csv")
+    return _via_tempfile(_iter_csv(table, db_path, include_raw, include_longtext), ".csv")
 
 
-def _iter_json(table: str, db_path: str, include_raw: bool) -> Iterator[str]:
+def _iter_json(table: str, db_path: str, include_raw: bool,
+               include_longtext: bool = True) -> Iterator[str]:
     with sa_db.connect(db_path) as conn:
         cur = conn.execute(f"SELECT * FROM {table}")
-        headers, keep = _headers_and_keep(cur, include_raw)
+        headers, keep = _headers_and_keep(cur, include_raw, include_longtext)
         names = [headers[i] for i in keep]
         yield "[\n"
         first = True
@@ -170,10 +188,10 @@ def _iter_json(table: str, db_path: str, include_raw: bool) -> Iterator[str]:
 
 
 def to_json(table, db_path=sa_db.SA_DB_PATH, include_raw: bool = True,
-            out_path: Optional[str] = None):
+            out_path: Optional[str] = None, include_longtext: bool = True):
     if out_path:
         with open(out_path, "w", encoding="utf-8") as fh:
-            for chunk in _iter_json(table, db_path, include_raw):
+            for chunk in _iter_json(table, db_path, include_raw, include_longtext):
                 fh.write(chunk)
         return out_path
-    return _via_tempfile(_iter_json(table, db_path, include_raw), ".json")
+    return _via_tempfile(_iter_json(table, db_path, include_raw, include_longtext), ".json")

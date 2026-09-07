@@ -109,14 +109,16 @@ def _render_pending(container, key, mime):
                               mime=mime, key=f"dl_{key}")
 
 
-def _estimate_mb(db_path, table, include_raw):
+def _estimate_mb(db_path, table, include_raw, include_longtext=True):
     """Rough uncompressed size of a table, from SQLite's own string lengths."""
     try:
         with sa_db.connect(db_path) as conn:
             cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
             if not cols:
                 return None
-            keep = [c for c in cols if include_raw or c != "raw_json"]
+            keep = [c for c in cols
+                    if (include_raw or c != "raw_json")
+                    and (include_longtext or c not in sa_export._LONGTEXT_COLS)]
             expr = "+".join(f"COALESCE(LENGTH(CAST({c} AS TEXT)),0)" for c in keep)
             n = conn.execute(f"SELECT COALESCE(SUM({expr}),0) FROM {table}").fetchone()[0]
         return (n or 0) / 1048576
@@ -427,6 +429,14 @@ def render() -> None:
             help="raw_json is the full original API object. On a 107k-programme "
                  "dataset it is ~78% of a CSV export (330 MB with it, 73 MB without) "
                  "and no spreadsheet can use it. The column stays in the database.")
+        inc_text = st.checkbox(
+            "Include long description / JSON columns", value=False, key="sa_exptext",
+            help="`description` alone is 230 MB across sa_programs and "
+                 "`description_detail` another 77 MB (growing to ~340 MB as phase ⑤ "
+                 "runs), which is what pushed the full export past the cap. Also "
+                 "covers the stored-JSON columns (living_cost, fee_data, "
+                 "application_dates, course_languages) and scholarship prose. "
+                 "The columns stay in the database either way.")
         st.caption(
             f"Downloads are capped at **{MAX_DL_MB:.0f} MB**. Streamlit holds a download "
             "in server memory twice (session state + its media store), so an "
@@ -434,7 +444,7 @@ def render() -> None:
             "logs you out and loses the export. **.xlsx is zip-compressed and is by "
             "far the smallest option** for big tables (sa_programs: ~17 MB as xlsx "
             "vs ~330 MB as CSV).")
-        est = _estimate_mb(V.db_path, tbl, inc_raw) if tbl else None
+        est = _estimate_mb(V.db_path, tbl, inc_raw, inc_text) if tbl else None
         if est is not None:
             st.caption(f"Estimated uncompressed size of `{tbl}`: ~{est:.0f} MB "
                        f"(xlsx will be far smaller).")
@@ -444,7 +454,8 @@ def render() -> None:
             with st.spinner("Building…"):
                 data, size = _prepare(
                     lambda p: sa_export.to_xlsx(sa_export.TABLES, V.db_path,
-                                                include_raw=inc_raw, out_path=p), ".xlsx")
+                                                include_raw=inc_raw, out_path=p,
+                                                include_longtext=inc_text), ".xlsx")
             _offer(e1, data, size, "study_abroad_export.xlsx", "sa_xlsx",
                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         _render_pending(e1, "sa_xlsx",
@@ -454,6 +465,7 @@ def render() -> None:
             with st.spinner("Building…"):
                 data, size = _prepare(
                     lambda p: sa_export.to_csv(tbl, V.db_path, include_raw=inc_raw,
+                                     include_longtext=inc_text,
                                                out_path=p), ".csv")
             _offer(e2, data, size, f"{tbl}.csv", "sa_csv", "text/csv")
         _render_pending(e2, "sa_csv", "text/csv")
@@ -462,6 +474,7 @@ def render() -> None:
             with st.spinner("Building…"):
                 data, size = _prepare(
                     lambda p: sa_export.to_json(tbl, V.db_path, include_raw=inc_raw,
+                                      include_longtext=inc_text,
                                                 out_path=p), ".json")
             _offer(st, data, size, f"{tbl}.json", "sa_json", "application/json")
         _render_pending(st, "sa_json", "application/json")

@@ -153,6 +153,14 @@ def wire_bytes(resp) -> int:
     `raw.tell()`, which is the compressed byte count urllib3 has read off the
     socket and is the only figure available for chunked responses.
     """
+    # Force the body to be read THROUGH the raw stream first. Requests are made
+    # with stream=True precisely so this read is ours: urllib3 only counts bytes
+    # off the socket while someone is reading it, and when requests preloads the
+    # body during response construction both `raw.tell()` and `_fp_bytes_read`
+    # come back 0. Measured against the live target: preloaded gave 0, streamed
+    # gave 141,042 compressed against 695,927 decompressed (4.9x). `.content` is
+    # cached, so touching it here costs nothing later.
+    body = resp.content or b""
     n = resp.headers.get("Content-Length")
     if n:
         try:
@@ -165,7 +173,7 @@ def wire_bytes(resp) -> int:
             return int(t)
     except Exception:  # noqa: BLE001  (raw consumed, or a non-stream backend)
         pass
-    return len(resp.content or b"")
+    return len(body)
 
 
 # How a provider spells a sticky-session id inside the proxy username.
@@ -580,6 +588,7 @@ class Client:
                 resp = self.session.get(
                     API_URL, params=params, headers=base_headers(),
                     proxies=proxy.as_dict() if proxy else None, timeout=self.timeout,
+                    stream=True,   # see wire_bytes(): lets us count the compressed body
                 )
                 self.stats.add(requests=1, byts=wire_bytes(resp))
                 self._check_blocked(resp)
@@ -611,7 +620,8 @@ class Client:
             try:
                 resp = self.session.get(
                     url, headers=base_headers(),
-                    proxies=proxy.as_dict() if proxy else None, timeout=self.timeout)
+                    proxies=proxy.as_dict() if proxy else None, timeout=self.timeout,
+                    stream=True)
                 self.stats.add(requests=1, byts=wire_bytes(resp))
                 self._check_blocked(resp)
                 resp.raise_for_status()
@@ -645,7 +655,8 @@ class Client:
             try:
                 resp = self.session.get(
                     COURSES_LIST_API, params=params, headers=headers,
-                    proxies=proxy.as_dict() if proxy else None, timeout=self.timeout)
+                    proxies=proxy.as_dict() if proxy else None, timeout=self.timeout,
+                    stream=True)
                 self.stats.add(requests=1, byts=wire_bytes(resp))
                 self._check_blocked(resp)
                 resp.raise_for_status()
@@ -682,7 +693,8 @@ class Client:
             try:
                 resp = self.session.get(
                     LISTING_API, params=params, headers=headers,
-                    proxies=proxy.as_dict() if proxy else None, timeout=self.timeout)
+                    proxies=proxy.as_dict() if proxy else None, timeout=self.timeout,
+                    stream=True)
                 self.stats.add(requests=1, byts=wire_bytes(resp))
                 self._check_blocked(resp)
                 resp.raise_for_status()
