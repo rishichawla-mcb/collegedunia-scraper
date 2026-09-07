@@ -118,6 +118,29 @@ def abs_url(path: Optional[str]) -> str:
     return f"{SITE}/{path.lstrip('/')}"
 
 
+def redact_proxy(url: Optional[str]) -> str:
+    """A proxy URL safe to write into a log line.
+
+    Failure logs used to print `proxy.url` verbatim — which embeds the provider
+    username AND password — and those lines are persisted in cf_logs/sa_logs and
+    rendered in the UI. This keeps what is useful for debugging (which exit node,
+    which sticky session) and drops the credentials entirely.
+    """
+    if not url:
+        return "direct"
+    try:
+        p = urlparse(url)
+        where = (p.hostname or "?") + (f":{p.port}" if p.port else "")
+        user = p.username or ""
+        # the session id is appended to the username by sticky_gateway()
+        for sep in (";", "-session-", "_session-", "-sessid-"):
+            if sep in user:
+                return f"{where} [{sep.strip('-_')}{user.split(sep, 1)[1]}]"
+        return where
+    except Exception:  # noqa: BLE001
+        return "proxy"
+
+
 def wire_bytes(resp) -> int:
     """Bytes that actually crossed the wire, not the decompressed body.
 
@@ -471,15 +494,23 @@ class Client:
 
     @staticmethod
     def _classify(err: Exception) -> str:
-        """'proxy' = dead tunnel, 'block' = the SITE refused us, else 'other'."""
-        if isinstance(err, requests.exceptions.ProxyError):
-            return "proxy"
-        if isinstance(err, requests.exceptions.ConnectionError) and (
-                "NO_HOST_CONNECTION" in str(err)
-                or "Unable to connect to proxy" in str(err)):
-            return "proxy"
+        """'proxy' = dead tunnel, 'block' = the SITE refused us, else 'other'.
+
+        Every request goes through a proxy, so ANY transport-level failure means
+        the exit node is bad and the retry must move to a new one. Being narrow
+        here is expensive: an `SSLError('record layer failure')` was classified
+        'other', so all five attempts hit the same broken node and the course
+        failed — the same way 403s used to burn five retries on one dead IP.
+        requests' hierarchy puts ProxyError, SSLError and ConnectTimeout under
+        ConnectionError, so catching that plus Timeout covers the lot. Rotating
+        when it wasn't strictly necessary costs nothing.
+        """
         if isinstance(err, BlockedError):
             return "block"
+        if isinstance(err, (requests.exceptions.ConnectionError,
+                            requests.exceptions.Timeout,
+                            requests.exceptions.ChunkedEncodingError)):
+            return "proxy"
         return "other"
 
     def _rotate(self, kind: str) -> bool:
@@ -521,7 +552,7 @@ class Client:
         ra = getattr(err, "retry_after", None)
         last = attempt >= self.max_retries
         wait = 0.0 if last else self._retry_wait(attempt, ra)
-        via = proxy.url if proxy else "direct"
+        via = redact_proxy(proxy.url if proxy else None)
         note = ""
         if rotated:
             note += " [fresh proxy IP]"
