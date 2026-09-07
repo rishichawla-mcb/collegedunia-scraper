@@ -898,6 +898,18 @@ elif st.session_state["proxy_mode"] == "gateway":
                 "run `python scrub_secrets.py --apply` to clear the stored copy.",
                 icon="🔓")
 
+    # Sticky sessions keep one crawl on one exit IP, which is what makes
+    # paginated partitions coherent and 403-rotation meaningful. Every provider
+    # spells the session id differently inside the username, so it is a setting
+    # rather than a hardcoded suffix — switching vendor needs no code change.
+    st.session_state["proxy_session_template"] = st.sidebar.text_input(
+        "Sticky-session template",
+        value=db.get_setting("proxy_session_template", "") or scraper.DEFAULT_SESSION_TEMPLATE,
+        help="`{user}` and `{sid}` are substituted into the proxy username. "
+             "DataImpulse `{user};sessid.{sid}` · Decodo/Evomi `{user}-session-{sid}` · "
+             "IPRoyal `{user}_session-{sid}` · Oxylabs `customer-{user}-sessid-{sid}`. "
+             "Leave as-is if your provider ignores the suffix.")
+
 with st.sidebar.expander("🔔 Notifications"):
     wh = st.text_input("Webhook URL (Slack/Discord/generic)",
                        value=db.get_setting("webhook_url", ""),
@@ -939,6 +951,8 @@ if st.sidebar.button("💾 Save settings"):
     db.set_setting("proxy_mode", st.session_state["proxy_mode"])
     db.set_setting("proxy_list_text", st.session_state.get("proxy_list_text", ""))
     db.set_setting("proxy_gateway", st.session_state.get("proxy_gateway", ""))
+    db.set_setting("proxy_session_template",
+                   st.session_state.get("proxy_session_template", ""))
     st.sidebar.success("Saved.")
 
 if st.sidebar.button("🧪 Test proxies"):

@@ -118,17 +118,57 @@ def abs_url(path: Optional[str]) -> str:
     return f"{SITE}/{path.lstrip('/')}"
 
 
-def sticky_gateway(url: str, session_id: Optional[str]) -> str:
-    """Inject a DataImpulse-style sticky session id into a proxy gateway URL's
-    username (``user;sessid.<id>``) so all requests in a session use one IP.
-    Harmless for providers that ignore the suffix."""
+def wire_bytes(resp) -> int:
+    """Bytes that actually crossed the wire, not the decompressed body.
+
+    `resp.content` is DECOMPRESSED. Collegedunia serves gzip at roughly 5.2:1
+    (560 KB of HTML arrives as ~107 KB), so counting `len(resp.content)` made
+    the bandwidth budget 5.2x pessimistic — it would halt a run at a fifth of
+    the traffic the user had paid for. Proxies bill the wire, so we count it.
+
+    Content-Length first (exact when the server sends it); otherwise
+    `raw.tell()`, which is the compressed byte count urllib3 has read off the
+    socket and is the only figure available for chunked responses.
+    """
+    n = resp.headers.get("Content-Length")
+    if n:
+        try:
+            return int(n)
+        except (TypeError, ValueError):
+            pass
+    try:
+        t = resp.raw.tell()
+        if t:
+            return int(t)
+    except Exception:  # noqa: BLE001  (raw consumed, or a non-stream backend)
+        pass
+    return len(resp.content or b"")
+
+
+# How a provider spells a sticky-session id inside the proxy username.
+# DataImpulse: user;sessid.<id>   Decodo/Evomi: user-session-<id>
+# IPRoyal:     user_session-<id>  Oxylabs:      customer-user-sessid-<id>
+# `{user}` and `{sid}` are substituted; override via the `proxy_session_template`
+# setting so switching vendor never needs a code change.
+DEFAULT_SESSION_TEMPLATE = "{user};sessid.{sid}"
+
+
+def sticky_gateway(url: str, session_id: Optional[str],
+                   template: Optional[str] = None) -> str:
+    """Inject a sticky session id into a proxy gateway URL's username so every
+    request in a session leaves from one IP. Harmless for providers that ignore
+    the suffix."""
     if not url or not session_id:
         return url
     try:
         p = urlparse(url)
         if not p.username:
             return url
-        user = f"{p.username};sessid.{session_id}"
+        tpl = template or DEFAULT_SESSION_TEMPLATE
+        try:
+            user = tpl.format(user=p.username, sid=session_id)
+        except (KeyError, IndexError, ValueError):
+            user = f"{p.username};sessid.{session_id}"
         auth = user + (f":{p.password}" if p.password else "")
         host = p.hostname or ""
         netloc = f"{auth}@{host}" + (f":{p.port}" if p.port else "")
@@ -331,6 +371,9 @@ class ProxyManager:
     gateway: Optional[str] = None
     cooldown_seconds: float = 120.0
     max_fails: int = 3
+    # How this provider spells a sticky-session id in the username. See
+    # DEFAULT_SESSION_TEMPLATE — settable so a vendor change needs no code edit.
+    session_template: str = DEFAULT_SESSION_TEMPLATE
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _cycle: Any = None
 
@@ -343,6 +386,8 @@ class ProxyManager:
             proxies=proxies,
             gateway=(cfg.get("proxy_gateway") or None),
             cooldown_seconds=float(cfg.get("proxy_cooldown", 120)),
+            session_template=(cfg.get("proxy_session_template")
+                              or DEFAULT_SESSION_TEMPLATE),
         )
 
     def __post_init__(self) -> None:
@@ -354,7 +399,9 @@ class ProxyManager:
         if self.mode == "gateway":
             if not self.gateway:
                 return None
-            return Proxy(url=sticky_gateway(self.gateway, session_id) if session_id else self.gateway)
+            return Proxy(url=sticky_gateway(self.gateway, session_id,
+                                            self.session_template)
+                         if session_id else self.gateway)
         # list mode
         with self._lock:
             if not self.proxies:
@@ -503,7 +550,7 @@ class Client:
                     API_URL, params=params, headers=base_headers(),
                     proxies=proxy.as_dict() if proxy else None, timeout=self.timeout,
                 )
-                self.stats.add(requests=1, byts=len(resp.content or b""))
+                self.stats.add(requests=1, byts=wire_bytes(resp))
                 self._check_blocked(resp)
                 resp.raise_for_status()
                 ctype = resp.headers.get("Content-Type", "")
@@ -534,7 +581,7 @@ class Client:
                 resp = self.session.get(
                     url, headers=base_headers(),
                     proxies=proxy.as_dict() if proxy else None, timeout=self.timeout)
-                self.stats.add(requests=1, byts=len(resp.content or b""))
+                self.stats.add(requests=1, byts=wire_bytes(resp))
                 self._check_blocked(resp)
                 resp.raise_for_status()
                 # A challenge page arrives as HTTP 200 + HTML. Treat it as a block
@@ -568,7 +615,7 @@ class Client:
                 resp = self.session.get(
                     COURSES_LIST_API, params=params, headers=headers,
                     proxies=proxy.as_dict() if proxy else None, timeout=self.timeout)
-                self.stats.add(requests=1, byts=len(resp.content or b""))
+                self.stats.add(requests=1, byts=wire_bytes(resp))
                 self._check_blocked(resp)
                 resp.raise_for_status()
                 ctype = resp.headers.get("Content-Type", "")
@@ -605,7 +652,7 @@ class Client:
                 resp = self.session.get(
                     LISTING_API, params=params, headers=headers,
                     proxies=proxy.as_dict() if proxy else None, timeout=self.timeout)
-                self.stats.add(requests=1, byts=len(resp.content or b""))
+                self.stats.add(requests=1, byts=wire_bytes(resp))
                 self._check_blocked(resp)
                 resp.raise_for_status()
                 ctype = resp.headers.get("Content-Type", "")

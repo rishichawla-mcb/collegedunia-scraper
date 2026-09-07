@@ -187,11 +187,12 @@ def _proxy_cfg() -> Dict[str, Any]:
             "proxy_list": [p.strip() for p in
                            (g("proxy_list_text", "") or "").splitlines() if p.strip()],
             "proxy_cooldown": g("proxy_cooldown", 120),
+            "proxy_session_template": g("proxy_session_template", ""),
             "delay": float(g("delay", 1.0) or 1.0),
         }
     except Exception:  # noqa: BLE001
         return {"proxy_mode": "none", "proxy_gateway": "", "proxy_list": [],
-                "proxy_cooldown": 120, "delay": 1.0}
+                "proxy_cooldown": 120, "proxy_session_template": "", "delay": 1.0}
 
 
 def _client(pm, cfg, log, stats, adaptive) -> Client:
