@@ -1767,11 +1767,25 @@ def run_enrichment(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
         except Exception as err:  # noqa: BLE001
             log(f"  ! could not seed directory colleges: {err}")
 
+    # Refresh mode. Without this the queue drains on `enriched_at IS NULL` and
+    # an enriched college is never revisited, which left `colleges` as the one
+    # stale table with no refresh path. Setting refresh_stale_days widens the
+    # queue to include rows not confirmed in that many days. Nothing is reset:
+    # enriched_at keeps its value, so a refresh run resumes like any other and
+    # an interrupted one does not orphan anything.
+    stale_before = cfg.get("refresh_stale_before")
+    if not stale_before and cfg.get("refresh_stale_days"):
+        stale_before = time.time() - float(cfg["refresh_stale_days"]) * 86400.0
+
     colleges = db.list_colleges_to_enrich(
         db_path=db_path, where=cfg.get("college_where", ""),
         params=tuple(cfg.get("college_where_params", [])),
         include_done=bool(cfg.get("force_rescrape")), limit=cfg.get("limit"),
-        need_basic=bool(cfg.get("basic_info", True)))
+        need_basic=bool(cfg.get("basic_info", True)),
+        stale_before=stale_before)
+    if stale_before:
+        log(f"Refresh mode: also re-enriching colleges not confirmed since "
+            f"{time.strftime('%Y-%m-%d', time.localtime(stale_before))}.")
     total = len(colleges)
     db.update_job(job_id, status="running", total_units=total,
                   message=f"{total} colleges to enrich", db_path=db_path)

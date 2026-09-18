@@ -79,15 +79,47 @@ class Sweep:
                  progress: Sequence[str], unit: str,
                  unit_reqs: Optional[float] = None,
                  unit_kb: Optional[float] = None,
-                 source: str = "", note: str = ""):
+                 source: str = "", note: str = "",
+                 retired: bool = False, refresh_via: str = ""):
         self.key, self.label, self.mod = key, label, mod
         self.tables = list(tables)
         self.progress = list(progress)
         self.unit, self.unit_reqs, self.unit_kb = unit, unit_reqs, unit_kb
         self.source, self.note = source, note
+        # A retired phase is listed so its tables do not read as an unmet need.
+        # `offerings` is stale and will stay stale on purpose; without this the
+        # queue invites somebody to go and build a refresh for a table the
+        # project decided to stop using on 2026-09-18.
+        self.retired = retired
+        # How this sweep is made to run again. Most clear a progress table;
+        # Phase 1 has none, and Phase 3 re-enrichment widens a WHERE instead.
+        self.refresh_via = refresh_via or (
+            f"python refresh.py --reset {key} --apply" if progress else
+            "no resume state — just run the phase again")
 
 
 SWEEPS: List[Sweep] = [
+    Sweep("dom_p1", "domestic Phase 1 — course catalogue", "db",
+          ["courses"], [], "stream",
+          note="Kept, not retired: it partitions by stream and so reaches 654 "
+               "untagged courses the Course Finder tag-facet sweep cannot see. "
+               "It has no progress table — it walks the stream list each run — "
+               "so there is nothing to reset."),
+    Sweep("dom_enrich", "domestic Phase 3 — college detail", "db",
+          ["colleges"], [], "college",
+          refresh_via="run Phase 3 with stale_before set (see "
+                      "db.list_colleges_to_enrich); do NOT clear enriched_at",
+          note="The queue normally drains on enriched_at IS NULL, so an "
+               "enriched college was never revisited — this was the only "
+               "stale table with no refresh path at all. stale_before widens "
+               "the WHERE instead of resetting anything. Note the directory "
+               "sweep is NOT a substitute: it misses the 453 colleges that "
+               "have no directory row, including IIT Bombay and AIIMS Jodhpur."),
+    Sweep("dom_p2", "domestic Phase 2 — offerings (RETIRED)", "db",
+          ["offerings"], ["offering_progress"], "course", retired=True,
+          note="Retired 2026-09-18: it only ever covered 59 of 16,896 courses "
+               "(0.35%). cf_offerings is the same relation done properly. "
+               "These rows are stale and stay stale deliberately."),
     Sweep("cf_a", "Course Finder Ⓐ — course catalogue", "cf_db",
           ["cf_courses"], ["cf_partition_progress"], "course",
           note="Partitions by course_tag_id, so it cannot see untagged "
@@ -149,8 +181,10 @@ def status(stale_days: float = DEFAULT_STALE_DAYS) -> Dict[str, Any]:
         with fr.connect(paths[mod]) as conn:
             st = table_state(conn, table, stale_days)
         if st:
+            s = SWEEP_FOR_TABLE.get(table)
             st["mod"] = mod
-            st["sweep"] = SWEEP_FOR_TABLE[table].key if table in SWEEP_FOR_TABLE else None
+            st["sweep"] = s.key if s else None
+            st["retired"] = bool(s and s.retired)
             out.append(st)
     return {"stale_days": stale_days, "tables": out}
 
@@ -168,21 +202,31 @@ def render_status(rep: Dict[str, Any]) -> str:
             L.append(f"  {t['table']:<26}{t['total']:>10,}"
                      f"{'— not tracked; run freshness_backfill.py --apply':>40}")
             continue
+        tag = t["sweep"] or "—"
+        if t.get("retired"):
+            tag += "  (retired — stale on purpose)"
         L.append(f"  {t['table']:<26}{t['total']:>10,}{t['stale']:>10,}"
-                 f"{t['inactive']:>10,}{t['unhashed']:>9,}  "
-                 f"{t['sweep'] or '—'}")
+                 f"{t['inactive']:>10,}{t['unhashed']:>9,}  {tag}")
         (cold if t["stale"] else warm).append(t)
     L.append("")
     n_cold = sum(t["stale"] for t in cold)
     L.append(f"  {len(cold)} tables hold {n_cold:,} stale rows; "
              f"{len(warm)} tables are current.")
-    covered = {t["table"] for t in cold if t["sweep"]}
-    orphan = [t["table"] for t in cold if not t["sweep"]]
-    if covered:
-        keys = sorted({SWEEP_FOR_TABLE[t].key for t in covered})
+
+    live = [t for t in cold if t["sweep"] and not t.get("retired")]
+    retired = [t for t in cold if t.get("retired")]
+    orphan = [t for t in cold if not t["sweep"]]
+    if live:
+        keys = sorted({t["sweep"] for t in live})
         L.append(f"  refreshable by re-sweeping: {', '.join(keys)}")
+    if retired:
+        L.append("  stale by decision, no action wanted: " +
+                 ", ".join(f"{t['table']} ({t['stale']:,})" for t in retired))
     if orphan:
-        L.append(f"  no cheap sweep refreshes these yet: {', '.join(orphan)}")
+        # Row counts are printed because "no sweep" reads very differently for
+        # 14,997 colleges than for 31 countries, and the bare list hides that.
+        L.append("  no refresh path yet: " +
+                 ", ".join(f"{t['table']} ({t['stale']:,})" for t in orphan))
     return "\n".join(L)
 
 
@@ -212,9 +256,12 @@ def plan(stale_days: float = DEFAULT_STALE_DAYS) -> str:
         else:
             L.append("            cost:     unmeasured — run it once and read "
                      "the job's own totals")
+        if s.retired:
+            L.append("            status:   RETIRED — not to be run")
         if s.note:
             L.append(f"            note:     {s.note}")
-        L.append(f"            reset:    python refresh.py --reset {s.key} --apply")
+        if not s.retired:
+            L.append(f"            refresh:  {s.refresh_via}")
     L.append("")
     L.append("  A reset only clears resume bookkeeping. The next run of that")
     L.append("  phase then re-fetches everything and the upserts fingerprint")
@@ -230,6 +277,17 @@ def reset(key: str, apply: bool = False) -> int:
     if not s:
         print(f"unknown sweep {key!r}. known: {', '.join(sorted(BY_KEY))}")
         return 2
+    if s.retired:
+        print(f"REFUSED — {s.key} ({s.label}) is retired. Resetting it would "
+              f"queue up a crawl the project has decided not to run.")
+        print("If that decision has changed, take `retired=True` off the sweep "
+              "so the change is recorded in the code rather than in a shell "
+              "history.")
+        return 2
+    if not s.progress:
+        print(f"{s.key} has no resume state to clear.")
+        print(f"  to refresh it: {s.refresh_via}")
+        return 0
     path = _paths()[s.mod]
     print("=" * 74)
     print(f"reset {s.key} — {s.label}")

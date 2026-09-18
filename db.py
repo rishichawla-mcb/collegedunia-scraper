@@ -667,20 +667,43 @@ def get_done_course_ids(db_path: str = DB_PATH) -> set:
 
 def list_colleges_to_enrich(db_path: str = DB_PATH, where: str = "", params: tuple = (),
                             include_done: bool = False, limit: Optional[int] = None,
-                            need_basic: bool = False) -> List[Dict[str, Any]]:
+                            need_basic: bool = False,
+                            stale_before: Optional[float] = None) -> List[Dict[str, Any]]:
     """Colleges still needing Phase 3.
 
     need_basic=True also returns colleges that were enriched by an older build
     and therefore have JSON-LD data but no `basic_info`. Without it those rows
     are permanently invisible to the phase (enriched_at is already set), and the
-    only way to collect basic_info would be a full force-rescrape."""
+    only way to collect basic_info would be a full force-rescrape.
+
+    stale_before=<epoch> ALSO returns colleges that were enriched but have not
+    been confirmed since then. This is the refresh path: without it the queue
+    drains on `enriched_at IS NULL` and a college, once enriched, is never
+    looked at again — which is why `colleges` was the one stale table with no
+    sweep at all. Nothing is cleared or reset to achieve this; it is only a
+    wider WHERE, so the resume behaviour of a normal run is unchanged and a
+    refresh run can be stopped and restarted like any other.
+
+    `last_seen_at` only exists once freshness_backfill has run, so the clause is
+    added only when the column is actually there — an un-backfilled database
+    keeps the old behaviour instead of raising.
+    """
     sql = "SELECT college_id, link FROM colleges"
-    conds = []
+    conds: List[str] = []
+    args: List[Any] = list(params)
     if where:
         conds.append(where)
     if not include_done:
-        conds.append("(enriched_at IS NULL OR basic_scraped_at IS NULL)"
-                     if need_basic else "(enriched_at IS NULL)")
+        base = ("(enriched_at IS NULL OR basic_scraped_at IS NULL)"
+                if need_basic else "(enriched_at IS NULL)")
+        if stale_before:
+            with connect(db_path) as conn:
+                has_seen = any(r[1] == "last_seen_at" for r in
+                               conn.execute("PRAGMA table_info(colleges)"))
+            if has_seen:
+                base = (f"({base} OR last_seen_at IS NULL OR last_seen_at < ?)")
+                args.append(float(stale_before))
+        conds.append(base)
     conds.append("link IS NOT NULL AND link<>''")
     if conds:
         sql += " WHERE " + " AND ".join(conds)
@@ -688,7 +711,7 @@ def list_colleges_to_enrich(db_path: str = DB_PATH, where: str = "", params: tup
     if limit:
         sql += f" LIMIT {int(limit)}"
     with connect(db_path) as conn:
-        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
 
 
 def update_college_details(college_id: int, fields: Dict[str, Any], db_path: str = DB_PATH) -> None:

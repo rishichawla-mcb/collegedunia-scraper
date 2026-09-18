@@ -1523,6 +1523,17 @@ with tab_run:
         e_conc = ec1.number_input("Parallel workers", 1, 20, 3, key="econc")
         e_bud = ec2.number_input("Max bandwidth MB (0=∞)", 0, 100000, 0, step=100, key="ebud")
         e_force = st.checkbox("Re-enrich already-done", key="eforce")
+        e_stale = st.number_input(
+            "Also re-enrich colleges not confirmed in N days (0 = off)",
+            0, 3650, 0, step=30, key="estale",
+            help="The queue normally drains on enriched_at IS NULL, so an "
+                 "enriched college is never revisited. This widens it to "
+                 "include rows whose freshness fingerprint has not been "
+                 "confirmed in N days. Nothing is cleared or reset — "
+                 "enriched_at keeps its value — so the run resumes like any "
+                 "other. Unlike 'Re-enrich already-done' this does not re-fetch "
+                 "colleges that are already current. Needs "
+                 "freshness_backfill.py to have been run.")
         if st.button("🏫 Start college enrichment", key="rune",
                      disabled=(n_total == 0 and _dir_gap == 0)):
             cfg = proxy_config_from_ui()
@@ -1532,6 +1543,8 @@ with tab_run:
             cfg["force_rescrape"] = e_force
             cfg["basic_info"] = bool(e_basic)
             cfg["include_directory"] = bool(e_dir)
+            if int(e_stale) > 0:
+                cfg["refresh_stale_days"] = int(e_stale)
             jid = db.create_job("enrichment", cfg)
             launch_worker(jid)
             st.session_state["watch_p3"] = jid
