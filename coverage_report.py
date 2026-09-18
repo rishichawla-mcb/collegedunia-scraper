@@ -162,8 +162,12 @@ def unenriched(paths: Dict[str, str]) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 FRESHNESS_TABLES = [
     ("db", "colleges"), ("db", "courses"), ("db", "college_courses"),
-    ("db", "colleges_directory"),
+    ("db", "offerings"), ("db", "colleges_directory"),
     ("sa_db", "sa_programs"), ("sa_db", "sa_universities"),
+    ("sa_db", "sa_countries"), ("sa_db", "sa_program_exams"),
+    ("sa_db", "sa_scholarships"), ("sa_db", "sa_university_rankings"),
+    ("sa_db", "sa_university_courses"), ("sa_db", "sa_program_fees"),
+    ("sa_db", "sa_program_scholarships"),
     ("cf_db", "cf_courses"), ("cf_db", "cf_offerings"),
 ]
 
@@ -193,8 +197,17 @@ def freshness(paths: Dict[str, str], stale_days: float = 30.0) -> Dict[str, Any]
                                           f"WHERE inactive_since IS NOT NULL"),
                 "hashed": _scalar(conn, f"SELECT COUNT(*) FROM {table} "
                                         f"WHERE content_hash IS NOT NULL"),
+                # `> first_seen_at` is load-bearing. freshness.backfill() seeds
+                # last_changed_at from the row's own scraped_at, so without this
+                # clause every row scraped inside the horizon reads as "changed"
+                # even though nothing has ever been compared against anything.
+                # The first live run of this report showed 337,571 cf_offerings
+                # "changed" while the change log (section 4) said zero — the log
+                # was right. A row only counts as changed once an observe() call
+                # has actually moved its hash after it was first recorded.
                 "changed_recently": _scalar(
-                    conn, f"SELECT COUNT(*) FROM {table} WHERE last_changed_at >= ?",
+                    conn, f"SELECT COUNT(*) FROM {table} WHERE last_changed_at >= ? "
+                          f"AND last_changed_at > COALESCE(first_seen_at, 0)",
                     (cutoff,)),
             })
     finally:
