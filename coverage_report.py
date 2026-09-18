@@ -92,6 +92,15 @@ def cross_source(paths: Dict[str, str]) -> List[Dict[str, Any]]:
             ("colleges", "domestic directory", d,
              "SELECT college_id FROM colleges_directory",
              "CF offerings", c, "SELECT DISTINCT college_id FROM cf_offerings"),
+            # The directory was assumed to be the discovery layer and `colleges`
+            # its enriched subset. It is not: 453 enriched colleges — IIT Bombay
+            # 25703, IIT Madras 25881, MIT Manipal 14265, AIIMS Jodhpur 25796 —
+            # have no directory row at all. They came in via Phase 2 offerings.
+            # Anything that walks the directory to decide what to refresh will
+            # therefore silently skip them, which is why this pair is reported.
+            ("colleges", "domestic directory", d,
+             "SELECT college_id FROM colleges_directory",
+             "domestic colleges", d, "SELECT college_id FROM colleges"),
         ]
         for entity, an, ac, aq, bn, bc, bq in pairs:
             A, B = _ids(ac, aq), _ids(bc, bq)
@@ -121,7 +130,11 @@ def unenriched(paths: Dict[str, str]) -> List[Dict[str, Any]]:
     c = _conn(paths["cf_db"])
     try:
         rows = [
-            ("directory colleges never enriched", d,
+            # Deliberately named for what it measures. It is NOT "colleges we
+            # have not enriched": the directory is not a superset of `colleges`
+            # (see the last pair in section 1), so 453 enriched colleges are
+            # outside this denominator entirely.
+            ("directory rows with no colleges row", d,
              "SELECT COUNT(*) FROM colleges_directory",
              "SELECT COUNT(*) FROM colleges_directory x WHERE NOT EXISTS "
              "(SELECT 1 FROM colleges y WHERE y.college_id=x.college_id)"),
