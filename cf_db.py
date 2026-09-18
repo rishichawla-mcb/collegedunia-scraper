@@ -197,6 +197,18 @@ OFFERING_COLS = ["course_id", "college_id", "course_name", "college_name",
                  "raw_json", "scraped_at", "source_job_id"]
 
 
+import freshness as _fr
+
+
+def _job_of(rows):
+    """The job that produced this batch, read off the rows themselves."""
+    for r in rows:
+        j = r.get("source_job_id")
+        if j is not None:
+            return j
+    return None
+
+
 def _upsert(conn, table: str, cols: List[str], key_cols: List[str],
             rows: List[Dict[str, Any]], preserve_nonempty: bool = True) -> int:
     """Non-destructive by default — an incoming NULL/'' never replaces a stored
@@ -212,10 +224,11 @@ def _upsert(conn, table: str, cols: List[str], key_cols: List[str],
             for c in cols if c not in key_cols)
     else:
         setc = ",".join(f"{c}=excluded.{c}" for c in cols if c not in key_cols)
-    conn.executemany(
-        f"INSERT INTO {table} ({','.join(cols)}) VALUES ({ph}) "
-        f"ON CONFLICT({','.join(key_cols)}) DO UPDATE SET {setc}",
-        [tuple(r.get(c) for c in cols) for r in rows])
+    with _fr.tracking(conn, table, key_cols, rows, _job_of(rows)):
+        conn.executemany(
+            f"INSERT INTO {table} ({','.join(cols)}) VALUES ({ph}) "
+            f"ON CONFLICT({','.join(key_cols)}) DO UPDATE SET {setc}",
+            [tuple(r.get(c) for c in cols) for r in rows])
     return len(rows)
 
 

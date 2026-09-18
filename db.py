@@ -29,6 +29,22 @@ import time
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
+import freshness as _fr
+
+
+def _job_of(rows) -> Optional[int]:
+    """The job that produced this batch.
+
+    Taken from the rows themselves rather than added as an argument to every
+    upsert: each scraped row already carries source_job_id, and threading a new
+    parameter through five signatures and all their callers buys nothing.
+    """
+    for r in rows:
+        j = r.get("source_job_id")
+        if j is not None:
+            return j
+    return None
+
 
 def fee_to_inr(value: Any) -> Optional[int]:
     """Normalise mixed fee strings to an integer INR amount.
@@ -573,7 +589,8 @@ def upsert_courses(rows: Iterable[Dict[str, Any]], db_path: str = DB_PATH,
         f"ON CONFLICT(course_id) DO UPDATE SET " + set_clause
     )
     with connect(db_path) as conn:
-        conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
+        with _fr.tracking(conn, 'courses', ['course_id'], rows, _job_of(rows)):
+            conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
     return len(rows)
 
 
@@ -593,7 +610,8 @@ def upsert_colleges(rows: Iterable[Dict[str, Any]], db_path: str = DB_PATH) -> i
         + ",".join(f"{c}=excluded.{c}" for c in cols if c != "college_id")
     )
     with connect(db_path) as conn:
-        conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
+        with _fr.tracking(conn, 'colleges', ['college_id'], rows, _job_of(rows)):
+            conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
     return len(rows)
 
 
@@ -619,7 +637,8 @@ def upsert_offerings(rows: Iterable[Dict[str, Any]], db_path: str = DB_PATH) -> 
         + ",".join(f"{c}=excluded.{c}" for c in cols if c not in ("course_id", "college_id"))
     )
     with connect(db_path) as conn:
-        conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
+        with _fr.tracking(conn, 'offerings', ['course_id', 'college_id'], rows, _job_of(rows)):
+            conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
     return len(rows)
 
 
@@ -834,7 +853,8 @@ def upsert_college_courses(rows: Iterable[Dict[str, Any]], db_path: str = DB_PAT
            + ",".join(f"{c}=excluded.{c}" for c in cols
                       if c not in ("college_id", "course_name")))
     with connect(db_path) as conn:
-        conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
+        with _fr.tracking(conn, 'college_courses', ['college_id', 'course_name'], rows, _job_of(rows)):
+            conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
     return len(rows)
 
 
@@ -877,7 +897,8 @@ def upsert_colleges_directory(rows: Iterable[Dict[str, Any]], db_path: str = DB_
            f"ON CONFLICT(college_id) DO UPDATE SET "
            + ",".join(f"{c}=excluded.{c}" for c in cols if c != "college_id"))
     with connect(db_path) as conn:
-        conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
+        with _fr.tracking(conn, 'colleges_directory', ['college_id'], rows, _job_of(rows)):
+            conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
     return len(rows)
 
 

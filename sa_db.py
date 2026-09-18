@@ -376,6 +376,18 @@ def init_db(db_path: str = SA_DB_PATH) -> None:
 # ---------------------------------------------------------------------------
 # Upserts (idempotent — unique keys make duplicates impossible)
 # ---------------------------------------------------------------------------
+import freshness as _fr
+
+
+def _job_of(rows):
+    """The job that produced this batch, read off the rows themselves."""
+    for r in rows:
+        j = r.get("source_job_id")
+        if j is not None:
+            return j
+    return None
+
+
 def _upsert(conn, table: str, cols: List[str], key_cols: List[str],
             rows: List[Dict[str, Any]], preserve_nonempty: bool = False) -> int:
     """preserve_nonempty=True makes the upsert non-destructive: an incoming NULL
@@ -395,7 +407,8 @@ def _upsert(conn, table: str, cols: List[str], key_cols: List[str],
         setc = ",".join(f"{c}=excluded.{c}" for c in cols if c not in key_cols)
     sql = (f"INSERT INTO {table} ({','.join(cols)}) VALUES ({ph}) "
            f"ON CONFLICT({','.join(key_cols)}) DO UPDATE SET {setc}")
-    conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
+    with _fr.tracking(conn, table, key_cols, rows, _job_of(rows)):
+        conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
     return len(rows)
 
 

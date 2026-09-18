@@ -241,6 +241,184 @@ def observe(conn: sqlite3.Connection, table: str, pk_cols: Sequence[str],
     return "returned" if was_gone else "changed"
 
 
+# ---------------------------------------------------------------------------
+# Batch observation — the path the live upserts use
+#
+# `observe()` above compares an incoming row against what is stored. That is
+# correct only when the upsert writes the incoming row verbatim, and ours do
+# not: every vertical's upsert is preserve_nonempty, so an incoming NULL or ''
+# leaves the stored value alone and the row that ends up on disk is a MERGE of
+# the two. Hashing the incoming row would therefore have fingerprinted
+# something that was never stored, and the first sweep would have reported
+# every partially-written row as changed — CF phase Ⓐ writes course-level
+# fields and phase Ⓑ writes the rest, so that is all 337,571 offerings.
+#
+# Rather than reimplement the upsert's CASE WHEN semantics in Python and hope
+# the two stay in step, this reads the row twice: once before the write and
+# once after. The second read is the truth by construction, whatever the SQL
+# did. Two SELECTs per batch is a cheap price for not having to be right about
+# somebody else's ON CONFLICT clause.
+# ---------------------------------------------------------------------------
+import os as _os
+from contextlib import contextmanager
+
+# Escape hatch: CD_FRESHNESS=0 turns tracking off everywhere without a deploy.
+TRACKING_ENABLED = _os.environ.get("CD_FRESHNESS", "1") not in ("0", "false", "no")
+
+# SQLite's default parameter limit is 999. Each key contributes len(pk_cols)
+# parameters, so 200 composite keys stays well inside it.
+_KEY_CHUNK = 200
+
+_SCHEMA_READY: set = set()
+
+
+def _get(row: Any, col: str) -> Any:
+    try:
+        return row[col]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _key_tuple(row: Any, pk_cols: Sequence[str]) -> Tuple[str, ...]:
+    return tuple(_norm(_get(row, c)) for c in pk_cols)
+
+
+def has_freshness(conn: sqlite3.Connection, table: str) -> bool:
+    try:
+        return "content_hash" in set(table_columns(conn, table))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ready(conn: sqlite3.Connection, table: str) -> bool:
+    """Make sure the table can be tracked, at most once per process per table."""
+    if table in _SCHEMA_READY:
+        return True
+    try:
+        ensure_schema(conn, table)
+    except Exception:  # noqa: BLE001
+        return False
+    _SCHEMA_READY.add(table)
+    return True
+
+
+def _fetch_by_keys(conn: sqlite3.Connection, table: str, pk_cols: Sequence[str],
+                   rows: Sequence[Dict[str, Any]]) -> Dict[Tuple[str, ...], Any]:
+    """{key -> stored Row} for those that exist. One SELECT per chunk."""
+    wanted: Dict[Tuple[str, ...], List[Any]] = {}
+    for r in rows:
+        wanted.setdefault(_key_tuple(r, pk_cols), [_get(r, c) for c in pk_cols])
+    out: Dict[Tuple[str, ...], Any] = {}
+    group = "(" + " AND ".join(f"{c}=?" for c in pk_cols) + ")"
+    items = list(wanted.items())
+    for i in range(0, len(items), _KEY_CHUNK):
+        chunk = items[i:i + _KEY_CHUNK]
+        sql = f"SELECT * FROM {table} WHERE " + " OR ".join(group for _ in chunk)
+        args = [v for _, vals in chunk for v in vals]
+        for row in conn.execute(sql, args):
+            out[_key_tuple(row, pk_cols)] = row
+    return out
+
+
+def snapshot(conn: sqlite3.Connection, table: str, pk_cols: Sequence[str],
+             rows: Sequence[Dict[str, Any]]) -> Optional[Dict[Tuple[str, ...], Any]]:
+    """Read the stored rows BEFORE the upsert overwrites them.
+
+    Returns None when tracking is off or the table has no freshness columns —
+    `reconcile` then does nothing, so a deployment that has not run
+    freshness_backfill is simply untracked rather than broken.
+    """
+    if not TRACKING_ENABLED or not rows:
+        return None
+    if not _ready(conn, table):
+        return None
+    return _fetch_by_keys(conn, table, pk_cols, rows)
+
+
+def reconcile(conn: sqlite3.Connection, table: str, pk_cols: Sequence[str],
+              rows: Sequence[Dict[str, Any]],
+              before: Optional[Dict[Tuple[str, ...], Any]],
+              job_id: Optional[int] = None,
+              cols: Optional[Sequence[str]] = None,
+              ts: Optional[float] = None) -> Dict[str, int]:
+    """Re-read the rows the upsert just wrote and record what moved."""
+    counts = {"new": 0, "changed": 0, "same": 0, "returned": 0}
+    if before is None or not rows:
+        return counts
+    cols = list(cols) if cols else tracked_columns(conn, table)
+    now = ts if ts is not None else time.time()
+    after = _fetch_by_keys(conn, table, pk_cols, rows)
+    where = " AND ".join(f"{c}=?" for c in pk_cols)
+
+    seen_only: List[List[Any]] = []   # confirmed unchanged
+    moved: List[List[Any]] = []       # new or changed
+
+    for key, cur in after.items():
+        old = before.get(key)
+        h = row_hash(cur, cols)
+        pk = "|".join(key)
+        args = [_get(cur, c) for c in pk_cols]
+        if old is None:
+            log_change(conn, table, pk, "*", None, None, "new", job_id, now)
+            moved.append([h, now, now, now] + args)
+            counts["new"] += 1
+            continue
+        was_gone = old["inactive_since"] if "inactive_since" in old.keys() else None
+        if old["content_hash"] == h:
+            seen_only.append([now] + args)
+            if was_gone:
+                log_change(conn, table, pk, "*", None, None, "returned",
+                           job_id, now)
+                counts["returned"] += 1
+            else:
+                counts["same"] += 1
+            continue
+        for field, a, b in diff_row(old, cur, cols):
+            log_change(conn, table, pk, field, a, b, "changed", job_id, now)
+        moved.append([h, now, now, now] + args)
+        counts["returned" if was_gone else "changed"] += 1
+
+    if seen_only:
+        conn.executemany(
+            f"UPDATE {table} SET last_seen_at=?, inactive_since=NULL "
+            f"WHERE {where}", seen_only)
+    if moved:
+        # first_seen_at is COALESCEd so one statement serves both a brand-new
+        # row (sets it) and a changed one (keeps the original date).
+        conn.executemany(
+            f"UPDATE {table} SET content_hash=?, last_seen_at=?, "
+            f"last_changed_at=?, first_seen_at=COALESCE(first_seen_at,?), "
+            f"inactive_since=NULL WHERE {where}", moved)
+    return counts
+
+
+class _Tracker:
+    __slots__ = ("counts",)
+
+    def __init__(self) -> None:
+        self.counts: Dict[str, int] = {"new": 0, "changed": 0,
+                                       "same": 0, "returned": 0}
+
+
+@contextmanager
+def tracking(conn: sqlite3.Connection, table: str, pk_cols: Sequence[str],
+             rows: Sequence[Dict[str, Any]], job_id: Optional[int] = None,
+             cols: Optional[Sequence[str]] = None):
+    """Wrap an upsert so the freshness columns and change log follow it.
+
+        with fr.tracking(conn, "courses", ["course_id"], rows, job_id) as t:
+            conn.executemany(sql, params)
+        t.counts  ->  {'new': .., 'changed': .., 'same': .., 'returned': ..}
+
+    Reconciliation is skipped if the upsert raised — a half-written batch must
+    not be fingerprinted as though it had landed.
+    """
+    t = _Tracker()
+    before = snapshot(conn, table, pk_cols, rows)
+    yield t
+    t.counts = reconcile(conn, table, pk_cols, rows, before, job_id, cols)
+
+
 def stamp_new(conn: sqlite3.Connection, table: str, pk_cols: Sequence[str],
               row: Dict[str, Any], cols: Optional[Sequence[str]] = None,
               ts: Optional[float] = None) -> None:
