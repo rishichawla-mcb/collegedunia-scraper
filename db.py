@@ -714,7 +714,8 @@ def list_colleges_to_enrich(db_path: str = DB_PATH, where: str = "", params: tup
         return [dict(r) for r in conn.execute(sql, args).fetchall()]
 
 
-def update_college_details(college_id: int, fields: Dict[str, Any], db_path: str = DB_PATH) -> None:
+def update_college_details(college_id: int, fields: Dict[str, Any], db_path: str = DB_PATH,
+                           job_id: Optional[int] = None) -> None:
     """Write Phase-3 enrichment onto a college row.
 
     NON-DESTRUCTIVE: a blank/NULL incoming value never overwrites an existing
@@ -731,12 +732,18 @@ def update_college_details(college_id: int, fields: Dict[str, Any], db_path: str
         v = fields.get(c)
         vals += [v, v, v]
     vals += [time.time(), college_id]
+    # Tracked like every other write to `colleges`. Phase 3 is the refresh
+    # path for this table (stale_before), so if this write were untracked a
+    # refreshed college would keep its old last_seen_at, stay "stale", and be
+    # re-fetched on every refresh forever — found by the 2026-09-21 canary.
     with connect(db_path) as conn:
-        conn.execute(f"UPDATE colleges SET {sets} WHERE college_id=?", vals)
+        with _fr.tracking(conn, "colleges", ["college_id"],
+                          [{"college_id": college_id}], job_id):
+            conn.execute(f"UPDATE colleges SET {sets} WHERE college_id=?", vals)
 
 
 def update_college_basic(college_id: int, fields: Dict[str, Any],
-                         db_path: str = DB_PATH) -> None:
+                         db_path: str = DB_PATH, job_id: Optional[int] = None) -> None:
     """Write Phase-3 `basic_info` onto a college row.
 
     NON-DESTRUCTIVE, exactly like update_college_details: a blank incoming value
@@ -752,8 +759,14 @@ def update_college_basic(college_id: int, fields: Dict[str, Any],
         v = fields.get(c)
         vals += [v, v, v]
     vals += [time.time(), college_id]
+    # Tracked like every other write to `colleges`. Phase 3 is the refresh
+    # path for this table (stale_before), so if this write were untracked a
+    # refreshed college would keep its old last_seen_at, stay "stale", and be
+    # re-fetched on every refresh forever — found by the 2026-09-21 canary.
     with connect(db_path) as conn:
-        conn.execute(f"UPDATE colleges SET {sets} WHERE college_id=?", vals)
+        with _fr.tracking(conn, "colleges", ["college_id"],
+                          [{"college_id": college_id}], job_id):
+            conn.execute(f"UPDATE colleges SET {sets} WHERE college_id=?", vals)
 
 
 def seed_colleges_from_directory(db_path: str = DB_PATH) -> int:

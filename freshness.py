@@ -57,9 +57,26 @@ EXCLUDED_FROM_HASH = FRESHNESS_NAMES | {
     "id",                      # autoincrement surrogate, not identity
     "scraped_at", "updated_at", "enriched_at",
     "detail_scraped_at", "program_detail_scraped_at",
+    # Phase 3 stamps this on every visit. Found by the 2026-09-21 canary audit:
+    # it was the one volatile column still inside a fingerprint, and would have
+    # made all 14,997 colleges read as changed on every refresh.
+    "basic_scraped_at",
     "source_job_id", "job_id",
     "raw_json", "detail_json",
+    # The raw basic_info object that colleges' 29 basic_* columns are parsed
+    # from — a duplicate of hashed content, like raw_json, and serialised
+    # without sort_keys so a key reorder upstream would read as a change.
+    # Other *_json columns stay IN the fingerprint on purpose: the phase ⑤
+    # fee/living-cost/dates/languages JSON, courses_fees_json and the SA
+    # application/fee-history JSON are the only copy of that data (their
+    # normalisation was deferred), so a change in them is a real change.
+    "basic_info_json",
 }
+
+# Belt and braces for columns added later: any "<something>_scraped_at" is a
+# visit stamp, never content. basic_scraped_at slipped through because the
+# explicit list above is only as good as whoever last remembered to extend it.
+VOLATILE_SUFFIXES = ("_scraped_at",)
 
 # A changed value is logged, but descriptions run to thousands of characters and
 # the log would dwarf the data. Store enough to see WHAT changed.
@@ -118,7 +135,8 @@ def ensure_schema(conn: sqlite3.Connection, table: str) -> List[str]:
 def tracked_columns(conn: sqlite3.Connection, table: str) -> List[str]:
     """The columns that make up the fingerprint, in a stable order."""
     return sorted(c for c in table_columns(conn, table)
-                  if c not in EXCLUDED_FROM_HASH)
+                  if c not in EXCLUDED_FROM_HASH
+                  and not c.endswith(VOLATILE_SUFFIXES))
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +360,7 @@ def reconcile(conn: sqlite3.Connection, table: str, pk_cols: Sequence[str],
               cols: Optional[Sequence[str]] = None,
               ts: Optional[float] = None) -> Dict[str, int]:
     """Re-read the rows the upsert just wrote and record what moved."""
-    counts = {"new": 0, "changed": 0, "same": 0, "returned": 0}
+    counts = {"new": 0, "changed": 0, "same": 0, "returned": 0, "resynced": 0}
     if before is None or not rows:
         return counts
     cols = list(cols) if cols else tracked_columns(conn, table)
@@ -352,19 +370,27 @@ def reconcile(conn: sqlite3.Connection, table: str, pk_cols: Sequence[str],
 
     seen_only: List[List[Any]] = []   # confirmed unchanged
     moved: List[List[Any]] = []       # new or changed
+    resync: List[List[Any]] = []      # hash was stale; nothing actually changed
 
     for key, cur in after.items():
         old = before.get(key)
         h = row_hash(cur, cols)
         pk = "|".join(key)
         args = [_get(cur, c) for c in pk_cols]
-        if old is None:
+        old_hash = old["content_hash"] if old is not None and \
+            "content_hash" in old.keys() else None
+        if old is None or old_hash is None:
+            # No row, or a row that was never fingerprinted — e.g. identity-only
+            # rows copied in by seed_colleges_from_directory's untracked INSERT.
+            # Either way this is the FIRST observation. Diffing it field by
+            # field would log ~30 "changes" from NULL per row, which for the
+            # 5,309 seeded directory colleges is ~150k rows of noise.
             log_change(conn, table, pk, "*", None, None, "new", job_id, now)
             moved.append([h, now, now, now] + args)
             counts["new"] += 1
             continue
         was_gone = old["inactive_since"] if "inactive_since" in old.keys() else None
-        if old["content_hash"] == h:
+        if old_hash == h:
             seen_only.append([now] + args)
             if was_gone:
                 log_change(conn, table, pk, "*", None, None, "returned",
@@ -373,7 +399,25 @@ def reconcile(conn: sqlite3.Connection, table: str, pk_cols: Sequence[str],
             else:
                 counts["same"] += 1
             continue
-        for field, a, b in diff_row(old, cur, cols):
+        diffs = diff_row(old, cur, cols)
+        if not diffs:
+            # The fingerprint moved but no field differs from what was stored
+            # before this write. So the STORED HASH was stale, not the site:
+            # some untracked write — normalize_fees, fill_empty_directory_extras,
+            # fix_airport.py, freefix.py, a definition change without a rehash —
+            # altered the row after it was fingerprinted. Re-sync the hash
+            # silently. A genuine change always shows up as a field difference,
+            # so this rule cannot swallow one.
+            resync.append([h, now] + args)
+            if was_gone:
+                log_change(conn, table, pk, "*", None, None, "returned",
+                           job_id, now)
+                counts["returned"] += 1
+            else:
+                counts["same"] += 1
+            counts["resynced"] += 1
+            continue
+        for field, a, b in diffs:
             log_change(conn, table, pk, field, a, b, "changed", job_id, now)
         moved.append([h, now, now, now] + args)
         counts["returned" if was_gone else "changed"] += 1
@@ -382,6 +426,11 @@ def reconcile(conn: sqlite3.Connection, table: str, pk_cols: Sequence[str],
         conn.executemany(
             f"UPDATE {table} SET last_seen_at=?, inactive_since=NULL "
             f"WHERE {where}", seen_only)
+    if resync:
+        # last_changed_at deliberately NOT moved — nothing changed on the site.
+        conn.executemany(
+            f"UPDATE {table} SET content_hash=?, last_seen_at=?, "
+            f"inactive_since=NULL WHERE {where}", resync)
     if moved:
         # first_seen_at is COALESCEd so one statement serves both a brand-new
         # row (sets it) and a changed one (keeps the original date).
@@ -396,8 +445,8 @@ class _Tracker:
     __slots__ = ("counts",)
 
     def __init__(self) -> None:
-        self.counts: Dict[str, int] = {"new": 0, "changed": 0,
-                                       "same": 0, "returned": 0}
+        self.counts: Dict[str, int] = {"new": 0, "changed": 0, "same": 0,
+                                       "returned": 0, "resynced": 0}
 
 
 @contextmanager
@@ -512,6 +561,54 @@ def backfill(db_path: str, table: str, pk_cols: Sequence[str],
                 break
         return {"rows": total, "needing_hash": todo, "hashed": done,
                 "columns_in_hash": len(cols)}
+    finally:
+        conn.commit()
+        conn.close()
+
+
+def rehash(db_path: str, table: str, pk_cols: Sequence[str],
+           batch: int = 5000, apply: bool = True) -> Dict[str, int]:
+    """Recompute `content_hash` for every row under the CURRENT definition.
+
+    Needed whenever the set of fingerprinted columns changes — as it did when
+    basic_scraped_at was taken out of the colleges fingerprint. Without it, the
+    stored hashes describe the old column set, and the first refresh after the
+    change reports every row as changed while `diff_row` finds no field that
+    differs.
+
+    Writes `content_hash` and nothing else. No data column is touched, and
+    first_seen_at / last_seen_at / last_changed_at are deliberately left alone:
+    a definition change is not an observation, so it must not make a row look
+    freshly seen or freshly changed. Nothing is logged to data_changes for the
+    same reason.
+    """
+    conn = connect(db_path)
+    try:
+        ensure_schema(conn, table)
+        cols = tracked_columns(conn, table)
+        total = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        where = " AND ".join(f"{c}=?" for c in pk_cols)
+        moved = 0
+        last_rowid = 0
+        while True:
+            rows = conn.execute(
+                f"SELECT rowid AS _rid, * FROM {table} WHERE rowid > ? "
+                f"ORDER BY rowid LIMIT {int(batch)}", (last_rowid,)).fetchall()
+            if not rows:
+                break
+            updates = []
+            for r in rows:
+                h = row_hash(r, cols)
+                if h != r["content_hash"]:
+                    moved += 1
+                    updates.append([h] + [r[c] for c in pk_cols])
+            if apply and updates:
+                conn.executemany(
+                    f"UPDATE {table} SET content_hash=? WHERE {where}", updates)
+                conn.commit()
+            last_rowid = rows[-1]["_rid"]
+        return {"rows": total, "hash_moved": moved,
+                "columns_in_hash": len(cols), "applied": bool(apply)}
     finally:
         conn.commit()
         conn.close()

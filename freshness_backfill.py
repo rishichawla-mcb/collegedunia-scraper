@@ -7,6 +7,12 @@ Seeding the hashes now is what makes that first sweep cheap.
     python freshness_backfill.py            # report only, no writes
     python freshness_backfill.py --apply    # seed the hashes
     python freshness_backfill.py --status   # what the log has recorded so far
+    python freshness_backfill.py --rehash colleges           # dry run
+    python freshness_backfill.py --rehash colleges --apply   # recompute hashes
+
+--rehash is for when the fingerprint DEFINITION changes (a column added to or
+removed from the hash). It rewrites content_hash only — no data column and no
+timestamp — so the next refresh compares like with like.
 
 Nothing is deleted or overwritten: this adds five columns and computes a hash
 from values already stored.
@@ -92,10 +98,31 @@ def status() -> int:
     return 0
 
 
+def rehash_cmd(table: str, apply: bool) -> int:
+    entry = next(((m, t, pk) for m, t, pk in TRACKED if t == table), None)
+    if not entry:
+        print(f"{table!r} is not a tracked table. Tracked: "
+              + ", ".join(t for _m, t, _pk in TRACKED))
+        return 2
+    mod, _t, pk = entry
+    r = fr.rehash(_paths()[mod], table, pk, apply=apply)
+    print(f"  {table}: {r['rows']:,} rows · {r['columns_in_hash']} columns in "
+          f"the fingerprint · {r['hash_moved']:,} hashes "
+          f"{'recomputed' if apply else 'would change'}")
+    print("  content_hash only — no data column or timestamp was touched."
+          if apply else "\nDRY RUN — nothing written. Re-run with --apply.")
+    return 0
+
+
 def main() -> int:
-    args = set(sys.argv[1:])
+    argv = sys.argv[1:]
+    args = set(argv)
     if "--status" in args:
         return status()
+    if "--rehash" in args:
+        i = argv.index("--rehash")
+        return rehash_cmd(argv[i + 1] if i + 1 < len(argv) else "",
+                          "--apply" in args)
     apply = "--apply" in args
     paths = _paths()
 

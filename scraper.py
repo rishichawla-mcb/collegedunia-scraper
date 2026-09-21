@@ -1852,9 +1852,11 @@ def run_enrichment(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
                     # still marked done (fields == {}), so it isn't re-fetched
                     # forever. Neither writer overwrites an existing value with a
                     # blank one.
-                    db.update_college_details(cobj["college_id"], fields, db_path=db_path)
+                    db.update_college_details(cobj["college_id"], fields, db_path=db_path,
+                                            job_id=job_id)
                     if basic:
-                        db.update_college_basic(cobj["college_id"], basic, db_path=db_path)
+                        db.update_college_basic(cobj["college_id"], basic, db_path=db_path,
+                                              job_id=job_id)
                 ok = bool(fields or basic)
             except Exception as err:  # noqa: BLE001
                 log(f"  college {cobj['college_id']} err: {str(err)[:60]}")
