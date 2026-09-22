@@ -1981,6 +1981,16 @@ def run_enrichment(job_id: int, cfg: Dict[str, Any], db_path: str = db.DB_PATH,
                     state["incomplete"] = True; state["msg"] = bh
                 stop_event.set(); return
             ok = False
+            # One sticky exit IP per college, as every other phase already does
+            # (cf…, crs…, col…, dir…). Without a session id, Client._rotate() is
+            # a no-op, so after a 403 every retry — and every later college on
+            # this worker — went out through the SAME refused IP over a reused
+            # connection. That, not the site, is what took Phase 3 from working
+            # in August to 86-100% refused in jobs 45/47/48: their 403 lines
+            # never say "[fresh proxy IP]", Course Finder's always do. Found
+            # 2026-09-22 when fresh-connection probes got 8/18 through on the
+            # very endpoint job 48 was getting 0/68 on.
+            client.session_id = f"enr{cobj['college_id']}"
             try:
                 # get_text now raises BlockedError on a challenge page, so a
                 # blocked college never reaches the write below and keeps
