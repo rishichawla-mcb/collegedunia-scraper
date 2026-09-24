@@ -50,10 +50,48 @@ from urllib.parse import urlparse
 import db as _core
 import sk_db
 from scraper import (AdaptiveDelay, BlockedError, Client, ProxyManager, Stats,
-                     base_headers, is_block_page, redact_proxy, wire_bytes)
+                     is_block_page, redact_proxy, wire_bytes)
 
 SITE = "https://www.shiksha.com"
 SITEMAP_INDEX = f"{SITE}/sitemap_index.xml"
+
+CHROME_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+
+def sk_headers() -> Dict[str, str]:
+    """Headers for shiksha.com. NOT `scraper.base_headers()`.
+
+    The first discovery run used `base_headers()` and was refused five times
+    over. Those headers were written for Collegedunia's web-api and send
+    `Referer: https://collegedunia.com/course-finder`, `X-Requested-With:
+    XMLHttpRequest` and `Accept: application/json` — a cross-site referer and an
+    AJAX marker on a request for a static XML file. That combination is bot-like
+    enough that the 403 said nothing about whether the IP was acceptable; it was
+    my bug, not a finding about Shiksha. See sk_probe.py, which measures which
+    of the two it actually was.
+
+    `Accept-Encoding` deliberately omits `br` and `zstd`: brotli is not installed
+    here, and advertising an encoding we cannot decode turns a good response into
+    an unreadable one.
+    """
+    return {
+        "User-Agent": CHROME_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                  "image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-IN,en-GB;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", '
+                     '"Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Connection": "keep-alive",
+    }
 
 # The sitemap families worth reading. `www_news_SiteMap` (137 files) and the
 # category/exam/ranking/review families are deliberately NOT here: they describe
@@ -214,7 +252,7 @@ def fetch_bytes(client: Client, url: str, label: str) -> bytes:
         proxy = client.pm.get(client.session_id)
         try:
             resp = client.session.get(
-                url, headers=base_headers(),
+                url, headers=sk_headers(),
                 proxies=proxy.as_dict() if proxy else None,
                 timeout=client.timeout, stream=True)
             client.stats.add(requests=1, byts=wire_bytes(resp))

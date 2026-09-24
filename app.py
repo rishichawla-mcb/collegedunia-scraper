@@ -258,7 +258,8 @@ if not st.session_state.get("_recovered"):
         import vertical_base as _vb
         import sa_vertical
         import cf_vertical
-        _ = (sa_vertical, cf_vertical)   # imported for their self-registration
+        import sk_vertical
+        _ = (sa_vertical, cf_vertical, sk_vertical)   # imported for their self-registration
         _reaped = _vb.reap_all(REAP_GRACE)
         st.session_state["_reaped"] = {k: v for k, v in _reaped.items() if v}
     except Exception:  # noqa: BLE001
@@ -799,9 +800,23 @@ def render_system_bar() -> None:
 # ever touches its own `sa_`-prefixed tables (namespace isolation). Auth above
 # (require_login) already gates both verticals.
 _vertical = st.sidebar.radio(
-    "🧭 Vertical", ["🇮🇳 Domestic", "🌍 Study Abroad", "🔎 Course Finder"], index=0,
+    "🧭 Vertical",
+    ["🇮🇳 Domestic", "🌍 Study Abroad", "🔎 Course Finder", "📗 Shiksha"], index=0,
     help="Switch scraping verticals. Data is isolated in separate tables; "
-         "Study Abroad scrapes run as their own worker processes.")
+         "Shiksha goes further and uses its own database FILE. Each vertical's "
+         "scrapes run as their own worker processes.")
+if _vertical == "📗 Shiksha":
+    try:
+        render_system_bar()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import sk_ui
+        sk_ui.render()
+    except Exception as _sk_err:  # error boundary: never crashes the page
+        st.error(f"Shiksha module error: {_sk_err}")
+    st.stop()
+
 if _vertical == "🔎 Course Finder":
     try:
         render_system_bar()
