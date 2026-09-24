@@ -19,7 +19,8 @@ import vertical_base as vb
 # Import each vertical module so it self-registers. Add future verticals here.
 import sa_vertical  # noqa: F401  (registers 'studyabroad')
 import cf_vertical  # noqa: F401  (registers 'coursefinder')
-_VERTICALS = (sa_vertical, cf_vertical)   # referenced so pyflakes keeps the self-registration imports
+import sk_vertical  # noqa: F401  (registers 'shiksha')
+_VERTICALS = (sa_vertical, cf_vertical, sk_vertical)   # referenced so pyflakes keeps the self-registration imports
 
 
 def main() -> None:

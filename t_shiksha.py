@@ -1,0 +1,486 @@
+"""
+Shiksha vertical — test harness.
+
+Drives the REAL runner (`sk_scraper.run_discovery`) with the transport
+monkeypatched at `requests.Session.get`, exactly as the other twelve suites do.
+Nothing is stubbed above the socket: the parsers, the accumulator, the upserts,
+the freshness tracking, the resume logic and the job bookkeeping all run.
+
+Every load-bearing guard is mutation-tested — the guard is broken on purpose and
+the test must then fail. A test that passes both ways is not testing anything.
+
+    python t_shiksha.py
+"""
+from __future__ import annotations
+
+import gzip
+import io
+import os
+import shutil
+import sys
+import tempfile
+import traceback
+
+_TMP = tempfile.mkdtemp(prefix="sktest_")
+os.environ["CD_DB_PATH"] = os.path.join(_TMP, "data.db")
+os.environ["CD_SK_DB_PATH"] = os.path.join(_TMP, "shiksha.db")
+
+import requests  # noqa: E402
+
+import sk_db      # noqa: E402
+import sk_scraper  # noqa: E402
+
+SITE = "https://www.shiksha.com"
+
+FAILURES = []
+PASSES = []
+
+
+def check(name, cond, detail=""):
+    (PASSES if cond else FAILURES).append(name)
+    print(("  ok   " if cond else "  FAIL ") + name + (f"  — {detail}" if detail and not cond else ""))
+    return cond
+
+
+# ---------------------------------------------------------------------------
+# A fake site: a sitemap index plus five sitemap files.
+# ---------------------------------------------------------------------------
+def _urlset(entries):
+    body = "".join(
+        f"<url><loc>{loc}</loc>" + (f"<lastmod>{lm}</lastmod>" if lm else "") + "</url>"
+        for loc, lm in entries)
+    return ('<?xml version="1.0" encoding="UTF-8"?>'
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            + body + "</urlset>")
+
+
+def _index(names):
+    body = "".join(f"<sitemap><loc>{SITE}/{n}</loc>"
+                   f"<lastmod>2026-09-20</lastmod></sitemap>" for n in names)
+    return ('<?xml version="1.0" encoding="UTF-8"?>'
+            '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            + body + "</sitemapindex>")
+
+
+def _gz(s: str) -> bytes:
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as f:
+        f.write(s.encode())
+    return buf.getvalue()
+
+
+SITEMAP_NAMES = ["www_sd_college_SiteMap_f1.xml.gz",
+                 "www_sd_college_SiteMap_f2.xml.gz",
+                 "www_sd_university_SiteMap_f1.xml.gz",
+                 "www_listing_SiteMap_f1.xml.gz",
+                 "www_news_SiteMap_f1.xml.gz"]
+
+# college 72 appears under THREE home slugs (the alias problem, in miniature:
+# 3 home URLs -> 1 id), college 99 under one.
+COLLEGE_F1 = _urlset([
+    (f"{SITE}/college/iim-ahmedabad-72", "2026-09-01"),
+    (f"{SITE}/college/indian-institute-of-management-ahmedabad-72", "2026-09-02"),
+    (f"{SITE}/college/iim-a-72", ""),
+    (f"{SITE}/college/iim-ahmedabad-72/fees", "2026-09-03"),
+    (f"{SITE}/college/nit-trichy-2-99", "2026-08-15"),      # digits inside the slug
+    (f"{SITE}/college/nit-trichy-2-99/courses", ""),
+])
+COLLEGE_F2 = _urlset([
+    (f"{SITE}/college/iim-ahmedabad-72/placement", ""),
+    (f"{SITE}/college/iim-ahmedabad-72/course-mba-101", "2026-09-05"),
+    (f"{SITE}/college/nit-trichy-2-99/course-mba-101", ""),
+    (f"{SITE}/college/nit-trichy-2-99/course-btech-computer-science-202", ""),
+    (f"{SITE}/college/nit-trichy-2-99/some-unknown-page", ""),
+])
+UNIV_F1 = _urlset([
+    (f"{SITE}/university/anna-university-5", "2026-07-01"),
+    (f"{SITE}/university/anna-university-5/courses", ""),
+])
+LISTING_F1 = _urlset([
+    (f"{SITE}/college/iim-ahmedabad-72/course-pgp-303", ""),
+])
+# Must never be read: it is not in SITEMAP_GROUPS.
+NEWS_F1 = _urlset([(f"{SITE}/college/should-never-be-seen-4242", "")])
+
+BODIES = {
+    f"{SITE}/sitemap_index.xml": _index(SITEMAP_NAMES).encode(),
+    f"{SITE}/www_sd_college_SiteMap_f1.xml.gz": _gz(COLLEGE_F1),
+    f"{SITE}/www_sd_college_SiteMap_f2.xml.gz": _gz(COLLEGE_F2),
+    f"{SITE}/www_sd_university_SiteMap_f1.xml.gz": _gz(UNIV_F1),
+    f"{SITE}/www_listing_SiteMap_f1.xml.gz": _gz(LISTING_F1),
+    f"{SITE}/www_news_SiteMap_f1.xml.gz": _gz(NEWS_F1),
+}
+
+REQUESTS = []          # (url, session_id_in_proxy_or_None)
+
+
+class FakeResponse:
+    def __init__(self, body: bytes, status: int = 200):
+        self.status_code = status
+        self._body = body
+        self.headers = {"Content-Length": str(len(body)),
+                        "Content-Type": "application/xml"}
+        self.raw = self
+        self.encoding = "utf-8"
+
+    # wire_bytes() reads Content-Length first; raw.tell() is the fallback.
+    def tell(self):
+        return len(self._body)
+
+    @property
+    def content(self):
+        return self._body
+
+    @property
+    def text(self):
+        return self._body.decode("utf-8", "replace")
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(f"HTTP {self.status_code}")
+
+
+def install_transport(fail_urls=None, missing=()):
+    fail_urls = fail_urls or {}
+
+    def fake_get(self, url, **kw):
+        prox = (kw.get("proxies") or {}).get("https")
+        REQUESTS.append((url, prox))
+        if url in fail_urls and fail_urls[url] > 0:
+            fail_urls[url] -= 1
+            return FakeResponse(b"blocked", 403)
+        if url in missing:
+            return FakeResponse(b"nope", 404)
+        body = BODIES.get(url)
+        if body is None:
+            return FakeResponse(b"not found", 404)
+        return FakeResponse(body)
+
+    requests.Session.get = fake_get
+
+
+install_transport()
+
+
+def fresh_db():
+    p = os.path.join(_TMP, "shiksha.db")
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.remove(p + suffix)
+        except OSError:
+            pass
+    # freshness caches "this table is ready" per PROCESS, keyed by table name
+    # alone. Deleting the file underneath it would otherwise leave the cache
+    # asserting a schema that no longer exists.
+    import freshness as _fr
+    _fr._SCHEMA_READY.clear()
+    sk_db.init_db()
+    REQUESTS.clear()
+
+
+CFG = {"proxy_mode": "gateway",
+       "proxy_gateway": "http://u:p@gw.example.com:7777",
+       "concurrency": 2, "delay": 0, "adaptive": False, "max_retries": 3,
+       "backoff": 0.01}
+
+
+LOGS = []
+
+
+def run(cfg=None, phase="discovery"):
+    """Drive the real runner. Job logs are captured, not swallowed: a swallowed
+    '! sitemap … failed' once turned a broken run into a silently empty one."""
+    del LOGS[:]
+    job = sk_db.create_job(phase, {})
+    sk_scraper.run_discovery(job, {**CFG, **(cfg or {})}, log=LOGS.append)
+    bad = [m for m in LOGS if m.lstrip().startswith("!")]
+    if bad and os.environ.get("SK_TEST_VERBOSE", "1") != "0":
+        for m in bad[:8]:
+            print("       [runner]", m.strip())
+    return sk_db.get_job(job)
+
+
+# ---------------------------------------------------------------------------
+print("\n== 1. classify() ==")
+c = sk_scraper.classify(f"{SITE}/college/iim-ahmedabad-72")
+check("home URL -> college_home + id", c["kind"] == "college_home" and c["college_id"] == 72, c)
+c = sk_scraper.classify(f"{SITE}/college/iim-ahmedabad-72/")
+check("trailing slash tolerated", c["kind"] == "college_home" and c["college_id"] == 72, c)
+c = sk_scraper.classify(f"{SITE}/college/nit-trichy-2-99")
+check("id is the LAST numeric segment, not the first",
+      c["college_id"] == 99 and c["slug"] == "nit-trichy-2", c)
+c = sk_scraper.classify(f"{SITE}/college/iim-ahmedabad-72/fees")
+check("tab URL -> college_tab", c["kind"] == "college_tab" and c["tab"] == "fees", c)
+c = sk_scraper.classify(f"{SITE}/college/iim-ahmedabad-72/course-btech-computer-science-202")
+check("offering carries BOTH ids",
+      c["kind"] == "offering" and c["college_id"] == 72 and c["course_id"] == 202
+      and c["course_slug"] == "btech-computer-science", c)
+c = sk_scraper.classify(f"{SITE}/college/x-72/some-unknown-page")
+check("unknown sub-page -> tab 'other', never dropped silently",
+      c["kind"] == "college_tab" and c["tab"] == "other", c)
+c = sk_scraper.classify(f"{SITE}/university/anna-university-5")
+check("university home", c["kind"] == "university_home" and c["university_id"] == 5, c)
+check("news/editorial URL -> other",
+      sk_scraper.classify(f"{SITE}/news/some-story")["kind"] == "other")
+
+print("\n== 2. decompress() / parse_sitemap() ==")
+check("gzip FILE body is decompressed",
+      sk_scraper.decompress(_gz("<urlset/>")) == "<urlset/>")
+check("already-decoded body passes through",
+      sk_scraper.decompress(b"<urlset/>") == "<urlset/>")
+ents = sk_scraper.parse_sitemap(COLLEGE_F1)
+check("urlset parsed with namespace", len(ents) == 6, len(ents))
+check("lastmod paired to its own loc",
+      dict(ents)[f"{SITE}/college/iim-ahmedabad-72"] == "2026-09-01")
+check("missing lastmod -> empty, not the neighbour's",
+      dict(ents)[f"{SITE}/college/iim-a-72"] == "")
+check("sitemap index parsed the same way",
+      len(sk_scraper.parse_sitemap(_index(SITEMAP_NAMES))) == 5)
+check("truncated XML still yields its <loc>s",
+      len(sk_scraper.parse_sitemap(
+          f"<urlset><url><loc>{SITE}/college/a-1</loc></url><url><loc>"
+          f"{SITE}/college/b-2</loc>")) == 2)
+
+print("\n== 3. proxy is mandatory ==")
+fresh_db()
+try:
+    run({"proxy_mode": "none", "proxy_gateway": ""})
+    check("no-proxy run is refused", False, "it ran")
+except sk_scraper.ProxyRequired:
+    check("no-proxy run is refused", True)
+except Exception as e:  # noqa: BLE001
+    check("no-proxy run is refused", False, f"wrong exception: {e!r}")
+fresh_db()
+logged = []
+try:
+    run({"proxy_mode": "none", "proxy_gateway": "", "allow_direct": True})
+    ran = True
+except Exception:  # noqa: BLE001
+    ran = False
+check("allow_direct is the only override, and it works", ran)
+
+print("\n== 4. discovery, end to end ==")
+fresh_db()
+job = run()
+counts = sk_db.counts()
+check("job completed", job["status"] == "completed", job["message"])
+check("DEDUPED BY ID: 4 home URLs -> 2 colleges", counts["colleges"] == 2, counts)
+check("every alias slug kept (3 for id 72, 1 for id 99)",
+      counts["aliases"] == 4, counts)
+check("universities found", counts["universities"] == 1, counts)
+check("offerings: all 4 college x course edges", counts["offerings"] == 4, counts)
+check("courses learned free from offering URLs", counts["courses"] == 3, counts)
+check("the news sitemap was never fetched",
+      not any("news" in u for u, _ in REQUESTS),
+      [u for u, _ in REQUESTS if "news" in u])
+check("college 4242 (news-only) was not created",
+      not sk_db.colleges_pending(db_path=sk_db.SK_DB_PATH) or
+      all(r["college_id"] != 4242 for r in sk_db.colleges_pending()))
+
+with sk_db.connect() as conn:
+    row = dict(conn.execute("SELECT * FROM sk_colleges WHERE college_id=72").fetchone())
+    off = [dict(r) for r in conn.execute(
+        "SELECT * FROM sk_offerings WHERE college_id=72 ORDER BY course_id")]
+    crs = {r["course_id"]: dict(r) for r in conn.execute("SELECT * FROM sk_courses")}
+check("tabs UNIONED across two different sitemap files",
+      row["tabs"] == "fees,placement", row["tabs"])
+check("canonical slug = shortest home slug seen", row["slug"] == "iim-a-72"[:-3] or
+      row["slug"] == "iim-a", row["slug"])
+check("alias_count recorded", row["alias_count"] == 3, row["alias_count"])
+check("lastmod kept as the newest seen", row["lastmod"] == "2026-09-05", row["lastmod"])
+check("offering rows carry the course slug",
+      [o["course_slug"] for o in off] == ["mba", "pgp"], [o["course_slug"] for o in off])
+check("colleges_count backfilled onto courses",
+      crs[101]["colleges_count"] == 2 and crs[202]["colleges_count"] == 1,
+      {k: v["colleges_count"] for k, v in crs.items()})
+
+print("\n== 5. every fetch went through a sticky proxy session ==")
+sess = [p for _, p in REQUESTS]
+check("no request went out direct", all(p for p in sess), sess)
+sitemap_sessions = {p for u, p in REQUESTS if u.endswith(".gz")}
+check("each sitemap got its own sticky exit IP "
+      "(without this, one 403 burns the whole worker)",
+      len(sitemap_sessions) >= 4, sitemap_sessions)
+
+print("\n== 6. resume and the union guard ==")
+before = REQUESTS[:]
+n_before = len(REQUESTS)
+REQUESTS.clear()
+job2 = run()
+refetched = [u for u, _ in REQUESTS if u.endswith(".gz")]
+check("a completed sitemap is not re-read", refetched == [], refetched)
+with sk_db.connect() as conn:
+    row2 = dict(conn.execute("SELECT tabs, alias_count FROM sk_colleges "
+                             "WHERE college_id=72").fetchone())
+check("resumed run does not SHRINK tabs", row2["tabs"] == "fees,placement", row2)
+check("resumed run does not shrink alias_count", row2["alias_count"] == 3, row2)
+
+# Force a partial re-read: clear only f2's progress, then check the union holds
+# even though this run never sees f1's 'fees' tab.
+with sk_db.connect() as conn:
+    conn.execute("DELETE FROM sk_sitemap_progress WHERE sitemap_url LIKE '%f2%'")
+REQUESTS.clear()
+run()
+with sk_db.connect() as conn:
+    row3 = dict(conn.execute("SELECT tabs FROM sk_colleges WHERE college_id=72").fetchone())
+check("partial re-read still unions with what the db already held "
+      "(the seeding guard)", row3["tabs"] == "fees,placement", row3)
+
+print("\n== 7. a blocked sitemap does not lose the rest ==")
+fresh_db()
+install_transport(fail_urls={f"{SITE}/www_sd_college_SiteMap_f2.xml.gz": 99})
+job3 = run()
+c3 = sk_db.counts()
+check("the other sitemaps still landed", c3["colleges"] == 2, c3)
+with sk_db.connect() as conn:
+    st = {r[0]: r[1] for r in conn.execute(
+        "SELECT sitemap_url, status FROM sk_sitemap_progress")}
+check("the failed sitemap is recorded as error, not done",
+      any(v == "error" for v in st.values()), st)
+check("a failed sitemap stays in the queue for the next run",
+      sum(1 for v in st.values() if v == "done") == 3, st)
+install_transport()
+
+print("\n== 8. budget stops the run ==")
+fresh_db()
+job4 = run({"budget_requests": 2})
+check("request budget halts and the job says so",
+      job4["status"] == "stopped" and "budget" in (job4["message"] or ""),
+      job4["message"])
+
+print("\n== 9. mutation tests — break the guard, the test must fail ==")
+
+
+def mutate(name, patch, restore, assertion):
+    try:
+        patch()
+        ok = assertion()
+    except Exception as e:  # noqa: BLE001
+        ok = f"raised {type(e).__name__}"
+    finally:
+        restore()
+    check(f"MUTANT CAUGHT: {name}", ok is not True, f"mutant survived ({ok})")
+
+
+# (a) dedupe by URL instead of by id
+_real_classify = sk_scraper.classify
+
+
+def _by_url(url):
+    d = _real_classify(url)
+    if d.get("kind") == "college_home":
+        d = dict(d)
+        d["college_id"] = abs(hash(url)) % 10 ** 6   # a distinct id per URL
+    return d
+
+
+def _assert_two_colleges():
+    fresh_db()
+    run()
+    return sk_db.counts()["colleges"] == 2
+
+
+mutate("dedupe by URL, not by id",
+       lambda: setattr(sk_scraper, "classify", _by_url),
+       lambda: setattr(sk_scraper, "classify", _real_classify),
+       _assert_two_colleges)
+
+# (b) drop the sticky session id — Client._rotate() becomes a no-op
+_real_require = sk_scraper.require_proxy
+
+
+def _assert_sessions_distinct():
+    fresh_db()
+    run()
+    return len({p for u, p in REQUESTS if u.endswith(".gz")}) >= 4
+
+
+class _NoStick(str):
+    pass
+
+
+_real_Client_setattr = None
+
+
+def _patch_no_session():
+    global _real_Client_setattr
+    from scraper import Client as _C
+    _real_Client_setattr = _C.__setattr__
+
+    def _setattr(self, k, v):
+        if k == "session_id":
+            v = None
+        object.__setattr__(self, k, v)
+    _C.__setattr__ = _setattr
+
+
+def _unpatch_no_session():
+    from scraper import Client as _C
+    if _real_Client_setattr:
+        _C.__setattr__ = _real_Client_setattr
+
+
+mutate("no sticky session id per sitemap",
+       _patch_no_session, _unpatch_no_session, _assert_sessions_distinct)
+
+# (c) remove the proxy requirement
+_real_req = sk_scraper.require_proxy
+
+
+def _assert_refuses_direct():
+    fresh_db()
+    try:
+        run({"proxy_mode": "none", "proxy_gateway": ""})
+        return False
+    except sk_scraper.ProxyRequired:
+        return True
+
+
+mutate("proxy requirement removed",
+       lambda: setattr(sk_scraper, "require_proxy", lambda *a, **k: None),
+       lambda: setattr(sk_scraper, "require_proxy", _real_req),
+       _assert_refuses_direct)
+
+# (d) forget to decompress
+_real_decompress = sk_scraper.decompress
+
+
+def _assert_offerings():
+    fresh_db()
+    run()
+    return sk_db.counts()["offerings"] == 4
+
+
+mutate("gzip container not decompressed",
+       lambda: setattr(sk_scraper, "decompress",
+                       lambda b: b.decode("utf-8", "replace") if isinstance(b, bytes) else b),
+       lambda: setattr(sk_scraper, "decompress", _real_decompress),
+       _assert_offerings)
+
+# (e) seed the accumulator from nothing -> a resumed run shrinks tabs
+_real_load = sk_db.load_college_index
+
+
+def _assert_union_survives():
+    fresh_db()
+    run()
+    with sk_db.connect() as conn:
+        conn.execute("DELETE FROM sk_sitemap_progress WHERE sitemap_url LIKE '%f2%'")
+    run()
+    with sk_db.connect() as conn:
+        return dict(conn.execute("SELECT tabs FROM sk_colleges "
+                                 "WHERE college_id=72").fetchone())["tabs"] == "fees,placement"
+
+
+mutate("accumulator not seeded from the db",
+       lambda: setattr(sk_db, "load_college_index", lambda *a, **k: {}),
+       lambda: setattr(sk_db, "load_college_index", _real_load),
+       _assert_union_survives)
+
+# ---------------------------------------------------------------------------
+print("\n" + "=" * 64)
+print(f"{len(PASSES)} passed, {len(FAILURES)} failed")
+for f in FAILURES:
+    print("  FAILED:", f)
+shutil.rmtree(_TMP, ignore_errors=True)
+sys.exit(1 if FAILURES else 0)
