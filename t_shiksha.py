@@ -19,7 +19,6 @@ import os
 import shutil
 import sys
 import tempfile
-import traceback
 
 _TMP = tempfile.mkdtemp(prefix="sktest_")
 os.environ["CD_DB_PATH"] = os.path.join(_TMP, "data.db")
@@ -114,18 +113,21 @@ BODIES = {
 REQUESTS = []          # (url, session_id_in_proxy_or_None)
 
 
+HOST_IP = "203.0.113.9"          # this host's own public IP, in the fake world
+PROXY_IP = "198.51.100.44"       # what the gateway's exit looks like
+
+
 class FakeResponse:
+    """Shaped like a curl_cffi response: no `raw`, but curl's own counters."""
+
     def __init__(self, body: bytes, status: int = 200):
         self.status_code = status
         self._body = body
         self.headers = {"Content-Length": str(len(body)),
                         "Content-Type": "application/xml"}
-        self.raw = self
+        self.download_size = len(body)
+        self.header_size = 120
         self.encoding = "utf-8"
-
-    # wire_bytes() reads Content-Length first; raw.tell() is the fallback.
-    def tell(self):
-        return len(self._body)
 
     @property
     def content(self):
@@ -135,28 +137,54 @@ class FakeResponse:
     def text(self):
         return self._body.decode("utf-8", "replace")
 
+    def json(self):
+        import json as _j
+        return _j.loads(self._body.decode("utf-8"))
+
     def raise_for_status(self):
         if self.status_code >= 400:
             raise requests.exceptions.HTTPError(f"HTTP {self.status_code}")
 
 
-def install_transport(fail_urls=None, missing=()):
-    fail_urls = fail_urls or {}
+class FakeSession:
+    """Stands in for `curl_cffi.requests.Session`. Installed by replacing
+    `sk_scraper._session_for`, which is the seam the real code opens for it —
+    so the runner, the retry loop and the rotation logic are all still real."""
 
-    def fake_get(self, url, **kw):
-        prox = (kw.get("proxies") or {}).get("https")
+    def __init__(self, fail_urls, missing, honour_proxy=True):
+        self.fail_urls, self.missing = fail_urls, missing
+        self.honour_proxy = honour_proxy
+
+    def get(self, url, proxies=None, timeout=None, allow_redirects=True, **kw):
+        prox = (proxies or {}).get("https")
         REQUESTS.append((url, prox))
-        if url in fail_urls and fail_urls[url] > 0:
-            fail_urls[url] -= 1
+        if url.startswith(sk_scraper.IP_ECHO.split("?")[0]):
+            # A proxy that is honoured changes the exit IP; one that is silently
+            # ignored does not. That is exactly what the guard measures.
+            ip = PROXY_IP if (prox and self.honour_proxy) else HOST_IP
+            return FakeResponse(('{"ip": "%s"}' % ip).encode())
+        if url in self.fail_urls and self.fail_urls[url] > 0:
+            self.fail_urls[url] -= 1
             return FakeResponse(b"blocked", 403)
-        if url in missing:
+        if url in self.missing:
             return FakeResponse(b"nope", 404)
         body = BODIES.get(url)
         if body is None:
             return FakeResponse(b"not found", 404)
         return FakeResponse(body)
 
-    requests.Session.get = fake_get
+
+def install_transport(fail_urls=None, missing=(), honour_proxy=True):
+    fail_urls = fail_urls or {}
+
+    def _session_for(client):
+        s = getattr(client, "_sk_curl", None)
+        if s is None:
+            s = FakeSession(fail_urls, missing, honour_proxy)
+            client._sk_curl = s
+        return s
+
+    sk_scraper._session_for = _session_for
 
 
 install_transport()
@@ -259,6 +287,29 @@ except Exception:  # noqa: BLE001
     ran = False
 check("allow_direct is the only override, and it works", ran)
 
+print("\n== 3b. the proxy must demonstrably carry the traffic ==")
+fresh_db()
+job_pc = run()
+check("a working proxy passes the exit-IP check",
+      job_pc["status"] == "completed", job_pc["message"])
+check("the check is logged with the exit IP",
+      any("proxy exit IP confirmed" in m for m in LOGS), LOGS[:4])
+fresh_db()
+install_transport(honour_proxy=False)     # curl silently ignores `proxies`
+try:
+    run()
+    caught = False
+except sk_scraper.ProxyIneffective:
+    caught = True
+except Exception as e:  # noqa: BLE001
+    caught = f"wrong exception {type(e).__name__}"
+check("a proxy that does NOT change the exit IP stops the crawl",
+      caught is True, caught)
+check("and nothing was fetched from the site itself",
+      not any(u.endswith(".gz") for u, _ in REQUESTS),
+      [u for u, _ in REQUESTS if u.endswith(".gz")])
+install_transport()
+
 print("\n== 4. discovery, end to end ==")
 fresh_db()
 job = run()
@@ -295,8 +346,16 @@ check("colleges_count backfilled onto courses",
       {k: v["colleges_count"] for k, v in crs.items()})
 
 print("\n== 5. every fetch went through a sticky proxy session ==")
-sess = [p for _, p in REQUESTS]
-check("no request went out direct", all(p for p in sess), sess)
+# The exit-IP check deliberately sends ONE request with no proxy, to learn this
+# host's own IP. Every request to the site itself must still be proxied.
+site_reqs = [(u, p) for u, p in REQUESTS
+             if not u.startswith(sk_scraper.IP_ECHO.split("?")[0])]
+check("no request to shiksha.com went out direct",
+      all(p for _, p in site_reqs), [u for u, p in site_reqs if not p])
+echo_direct = [u for u, p in REQUESTS
+               if u.startswith(sk_scraper.IP_ECHO.split("?")[0]) and not p]
+check("exactly one un-proxied request, and it is the exit-IP check",
+      len(echo_direct) == 1, echo_direct)
 sitemap_sessions = {p for u, p in REQUESTS if u.endswith(".gz")}
 check("each sitemap got its own sticky exit IP "
       "(without this, one 403 burns the whole worker)",
@@ -476,6 +535,56 @@ mutate("accumulator not seeded from the db",
        lambda: setattr(sk_db, "load_college_index", lambda *a, **k: {}),
        lambda: setattr(sk_db, "load_college_index", _real_load),
        _assert_union_survives)
+
+# (f) the exit-IP check removed -> a silently-ignored proxy crawls from the
+#     host's own IP and nothing says so
+_real_assert = sk_scraper.assert_proxy_effective
+
+
+def _assert_stops_on_bypass():
+    fresh_db()
+    install_transport(honour_proxy=False)
+    try:
+        run()
+        return False
+    except sk_scraper.ProxyIneffective:
+        return True
+    finally:
+        install_transport()
+
+
+mutate("exit-IP check removed",
+       lambda: setattr(sk_scraper, "assert_proxy_effective", lambda *a, **k: None),
+       lambda: setattr(sk_scraper, "assert_proxy_effective", _real_assert),
+       _assert_stops_on_bypass)
+
+print("\n== 10. wire-byte accounting uses curl's own counter ==")
+r = FakeResponse(b"x" * 5000)
+check("download_size + header_size is preferred",
+      sk_scraper._wire(r) == 5000 + 120, sk_scraper._wire(r))
+r2 = FakeResponse(b"y" * 100)
+r2.download_size = 0                      # counter unavailable
+check("falls back to Content-Length", sk_scraper._wire(r2) == 100,
+      sk_scraper._wire(r2))
+r3 = FakeResponse(b"z" * 42)
+r3.download_size = 0
+r3.headers = {}
+check("falls back to body length", sk_scraper._wire(r3) == 42, sk_scraper._wire(r3))
+
+print("\n== 11. curl transport errors still rotate the exit IP ==")
+from curl_cffi.requests import RequestsError as _CErr  # noqa: E402
+from scraper import Client as _RealClient  # noqa: E402
+_wrapped = sk_scraper._transport_error(_CErr("tunnel died"))
+check("a curl_cffi error is translated to a requests ConnectionError",
+      isinstance(_wrapped, requests.exceptions.ConnectionError), type(_wrapped))
+check("and therefore classifies as 'proxy', which is what triggers rotation",
+      _RealClient._classify(_wrapped) == "proxy",
+      _RealClient._classify(_wrapped))
+check("an untranslated curl error would NOT rotate (this is the bug it avoids)",
+      _RealClient._classify(_CErr("tunnel died")) != "proxy")
+check("a BlockedError passes through unchanged",
+      isinstance(sk_scraper._transport_error(
+          sk_scraper.BlockedError("403")), sk_scraper.BlockedError))
 
 # ---------------------------------------------------------------------------
 print("\n" + "=" * 64)

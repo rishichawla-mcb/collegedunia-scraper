@@ -39,6 +39,7 @@ BUILD = "2026-09-24a"
 
 import gzip
 import io
+import os
 import queue as _queue
 import re
 import threading
@@ -47,10 +48,12 @@ import zlib
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
+import requests
+
 import db as _core
 import sk_db
 from scraper import (AdaptiveDelay, BlockedError, Client, ProxyManager, Stats,
-                     is_block_page, redact_proxy, wire_bytes)
+                     is_block_page)
 
 SITE = "https://www.shiksha.com"
 SITEMAP_INDEX = f"{SITE}/sitemap_index.xml"
@@ -237,25 +240,129 @@ def decompress(raw: bytes) -> str:
     return raw.decode("utf-8", "replace")
 
 
+# ---------------------------------------------------------------------------
+# The HTTP stack — curl_cffi, not requests
+# ---------------------------------------------------------------------------
+# Measured 2026-09-25 from the Render host (sk_probe.py, then sk_probe2.py):
+#
+#   url            client     route      result
+#   robots.txt     requests   direct     403
+#   robots.txt     curl_cffi  direct     200
+#   sitemap_index  requests   direct     403     (and 403 via proxy, and via IN)
+#   sitemap_index  curl_cffi  direct     200     (200 via proxy, and via IN)
+#
+# python-requests is refused by shiksha.com outright — every URL, every header
+# profile, including /robots.txt, from this host and through the proxy. The same
+# request through curl_cffi impersonating Chrome returns 200 everywhere. So it is
+# the TLS ClientHello and HTTP/2 fingerprint, not headers, not the IP, and not
+# geography (direct curl_cffi works, so India pinning is not needed).
+#
+# curl_cffi is used ONLY here. Nothing else in the codebase changes.
+try:
+    from curl_cffi import requests as _curl        # noqa: N813
+    CURL_AVAILABLE = True
+except ImportError:                                # pragma: no cover
+    _curl = None
+    CURL_AVAILABLE = False
+
+# `impersonate="chrome"` tracks the newest Chrome target the installed version
+# knows. It replaces the ClientHello, the HTTP/2 SETTINGS and the default header
+# ORDER — which is why it is not just another header profile, and why
+# `sk_headers()` is NOT passed to it: supplying our own header dict would
+# override the impersonated set and put the fingerprint back out of step with
+# itself. `sk_headers()` is kept for the probe's comparison rows only.
+IMPERSONATE = os.environ.get("CD_SK_IMPERSONATE", "chrome")
+
+# Used only by assert_proxy_effective() — two requests, once per job.
+IP_ECHO = "https://api.ipify.org?format=json"
+
+
+class CurlRequired(RuntimeError):
+    """curl_cffi is missing. Shiksha cannot be fetched without it."""
+
+
+class ProxyIneffective(RuntimeError):
+    """A proxy is configured but traffic is not going through it."""
+
+
+def _session_for(client: Client):
+    """One curl_cffi session per Client, created lazily and cached on it.
+
+    A seam on purpose: the test harness replaces this function to install a fake
+    transport, which keeps the tests driving the real runner rather than a
+    reimplementation of it."""
+    s = getattr(client, "_sk_curl", None)
+    if s is None:
+        if not CURL_AVAILABLE:
+            raise CurlRequired(
+                "curl_cffi is not installed. shiksha.com refuses python-requests "
+                "(403 on every URL, measured 2026-09-25); it is a hard "
+                "requirement for this vertical. `pip install curl_cffi`, or "
+                "redeploy — it is pinned in requirements.txt.")
+        s = _curl.Session(impersonate=IMPERSONATE)
+        client._sk_curl = s
+    return s
+
+
+def _proxies(proxy) -> Optional[Dict[str, str]]:
+    return {"http": proxy.url, "https": proxy.url} if proxy else None
+
+
+def _wire(resp) -> int:
+    """Bytes off the socket, not the decompressed body.
+
+    curl_cffi has no `raw.tell()`, but it exposes curl's own counters, which are
+    better than anything `wire_bytes()` could infer: `download_size` is the
+    compressed body as curl received it. Verified locally — 7,411,407 bytes
+    downloaded for a 46 MB decompressed response."""
+    n = getattr(resp, "download_size", None)
+    if n:
+        return int(n) + int(getattr(resp, "header_size", 0) or 0)
+    cl = resp.headers.get("Content-Length")
+    if cl:
+        try:
+            return int(cl)
+        except (TypeError, ValueError):
+            pass
+    return len(resp.content or b"")
+
+
+def _transport_error(err: Exception) -> Exception:
+    """Translate a curl_cffi transport failure into the requests exception the
+    shared retry path understands.
+
+    `Client._classify()` decides whether to rotate the exit IP by checking for
+    `requests.exceptions.ConnectionError` / `Timeout`. curl_cffi raises its own
+    classes with the same NAMES but a different ancestry, so without this every
+    dead tunnel would classify as 'other' and `_rotate()` would not fire — the
+    exact failure mode that cost Phase 3 a week in September."""
+    if isinstance(err, BlockedError):
+        return err
+    mod = type(err).__module__.split(".")[0]
+    if mod == "curl_cffi":
+        return requests.exceptions.ConnectionError(
+            f"{type(err).__name__}: {str(err)[:160]}")
+    return err
+
+
 def fetch_bytes(client: Client, url: str, label: str) -> bytes:
-    """GET raw bytes through the proxy with the client's own retry / rotation /
+    """GET raw bytes through curl_cffi, with the client's own retry / rotation /
     block handling.
 
-    `Client.get_text` cannot serve here: it returns `resp.text`, which decodes a
-    gzip FILE body as mojibake, and it runs `is_block_page` over that garbage.
-    Everything else — sticky session, wire-byte accounting, adaptive throttle,
-    Retry-After, the shared `_on_failure` path — is reused rather than reworded,
-    so this cannot drift away from the four fetchers in `scraper`.
+    `Client.get_text` cannot serve here twice over: it uses the requests session
+    shiksha.com refuses, and it returns `resp.text`, which decodes a gzip FILE
+    body as mojibake and then runs `is_block_page` over the garbage. Everything
+    else — sticky session, wire-byte accounting, adaptive throttle, Retry-After,
+    the shared `_on_failure` path — is reused rather than reworded.
     """
+    sess = _session_for(client)
     last_err: Optional[Exception] = None
     for attempt in range(1, client.max_retries + 1):
         proxy = client.pm.get(client.session_id)
         try:
-            resp = client.session.get(
-                url, headers=sk_headers(),
-                proxies=proxy.as_dict() if proxy else None,
-                timeout=client.timeout, stream=True)
-            client.stats.add(requests=1, byts=wire_bytes(resp))
+            resp = sess.get(url, proxies=_proxies(proxy),
+                            timeout=client.timeout, allow_redirects=True)
+            client.stats.add(requests=1, byts=_wire(resp))
             client._check_blocked(resp)
             resp.raise_for_status()
             raw = resp.content or b""
@@ -270,13 +377,58 @@ def fetch_bytes(client: Client, url: str, label: str) -> bytes:
             if client.verbose:
                 client.log(f"   · GET …{url[-46:]} → {len(raw)//1024} KB")
             return raw
-        except Exception as err:  # noqa: BLE001
-            if not isinstance(err, (BlockedError, IOError, OSError, ValueError)) \
-                    and type(err).__module__.split(".")[0] != "requests":
-                raise
+        # curl_cffi's RequestsError subclasses OSError, and requests'
+        # RequestException subclasses IOError, so one clause covers both stacks.
+        except (BlockedError, OSError, ValueError) as err:
             last_err = err
-            client._on_failure(err, proxy, attempt, label)
+            client._on_failure(_transport_error(err), proxy, attempt, label)
     raise RuntimeError(f"{label} failed after {client.max_retries} attempts: {last_err}")
+
+
+def exit_ip(client: Client, proxy) -> Optional[str]:
+    """The public IP this request leaves from, or None if it can't be read."""
+    try:
+        r = _session_for(client).get(IP_ECHO, proxies=_proxies(proxy),
+                                     timeout=20, allow_redirects=True)
+        client.stats.add(requests=1, byts=_wire(r))
+        if r.status_code != 200:
+            return None
+        return str((r.json() or {}).get("ip") or "") or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def assert_proxy_effective(client: Client, pm: ProxyManager, log) -> None:
+    """Prove the proxy is actually carrying the traffic. Two requests.
+
+    This is not belt-and-braces. curl_cffi is a DIFFERENT HTTP stack from the one
+    every other vertical uses, and a proxy argument it does not honour would fail
+    silently — the crawl would run happily from the Render host's own IP while
+    the logs said 'gateway'. Given the owner's standing instruction ("use proxy
+    always") and that Shiksha has never been crawled from here, a silent bypass
+    is the worst available outcome: it burns the one IP we cannot rotate.
+
+    So it is measured, not trusted. If the echo service cannot be reached the run
+    continues with a warning — a third-party outage should not block a crawl —
+    but a proxy that demonstrably is not changing the exit IP stops it.
+    """
+    if pm.mode == "none":
+        return
+    proxy = pm.get(client.session_id or "skcheck")
+    if proxy is None:
+        return
+    via = exit_ip(client, proxy)
+    own = exit_ip(client, None)
+    if via and own and via == own:
+        raise ProxyIneffective(
+            f"the proxy is not carrying the traffic: requests through the "
+            f"gateway and requests sent direct both leave from {via}. Refusing "
+            f"to crawl Shiksha from this host's own IP.")
+    if not via:
+        log("  ⚠ could not confirm the proxy exit IP (echo unreachable) — "
+            "continuing, but the proxy is unverified for this run")
+    else:
+        log(f"  proxy exit IP confirmed ({via}), distinct from this host's own")
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +593,8 @@ def run_discovery(job_id: int, cfg: Dict[str, Any],
 
     boot = _client(pm, merged, log, stats, adaptive)
     boot.session_id = f"skboot{int(time.time())}"
+    if not merged.get("skip_proxy_check"):
+        assert_proxy_effective(boot, pm, log)
     sitemaps = list_sitemaps(boot, groups, log)
     log(f"  {len(sitemaps)} in scope: " + ", ".join(
         f"{k}×{sum(1 for _, kk, _ in sitemaps if kk == k)}"
