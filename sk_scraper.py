@@ -387,9 +387,17 @@ def fetch_bytes(client: Client, url: str, label: str) -> bytes:
 
 def exit_ip(client: Client, proxy) -> Optional[str]:
     """The public IP this request leaves from, or None if it can't be read."""
+    # Deliberately OUTSIDE the try. A missing HTTP client is not "the echo
+    # service is unreachable", and reporting it as one is worse than useless:
+    # on 2026-09-25 a deploy that had not picked up curl_cffi printed
+    # "⚠ could not confirm the proxy exit IP (echo unreachable) — continuing"
+    # and only failed, with the real reason, several frames later. A broad
+    # `except` that swallows a setup error turns a clear failure into a
+    # misleading one.
+    sess = _session_for(client)
     try:
-        r = _session_for(client).get(IP_ECHO, proxies=_proxies(proxy),
-                                     timeout=20, allow_redirects=True)
+        r = sess.get(IP_ECHO, proxies=_proxies(proxy),
+                     timeout=20, allow_redirects=True)
         client.stats.add(requests=1, byts=_wire(r))
         if r.status_code != 200:
             return None

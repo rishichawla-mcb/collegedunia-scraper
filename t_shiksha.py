@@ -310,6 +310,31 @@ check("and nothing was fetched from the site itself",
       [u for u, _ in REQUESTS if u.endswith(".gz")])
 install_transport()
 
+print("\n== 3c. a missing curl_cffi fails clearly, not as 'echo unreachable' ==")
+fresh_db()
+_saved_session_for = sk_scraper._session_for
+
+
+def _no_curl(client):
+    raise sk_scraper.CurlRequired("curl_cffi is not installed.")
+
+
+sk_scraper._session_for = _no_curl
+try:
+    run()
+    outcome = "ran anyway"
+except sk_scraper.CurlRequired:
+    outcome = "CurlRequired"
+except Exception as e:  # noqa: BLE001
+    outcome = f"{type(e).__name__}"
+sk_scraper._session_for = _saved_session_for
+check("a missing client raises CurlRequired from the guard itself",
+      outcome == "CurlRequired", outcome)
+check("and is NOT reported as the echo being unreachable",
+      not any("echo unreachable" in m for m in LOGS),
+      [m for m in LOGS if "echo" in m])
+install_transport()
+
 print("\n== 4. discovery, end to end ==")
 fresh_db()
 job = run()

@@ -7,6 +7,12 @@ pandas==2.2.2
 numpy==1.26.4
 pyarrow==16.1.0
 requests==2.32.3
+# Shiksha only. shiksha.com refuses python-requests outright — 403 on every URL
+# including /robots.txt, from the Render host AND through the proxy, with any
+# header set (measured 2026-09-25, sk_probe.py + sk_probe2.py). The same request
+# through curl_cffi impersonating Chrome returns 200 everywhere. It is the TLS /
+# HTTP2 fingerprint, not headers, IP or geography. Nothing else uses this.
+curl_cffi==0.16.3
 openpyxl==3.1.5
 beautifulsoup4==4.12.3
 # Cookie component for "keep me signed in". Pinned to 0.1.71: it is the last
