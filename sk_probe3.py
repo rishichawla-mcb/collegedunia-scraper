@@ -39,7 +39,7 @@ from typing import Dict, List, Optional
 
 import db as _core
 import sk_db
-from scraper import sticky_gateway, DEFAULT_SESSION_TEMPLATE, redact_proxy
+from scraper import sticky_gateway, DEFAULT_SESSION_TEMPLATE
 from sk_scraper import IMPERSONATE, SITE, _wire
 
 try:
@@ -67,6 +67,49 @@ def _sess():
         print("curl_cffi is not installed — `pip install curl_cffi`.")
         sys.exit(1)
     return _curl.Session(impersonate=IMPERSONATE)
+
+
+def _routes() -> List:
+    """[(label, proxy_url_or_None)] — direct, the gateway, the gateway pinned to
+    India. Each sticky session id is fresh so one burned exit IP is not reused."""
+    import random
+    from sk_probe2 import _india_gateway
+    out = [("direct", None)]
+    gw = _core.proxy_gateway()
+    if gw and _core.get_setting("proxy_mode", "none") != "none":
+        tmpl = (_core.get_setting("proxy_session_template", "")
+                or DEFAULT_SESSION_TEMPLATE)
+        sid = f"p3{random.randint(0, 10**6)}"
+        out.append(("proxy", sticky_gateway(gw, sid, tmpl)))
+        ingw = _india_gateway(gw)
+        if ingw:
+            out.append(("proxy IN", sticky_gateway(ingw, sid + "i", tmpl)))
+    return out
+
+
+def try_cell(url: str, proxy: Optional[str], warm: bool, label: str):
+    """One (route × warm) cell on a FRESH session.
+
+    `warm` first requests the site root, so the session carries whatever cookies
+    a real first visit would set before the college page is asked for. A dynamic
+    page behind bot protection often refuses a cold, cookie-less request while
+    serving the same URL happily to a session that has been to the front door —
+    which a static sitemap, served from a CDN, never cares about. That asymmetry
+    is exactly what this matrix is testing, since the sitemaps pass and the
+    college page does not.
+    """
+    sess = _sess()
+    px = {"http": proxy, "https": proxy} if proxy else None
+    try:
+        if warm:
+            sess.get(SITE + "/", proxies=px, timeout=45, allow_redirects=True)
+        r = sess.get(url, proxies=px, timeout=45, allow_redirects=True)
+        print(f"   {label:<26} {r.status_code}  wire {_wire(r)/1024:>8,.1f} KB  "
+              f"body {len(r.content or b'')/1024:>9,.1f} KB")
+        return r, sess
+    except Exception as err:  # noqa: BLE001
+        print(f"   {label:<26} ERR {type(err).__name__}: {str(err)[:54]}")
+        return None, None
 
 
 def _get(sess, url: str, proxy: Optional[str], label: str):
@@ -100,9 +143,6 @@ def pick_college() -> Dict[str, str]:
 
 def main() -> None:
     print(f"Shiksha probe #3 — detail cost [BUILD {BUILD}]")
-    proxy = _proxy()
-    print(f"proxy: {redact_proxy(proxy) if proxy else 'direct'}\n")
-    sess = _sess()
 
     col = pick_college()
     if not col:
@@ -110,11 +150,38 @@ def main() -> None:
         return
     cid, slug = col["college_id"], col["slug"]
     url = col.get("url") or f"{SITE}/college/{slug}-{cid}"
-    print(f"1. College home page  (id {cid}, {slug})")
-    r = _get(sess, url, proxy, "home page")
-    if r is None or r.status_code != 200:
-        print("\n   Could not fetch the page; nothing further to measure.")
+
+    # ------------------------------------------------------------------ 1
+    # The sitemaps come through fine and the college page does not, so the
+    # route and the session state are the two things worth varying before
+    # concluding anything about college pages in general.
+    print(f"1. Reaching a college page  (id {cid}, {slug})")
+    print("   control: robots.txt, which is known to work")
+    routes = _routes()
+    try_cell(f"{SITE}/robots.txt", routes[-1][1], False, "robots.txt (proxy)")
+    print("   college page, route x warm:")
+    good = None
+    for rlabel, proxy in routes:
+        for warm in (False, True):
+            r, s = try_cell(url, proxy, warm,
+                            f"{rlabel}, {'warmed' if warm else 'cold'}")
+            if good is None and r is not None and r.status_code == 200 \
+                    and len(r.content or b"") > 20000:
+                good = (rlabel, proxy, warm, r, s)
+    if good is None:
+        print("\n   Every combination was refused. College pages are guarded")
+        print("   harder than the sitemaps, and no route or session state here")
+        print("   changes that. The remaining levers, in order of cost:")
+        print("     a) the apigateway endpoints — but they are read OFF a page,")
+        print("        so a page has to load at least once (try from the owner's")
+        print("        own browser and capture the URLs there);")
+        print("     b) a tab page (…/courses, …/fees) instead of the home page —")
+        print("        different route, possibly different rule;")
+        print("     c) a headless browser, which is a different order of cost")
+        print("        per college and probably rules out 57,751 of them.")
         return
+    rlabel, proxy, warm, r, sess = good
+    print(f"\n   -> using: {rlabel}, {'warmed' if warm else 'cold'}")
     html = r.text
 
     print("\n2. __PRELOADED_STATE__")
