@@ -39,6 +39,7 @@ BUILD = "2026-09-24a"
 
 import gzip
 import io
+import json
 import os
 import queue as _queue
 import re
@@ -52,8 +53,9 @@ import requests
 
 import db as _core
 import sk_db
-from scraper import (AdaptiveDelay, BlockedError, Client, ProxyManager, Stats,
-                     is_block_page)
+import sk_parse
+from scraper import (AdaptiveDelay, BlockedError, Client, PageGoneError,
+                     ProxyManager, Stats, is_block_page)
 
 SITE = "https://www.shiksha.com"
 SITEMAP_INDEX = f"{SITE}/sitemap_index.xml"
@@ -345,7 +347,8 @@ def _transport_error(err: Exception) -> Exception:
     return err
 
 
-def fetch_bytes(client: Client, url: str, label: str) -> bytes:
+def fetch_bytes(client: Client, url: str, label: str,
+                route: Optional["Route"] = None) -> bytes:
     """GET raw bytes through curl_cffi, with the client's own retry / rotation /
     block handling.
 
@@ -358,7 +361,8 @@ def fetch_bytes(client: Client, url: str, label: str) -> bytes:
     sess = _session_for(client)
     last_err: Optional[Exception] = None
     for attempt in range(1, client.max_retries + 1):
-        proxy = client.pm.get(client.session_id)
+        proxy = (route.proxy_for(client.session_id) if route is not None
+                 else client.pm.get(client.session_id))
         try:
             resp = sess.get(url, proxies=_proxies(proxy),
                             timeout=client.timeout, allow_redirects=True)
@@ -381,8 +385,64 @@ def fetch_bytes(client: Client, url: str, label: str) -> bytes:
         # RequestException subclasses IOError, so one clause covers both stacks.
         except (BlockedError, OSError, ValueError) as err:
             last_err = err
+            # A site refusal is the signal the route cares about; a dead tunnel
+            # or a timeout is not, and must not trip the switch.
+            if route is not None and isinstance(err, BlockedError):
+                route.on_refusal(label)
             client._on_failure(_transport_error(err), proxy, attempt, label)
     raise RuntimeError(f"{label} failed after {client.max_retries} attempts: {last_err}")
+
+
+class Route:
+    """Direct by default; the first refusal moves everything onto the proxy.
+
+    Owner's decision, 2026-09-25, taken against the probe: Shiksha serves this
+    host's own IP at the same size and speed as the gateway, so paying 9.4 GB of
+    a 5 GB plan buys nothing today. The fallback keeps the mitigation available
+    for the moment that stops being true.
+
+    The switch is ONE-WAY and shared by every worker. Flipping back on the next
+    success would oscillate — a site that has started refusing an IP does not
+    stop because one request got through — and each oscillation spends another
+    request from the IP we are trying to protect.
+
+    'Refusal' means a site refusal (403/429/503/challenge), not any failure. A
+    dead proxy tunnel or a timeout says nothing about whether the site minds us,
+    and treating those as refusals would switch on the first flaky connection.
+    """
+
+    def __init__(self, pm: ProxyManager, log, start_direct: bool = True) -> None:
+        self.pm = pm
+        self.log = log
+        self.lock = threading.Lock()
+        self.direct = bool(start_direct) and pm.mode != "none"
+        self.switched_at: Optional[float] = None
+        self.refusals = 0
+        if pm.mode == "none":
+            self.direct = True          # nothing to fall back to
+
+    def proxy_for(self, session_id: Optional[str]):
+        if self.direct:
+            return None
+        return self.pm.get(session_id)
+
+    def on_refusal(self, label: str) -> bool:
+        """Returns True if this refusal caused the switch."""
+        with self.lock:
+            self.refusals += 1
+            if not self.direct or self.pm.mode == "none":
+                return False
+            self.direct = False
+            self.switched_at = time.time()
+        self.log(f"  ⇄ site refused a direct request ({label}) — every request "
+                 f"from here on goes through the proxy. This is one-way for the "
+                 f"rest of the job.")
+        return True
+
+    def describe(self) -> str:
+        if self.pm.mode == "none":
+            return "direct (no proxy configured)"
+        return "direct, proxy on refusal" if self.direct else "proxy (switched)"
 
 
 def exit_ip(client: Client, proxy) -> Optional[str]:
@@ -777,6 +837,249 @@ def run_discovery(job_id: int, cfg: Dict[str, Any],
            f"{c['offerings']:,} offerings · "
            f"phase B forecast: {fc['colleges_left']:,} colleges ≈ "
            f"{fc['est_gb_left']} GB at {fc['kb_per_college']:.0f} KB each")
+    sk_db.update_job(job_id, status="stopped" if halt["reason"] else "completed",
+                     message=msg, finished_at=time.time())
+    log(msg)
+
+
+# ---------------------------------------------------------------------------
+# Phase Ⓑ — college detail
+# ---------------------------------------------------------------------------
+# One request per college. The whole dataset is already in the page
+# (`__PRELOADED_STATE__`, 616 KB of the 1,076 KB body), so there is no cheaper
+# endpoint to find: the only apis.shiksha.com URL in the static HTML is an error
+# logger. ~35 KB of that state is worth keeping; ~2.3 KB survives parsing.
+#
+# What is NOT fetched, and why: the /courses tab would give per-course fees
+# rather than the base-course RANGE, at the cost of a second request per college.
+# That is deferred until someone has looked at the ranges and found them too
+# coarse, rather than doubling the crawl on the assumption that they are.
+PRELOAD_MARKER = "window.__PRELOADED_STATE__"
+
+
+def extract_state(html: str) -> Optional[str]:
+    """The JSON object assigned to __PRELOADED_STATE__, by brace matching.
+
+    A regex cannot do this and a non-greedy one is actively wrong: the object
+    holds braces inside string literals, and the assignment is followed by more
+    JavaScript. The first attempt at this (sk_probe3) failed with "Extra data:
+    line 1 column 608718". This walks from the opening brace counting depth,
+    skipping string literals and their escapes."""
+    i = html.find(PRELOAD_MARKER)
+    if i < 0:
+        return None
+    j = html.find("{", i)
+    if j < 0:
+        return None
+    depth, in_str, esc, quote = 0, False, False, ""
+    for k in range(j, len(html)):
+        c = html[k]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == quote:
+                in_str = False
+            continue
+        if c in "\"'":
+            in_str, quote = True, c
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return html[j:k + 1]
+    return None
+
+
+class NoStateError(Exception):
+    """The page loaded but carries no __PRELOADED_STATE__ — a redirect, an
+    interstitial, or a college that no longer exists. Final, not retried."""
+
+
+class ParseEmptyError(Exception):
+    """The state parsed, but yielded no college. Distinct from NoStateError on
+    purpose: that is the site saying there is nothing here, this is US failing to
+    read what the site sent. It is recorded as an 'error', so the college stays
+    in the queue and a parser fix picks it up — marking it 'done' would bury the
+    bug under a full table of blank rows."""
+
+
+def fetch_college_state(client: Client, url: str, college_id: Any,
+                        route: Optional[Route] = None) -> Dict[str, Any]:
+    raw = fetch_bytes(client, url, f"college {college_id}", route=route)
+    blob = extract_state(raw.decode("utf-8", "replace"))
+    if not blob:
+        raise NoStateError(f"college {college_id}: no __PRELOADED_STATE__")
+    try:
+        state = json.loads(blob)
+    except Exception as err:  # noqa: BLE001
+        raise NoStateError(f"college {college_id}: state did not parse "
+                           f"({str(err)[:80]})") from err
+    if not isinstance(state, dict):
+        raise NoStateError(f"college {college_id}: state is not an object")
+    return state
+
+
+def run_detail(job_id: int, cfg: Dict[str, Any],
+               log: Optional[Callable[[str], None]] = None) -> None:
+    log = log or (lambda m: print(m, flush=True))
+    merged = {**_proxy_cfg(), **cfg}
+    pm = ProxyManager.from_config(merged)
+    stats = Stats()
+    adaptive = AdaptiveDelay(float(merged.get("delay", 1.0)),
+                             enabled=bool(merged.get("adaptive", True)))
+    concurrency = max(1, int(merged.get("concurrency", 4)))
+    delay = float(merged.get("delay", 1.0))
+    budget_requests = int(merged.get("budget_requests", 0))
+    budget_bytes = int(float(merged.get("budget_mb", 0)) * 1024 * 1024)
+    max_colleges = int(merged.get("max_colleges", 0))
+    order = str(merged.get("order", "id"))
+
+    route = Route(pm, log, start_direct=bool(merged.get("start_direct", True)))
+    sk_db.update_job(job_id, status="running", message="building the queue…")
+    log(f"Shiksha · Phase Ⓑ detail [BUILD {BUILD}] concurrency={concurrency} "
+        f"route={route.describe()}")
+    if pm.mode == "none":
+        log("  ⚠ no proxy is configured, so there is nothing to fall back to "
+            "if Shiksha starts refusing this host.")
+
+    pending = sk_db.colleges_pending(limit=max_colleges, order=order)
+    total = len(pending)
+    sk_db.update_job(job_id, total_units=total,
+                     message=f"{total:,} colleges to fetch")
+    log(f"  {total:,} colleges pending · ≈{total*171/1024/1024:,.2f} GB at the "
+        f"measured 171 KB each")
+    if not total:
+        sk_db.update_job(job_id, status="completed", finished_at=time.time(),
+                         message="nothing pending — every college already done")
+        log("  nothing pending")
+        return
+
+    q: "_queue.Queue" = _queue.Queue()
+    for c in pending:
+        q.put(c)
+
+    stop = threading.Event()
+    lock = threading.Lock()
+    state_counts = {"done": 0, "colleges": 0, "courses": 0, "gone": 0, "error": 0}
+    halt = {"reason": None}
+
+    def budget_hit() -> Optional[str]:
+        reqs, byts, _ = stats.snapshot()
+        if budget_requests and reqs >= budget_requests:
+            return f"request budget reached ({reqs:,})"
+        if budget_bytes and byts >= budget_bytes:
+            return f"bandwidth budget reached ({byts/1048576:,.0f} MB)"
+        return None
+
+    def push():
+        reqs, byts, _ = stats.snapshot()
+        with lock:
+            s = dict(state_counts)
+        sk_db.update_job(job_id, done_units=s["done"], items_written=s["courses"],
+                         req_count=reqs, bytes_count=byts,
+                         message=f"{s['done']:,}/{total:,} colleges · "
+                                 f"{s['courses']:,} course rows · "
+                                 f"{byts/1048576:,.0f} MB · {route.describe()}")
+
+    def worker(idx: int):
+        client = _client(pm, merged, log, stats, adaptive)
+        while not stop.is_set():
+            try:
+                col = q.get_nowait()
+            except _queue.Empty:
+                return
+            if sk_db.stop_requested(job_id):
+                halt["reason"] = "stopped by user"
+                stop.set()
+                return
+            bh = budget_hit()
+            if bh:
+                log(f"  ⏸ {bh}")
+                halt["reason"] = bh
+                stop.set()
+                return
+            cid = col["college_id"]
+            # One sticky exit IP per college, as every other phase does. It is a
+            # no-op while the route is direct, and correct the moment it is not.
+            client.session_id = f"skd{idx}_{cid}"
+            url = col.get("url") or f"{SITE}/college/{col.get('slug')}-{cid}"
+            try:
+                state = fetch_college_state(client, url, cid, route=route)
+                parsed = sk_parse.parse_all(state, cid, job_id)
+                now = time.time()
+                crow = parsed["college"]
+                bcs_probe = parsed["base_courses"]
+                # A parse that finds NOTHING must not be recorded as success.
+                # Without this the college_id falls through from the caller, the
+                # row is stamped `detail_scraped_at`, the college is marked
+                # 'done' and leaves the queue — 57,751 empty rows, no error
+                # anywhere. Caught by mutation-testing the node lookup on
+                # 2026-09-25: the mutant wrote blanks and every test still
+                # passed.
+                if crow is None or (not crow.get("name") and not bcs_probe):
+                    raise ParseEmptyError(
+                        f"college {cid}: page parsed to nothing — no name and no "
+                        f"courses. Not marking it done.")
+                crow["detail_scraped_at"] = now
+                crow["scraped_at"] = now
+                sk_db.upsert_college_detail([crow])
+                bcs = parsed["base_courses"]
+                for b in bcs:
+                    b["scraped_at"] = now
+                cat = parsed["catalogue"]
+                for c_ in cat:
+                    c_["scraped_at"] = now
+                if cat:
+                    sk_db.upsert_base_courses(cat)
+                if bcs:
+                    sk_db.upsert_college_base_courses(bcs)
+                sk_db.set_college_progress(cid, "done", found=len(bcs))
+                with lock:
+                    state_counts["colleges"] += 1
+                    state_counts["courses"] += len(bcs)
+            except NoStateError as err:
+                # An answer, not a refusal: do not retry it every run.
+                sk_db.set_college_progress(cid, "gone", message=str(err)[:300])
+                with lock:
+                    state_counts["gone"] += 1
+                log(f"  · college {cid}: {err}")
+            except PageGoneError as err:
+                sk_db.set_college_progress(cid, "gone", message=str(err)[:300])
+                with lock:
+                    state_counts["gone"] += 1
+            except Exception as err:  # noqa: BLE001
+                sk_db.set_college_progress(cid, "error", message=str(err)[:300])
+                with lock:
+                    state_counts["error"] += 1
+                log(f"  ! college {cid} failed: {str(err)[:160]}")
+            with lock:
+                state_counts["done"] += 1
+            if state_counts["done"] % 25 == 0:
+                push()
+            if delay:
+                time.sleep(adaptive.value() if adaptive else delay)
+
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True)
+               for i in range(concurrency)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    sk_db.recount_base_course_colleges()
+    push()
+    c = sk_db.counts()
+    reqs, byts, _ = stats.snapshot()
+    msg = (f"{halt['reason'] + ' — ' if halt['reason'] else ''}"
+           f"detail: {state_counts['colleges']:,} colleges parsed, "
+           f"{state_counts['courses']:,} course rows, "
+           f"{c['base_courses']:,} base courses in the catalogue · "
+           f"{state_counts['gone']:,} gone, {state_counts['error']:,} errors · "
+           f"{byts/1048576:,.0f} MB via {route.describe()}"
+           + (f" after {route.refusals} refusal(s)" if route.refusals else ""))
     sk_db.update_job(job_id, status="stopped" if halt["reason"] else "completed",
                      message=msg, finished_at=time.time())
     log(msg)

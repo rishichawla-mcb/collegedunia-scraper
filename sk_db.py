@@ -203,7 +203,71 @@ CREATE TABLE IF NOT EXISTS sk_logs (
 CREATE INDEX IF NOT EXISTS sk_idx_logs_job ON sk_logs(job_id, id);
 
 CREATE TABLE IF NOT EXISTS sk_settings (key TEXT PRIMARY KEY, value TEXT);
+
+-- Shiksha's SHARED course catalogue. `baseCourseTuples[].id` ("B.Des" = 9) is a
+-- site-wide id that never appears in a URL, which is why sitemap discovery could
+-- not see it and `sk_courses` ended up a page index instead of a catalogue.
+-- A few hundred rows, and the join key the Collegedunia comparison needs.
+CREATE TABLE IF NOT EXISTS sk_base_courses (
+    base_course_id INTEGER PRIMARY KEY,
+    name           TEXT,
+    level          TEXT,
+    colleges_count INTEGER DEFAULT 0,
+    scraped_at     REAL, source_job_id INTEGER
+);
+
+-- The fees table: one row per college x base course.
+-- NOTE the grain. A tuple is grouped by BASE course, so its fee range can span
+-- several actual courses; `course_count` says how many, so a consumer can tell a
+-- single-course range from an eight-course one rather than assuming precision
+-- that is not there.
+CREATE TABLE IF NOT EXISTS sk_college_base_courses (
+    college_id      INTEGER,
+    base_course_id  INTEGER,
+    name            TEXT,
+    course_page_id  INTEGER,       -- the per-college id used in /course-…-<id>
+    level           TEXT,
+    min_fees        INTEGER,
+    max_fees        INTEGER,
+    duration        TEXT,
+    total_seats     INTEGER,
+    course_count    INTEGER,
+    rating          REAL,
+    rating_count    INTEGER,
+    money_rating    REAL,
+    placement_rating REAL,
+    min_salary      INTEGER,
+    max_salary      INTEGER,
+    eligibility_xii INTEGER,
+    eligibility_grad INTEGER,
+    scholarships_count INTEGER,
+    exams           TEXT,
+    ranking         TEXT,
+    url             TEXT,
+    scraped_at      REAL, source_job_id INTEGER,
+    PRIMARY KEY (college_id, base_course_id)
+);
+CREATE INDEX IF NOT EXISTS sk_idx_cbc_base ON sk_college_base_courses(base_course_id);
+CREATE INDEX IF NOT EXISTS sk_idx_cbc_fees ON sk_college_base_courses(min_fees);
 """
+
+# Columns phase Ⓑ adds to sk_colleges. `CREATE TABLE IF NOT EXISTS` does nothing
+# to a table that already exists, so a database built by discovery needs these
+# added explicitly — without this the detail writer would fail on every row of a
+# live database while passing every test against a fresh one.
+DETAIL_COLUMNS = [
+    ("ownership", "TEXT"), ("tier", "TEXT"), ("city_id", "INTEGER"),
+    ("state_id", "INTEGER"), ("locality", "TEXT"), ("country_id", "INTEGER"),
+    ("questions_count", "INTEGER"), ("photo_count", "INTEGER"),
+    ("video_count", "INTEGER"), ("base_course_count", "INTEGER"),
+    ("flagship_course_id", "INTEGER"), ("parent_university", "TEXT"),
+    ("affiliations", "TEXT"), ("facilities", "TEXT"), ("recruiters", "TEXT"),
+    ("highlights", "TEXT"), ("streams", "TEXT"), ("accepted_exams", "TEXT"),
+    ("rankings", "TEXT"), ("admission_text", "TEXT"),
+    ("admission_updated", "TEXT"), ("description", "TEXT"),
+    ("meta_title", "TEXT"), ("meta_description", "TEXT"),
+    ("canonical_url", "TEXT"), ("tab_urls", "TEXT"),
+]
 
 
 def init_db(db_path: str = SK_DB_PATH) -> None:
@@ -218,6 +282,10 @@ def init_db(db_path: str = SK_DB_PATH) -> None:
         # "no such table: data_changes" while the colleges themselves parsed
         # fine.)
         conn.executescript(_fr.CHANGE_LOG_DDL)
+        have = {r[1] for r in conn.execute("PRAGMA table_info(sk_colleges)")}
+        for col, typ in DETAIL_COLUMNS:
+            if col not in have:
+                conn.execute(f"ALTER TABLE sk_colleges ADD COLUMN {col} {typ}")
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +385,69 @@ def upsert_offerings(rows, db_path: str = SK_DB_PATH) -> int:
     with connect(db_path) as conn:
         return _upsert(conn, "sk_offerings", OFFERING_COLS,
                        ["college_id", "course_id"], rows)
+
+
+# --------------------------------------------------------------------------- Ⓑ
+COLLEGE_DETAIL_COLS = [
+    "college_id", "name", "short_name", "college_type", "ownership", "tier",
+    "city", "state", "city_id", "state_id", "locality", "country_id", "address",
+    "website", "phone", "email", "logo", "rating", "reviews_count",
+    "questions_count", "photo_count", "video_count", "base_course_count",
+    "flagship_course_id", "parent_university", "affiliations", "facilities",
+    "recruiters", "highlights", "streams", "accepted_exams", "rankings",
+    "admission_text", "admission_updated", "description", "meta_title",
+    "meta_description", "canonical_url", "tab_urls", "detail_scraped_at",
+    "scraped_at", "source_job_id",
+]
+
+BASE_COURSE_COLS = ["base_course_id", "name", "level", "scraped_at",
+                    "source_job_id"]
+
+COLLEGE_BASE_COURSE_COLS = [
+    "college_id", "base_course_id", "name", "course_page_id", "level",
+    "min_fees", "max_fees", "duration", "total_seats", "course_count", "rating",
+    "rating_count", "money_rating", "placement_rating", "min_salary",
+    "max_salary", "eligibility_xii", "eligibility_grad", "scholarships_count",
+    "exams", "ranking", "url", "scraped_at", "source_job_id",
+]
+
+
+def upsert_college_detail(rows, db_path: str = SK_DB_PATH) -> int:
+    """Phase Ⓑ attributes onto the rows discovery created.
+
+    Non-destructive as everywhere else, which matters more here than usual:
+    discovery owns `slug`, `url`, `tabs`, `alias_count` and `lastmod`, and detail
+    must not blank any of them."""
+    rows = [r for r in rows if r.get("college_id") is not None]
+    with connect(db_path) as conn:
+        return _upsert(conn, "sk_colleges", COLLEGE_DETAIL_COLS,
+                       ["college_id"], rows)
+
+
+def upsert_base_courses(rows, db_path: str = SK_DB_PATH) -> int:
+    rows = [r for r in rows if r.get("base_course_id") is not None]
+    with connect(db_path) as conn:
+        return _upsert(conn, "sk_base_courses", BASE_COURSE_COLS,
+                       ["base_course_id"], rows)
+
+
+def upsert_college_base_courses(rows, db_path: str = SK_DB_PATH) -> int:
+    rows = [r for r in rows if r.get("college_id") is not None
+            and r.get("base_course_id") is not None]
+    with connect(db_path) as conn:
+        return _upsert(conn, "sk_college_base_courses", COLLEGE_BASE_COURSE_COLS,
+                       ["college_id", "base_course_id"], rows)
+
+
+def recount_base_course_colleges(db_path: str = SK_DB_PATH) -> int:
+    """Fill sk_base_courses.colleges_count from the discovered edges — the
+    catalogue's own 'how many colleges offer this', computed, never guessed."""
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE sk_base_courses SET colleges_count = COALESCE(("
+            "  SELECT COUNT(*) FROM sk_college_base_courses c "
+            "  WHERE c.base_course_id = sk_base_courses.base_course_id), 0)")
+        return cur.rowcount or 0
 
 
 def recount_course_colleges(db_path: str = SK_DB_PATH) -> int:
@@ -429,6 +560,8 @@ def counts(db_path: str = SK_DB_PATH) -> Dict[str, int]:
             "offerings": one("SELECT COUNT(*) FROM sk_offerings"),
             "colleges_with_detail": one("SELECT COUNT(*) FROM sk_colleges "
                                         "WHERE detail_scraped_at IS NOT NULL"),
+            "base_courses": one("SELECT COUNT(*) FROM sk_base_courses"),
+            "college_base_courses": one("SELECT COUNT(*) FROM sk_college_base_courses"),
             "colleges_done": one("SELECT COUNT(*) FROM sk_college_progress "
                                  "WHERE status IN ('done','gone')"),
             "sitemaps_done": one("SELECT COUNT(*) FROM sk_sitemap_progress "

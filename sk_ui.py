@@ -288,29 +288,64 @@ def render() -> None:
 
     # ----------------------------------------------------------------- Ⓑ
     with tab_b:
-        st.subheader("Ⓑ College detail — not built yet")
+        st.subheader("Ⓑ College detail — attributes and fees")
+        st.caption(
+            "One request per college home page. The whole dataset is already in "
+            "the page (`__PRELOADED_STATE__`, 616 KB of the 1,076 KB body), so "
+            "there is no cheaper endpoint — the only `apis.shiksha.com` URL in "
+            "the HTML is an error logger. About **2.3 KB per college** survives "
+            "parsing, which is what makes 57,751 colleges fit on this disk.")
+
+        f = st.columns(4)
+        f[0].metric("Colleges pending", f"{fc['colleges_left']:,}")
+        f[1].metric("With detail", f"{c['colleges_with_detail']:,}")
+        f[2].metric("Base courses", f"{c['base_courses']:,}")
+        f[3].metric("Course rows", f"{c['college_base_courses']:,}")
+
         if not c["colleges"]:
             st.info("Run discovery first — phase Ⓑ reads its queue from it.")
         else:
-            f = st.columns(4)
-            f[0].metric("Colleges pending", f"{fc['colleges_left']:,}")
-            f[1].metric("Wire cost each", f"{KB_PER_COLLEGE:.0f} KB")
-            f[2].metric("Total to fetch", f"{fc['est_gb_left']:,.1f} GB")
-            f[3].metric("Already done", f"{c['colleges_done']:,}")
-        st.warning(
-            f"**This is the blocking constraint, not an oversight.** A Shiksha "
-            f"college home page measured **{KB_PER_COLLEGE:.0f} KB on the wire** "
-            f"(1,072 KB decompressed). One pass over every college is "
-            f"**{fc['est_gb_total']:,.1f} GB** — against a 5 GB proxy plan and a "
-            f"4.9 GB disk that already holds 4.0 GB of Collegedunia data.\n\n"
-            f"Phase Ⓑ stays unbuilt until the `apis.shiksha.com/apigateway/…` "
-            f"lead is settled. That endpoint takes the same `?data=<base64>` "
-            f"shape as Collegedunia's `web-api`, so if it serves institute data "
-            f"as JSON the per-college cost could fall far below 170 KB and this "
-            f"number shrinks with it.", icon="⚠️")
-        st.caption("Discovery already gives you every college's id, slug, URL, "
-                   "the tabs it publishes and its full course list — without "
-                   "spending any of that budget.")
+            b1, b2, b3 = st.columns(3)
+            conc_b = b1.number_input("Parallel workers", 1, 12, 4, key="skb_conc")
+            budget_b = b2.number_input("Bandwidth budget (MB, 0 = none)", 0,
+                                       20000, 0, step=250, key="skb_mb")
+            max_b = b3.number_input("Max colleges (0 = all)", 0, 100000, 0,
+                                    step=500, key="skb_max")
+            st.caption(
+                f"All {fc['colleges_left']:,} pending ≈ **{fc['est_gb_left']:,.1f} GB** "
+                f"on the wire at the measured {KB_PER_COLLEGE:.0f} KB each. "
+                f"Set a max to take a slice first.")
+
+            st.info(
+                "**Route: direct, proxy on refusal.** Shiksha serves this "
+                "server's own IP at the same size and speed as the gateway, so "
+                "the crawl spends no proxy quota. The first 403/429 switches "
+                "every later request onto the proxy permanently, and the job log "
+                "records the switch.", icon="🛣️")
+            start_direct = st.checkbox(
+                "Start direct", value=True, key="skb_direct",
+                help="Untick to go through the proxy from the first request.")
+
+            if st.button("▶️ Run college detail", type="primary", key="skb_run"):
+                jid = sk_db.create_job("detail", _cfg(
+                    concurrency=int(conc_b), budget_mb=float(budget_b),
+                    max_colleges=int(max_b), start_direct=bool(start_direct)))
+                _launch(jid)
+                st.success(f"Started college detail — job #{jid}")
+                time.sleep(1)
+                st.rerun()
+            _job_monitor("b")
+
+        if c["base_courses"]:
+            with sk_db.connect() as conn:
+                cat = pd.read_sql_query(
+                    "SELECT base_course_id, name, level, colleges_count "
+                    "FROM sk_base_courses ORDER BY colleges_count DESC LIMIT 25",
+                    conn)
+            st.markdown("**The shared base-course catalogue** — `baseCourseTuples[].id`, "
+                        "which never appears in a URL. This is the join key for the "
+                        "Collegedunia comparison.")
+            st.dataframe(cat, use_container_width=True, hide_index=True)
 
     # -------------------------------------------------------------- Data
     with tab_data:

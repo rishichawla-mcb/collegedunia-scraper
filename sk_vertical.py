@@ -47,6 +47,15 @@ SHIKSHA = vb.Vertical(
                  "offering edge, all from URLs alone. ~48 gzipped requests, no "
                  "college page fetched. Resumable per sitemap.",
                  sk_scraper.run_discovery),
+        vb.Phase("detail", "Ⓑ College detail",
+                 "One request per college home page. The whole dataset is in the "
+                 "page (__PRELOADED_STATE__, 616 KB), so there is no cheaper "
+                 "endpoint; ~2.3 KB per college survives parsing, which is what "
+                 "makes 57,751 colleges fit on the disk. Fetches DIRECT by "
+                 "default and switches to the proxy permanently on the first "
+                 "site refusal. Builds the shared base-course catalogue — the "
+                 "join key the Collegedunia comparison needs.",
+                 sk_scraper.run_detail, depends_on=["discovery"]),
     ],
 )
 
