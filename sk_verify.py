@@ -111,8 +111,12 @@ def main() -> None:
         print(f"   colleges with NO home URL: {no_home:,}  "
               f"(found only via tab/offering URLs)")
         print("   alias_count distribution:")
-        for row in q(conn, "SELECT alias_count, COUNT(*) FROM sk_colleges "
-                           "GROUP BY 1 ORDER BY 1 LIMIT 8"):
+        # COALESCE: a college discovered without a home URL has alias_count
+        # NULL, and the format string crashed on it. It did not surface on the
+        # live database because discovery always sets the column there — a bug
+        # that only appears on data the report has not met yet.
+        for row in q(conn, "SELECT COALESCE(alias_count,0), COUNT(*) "
+                           "FROM sk_colleges GROUP BY 1 ORDER BY 1 LIMIT 8"):
             print(f"     {row[0]:>3} slug(s): {row[1]:>10,}")
         print()
 
@@ -162,6 +166,74 @@ def main() -> None:
                 print(f"     {r[0]:<22} {r[1]:<10} {r[2]:>10,}")
         except Exception as err:  # noqa: BLE001
             print(f"   (no change log: {err})")
+
+        # ------------------------------------------------------------ 7b
+        print("\n7b. Phase Ⓑ — detail coverage and the coarseness question")
+        done = one(conn, "SELECT COUNT(*) FROM sk_colleges "
+                         "WHERE detail_scraped_at IS NOT NULL")
+        print(f"   colleges with detail : {done:,}")
+        if done:
+            for col in ("name", "city", "website", "phone", "email", "latitude",
+                        "rating", "reviews_count", "facilities", "recruiters",
+                        "highlights", "admission_text", "description"):
+                try:
+                    n = one(conn, f"SELECT COUNT(*) FROM sk_colleges WHERE "
+                                  f"detail_scraped_at IS NOT NULL AND "
+                                  f"COALESCE(CAST({col} AS TEXT),'')<>''")
+                    print(f"     {col:<16} filled for {n:>7,} "
+                          f"({100.0*n/done:5.1f}%)")
+                except Exception as err:  # noqa: BLE001
+                    print(f"     {col:<16} ? {str(err)[:50]}")
+
+            # THE question for the comparison: is a base-course fee range one
+            # course or twenty-four? Measured across the slice, not argued about.
+            print("\n   base-course rows, by how many actual courses they cover:")
+            for row in q(conn,
+                         "SELECT CASE WHEN COALESCE(course_count,0)<=1 THEN '1' "
+                         "WHEN course_count<=3 THEN '2-3' "
+                         "WHEN course_count<=10 THEN '4-10' ELSE '11+' END b, "
+                         "COUNT(*) n FROM sk_college_base_courses GROUP BY b "
+                         "ORDER BY n DESC"):
+                print(f"     covers {row[0]:<5} {row[1]:>9,} rows")
+            tot = one(conn, "SELECT COUNT(*) FROM sk_college_base_courses")
+            nofee = one(conn, "SELECT COUNT(*) FROM sk_college_base_courses "
+                              "WHERE min_fees IS NULL AND max_fees IS NULL")
+            wide = one(conn, "SELECT COUNT(*) FROM sk_college_base_courses "
+                             "WHERE COALESCE(course_count,0) > 3")
+            covered = one(conn, "SELECT COALESCE(SUM(course_count),0) "
+                                "FROM sk_college_base_courses")
+            if tot:
+                print(f"\n   rows with NO fee range : {nofee:,}/{tot:,} "
+                      f"({100.0*nofee/tot:.1f}%)")
+                print(f"   rows covering >3       : {wide:,}/{tot:,} "
+                      f"({100.0*wide/tot:.1f}%)")
+                print(f"   actual courses behind them: {covered:,} "
+                      f"(so ~{covered/max(1,tot):.1f} courses per fee range)")
+                print("   -> a high figure here means base-course fees are too "
+                      "coarse to compare on, and the /courses tab pass is "
+                      "needed. A low one means phase Ⓑ v1 is enough.")
+
+            print("\n   widest fee ranges (a big spread = a range worth little):")
+            for row in q(conn,
+                         "SELECT name, min_fees, max_fees, course_count "
+                         "FROM sk_college_base_courses "
+                         "WHERE min_fees IS NOT NULL AND max_fees > min_fees "
+                         "ORDER BY (max_fees-min_fees) DESC LIMIT 8"):
+                print(f"     {row[0][:26]:<26} {row[1]:>10,} – {row[2]:>10,} "
+                      f"over {row[3]} course(s)")
+
+            print("\n   catalogue, most widely offered:")
+            for row in q(conn, "SELECT base_course_id, name, colleges_count "
+                               "FROM sk_base_courses ORDER BY colleges_count "
+                               "DESC LIMIT 12"):
+                print(f"     [{row[0]:>5}] {row[1][:34]:<34} {row[2]:>7,} colleges")
+
+            bad = q(conn, "SELECT college_id, recruiters FROM sk_colleges "
+                          "WHERE recruiters LIKE '%  %' LIMIT 3")
+            print(f"\n   rows with a double space in `recruiters` "
+                  f"(the H&M question): {len(bad)}")
+            for b in bad:
+                print(f"     {b[0]}: {(b[1] or '')[:90]}")
 
         # ------------------------------------------------------------ 8
         print("\n8. Sample rows")
