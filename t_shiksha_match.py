@@ -180,6 +180,91 @@ class NonIdentifyingSignalsAreRefused(unittest.TestCase):
         self.assertEqual([k for k in m if m[k]["tier"] == "website"], [])
 
 
+class BlockingIsDeterministic(unittest.TestCase):
+    """Two builds over identical data must produce identical pairs.
+
+    They did not. `best()` sorted a SET of tokens by document frequency alone,
+    so every tie was broken by set iteration order — string hashing, which
+    Python randomises per process. Two consecutive live builds each wrote
+    22,599 pairs and left 22,604 rows: five pairs existed in one run and not the
+    other, which means the judgement queue was not reproducible."""
+
+    TIED = {10: {"alpha", "beta", "gamma", "delta"}, 11: {"alpha"},
+            12: {"beta"}, 13: {"gamma"}, 14: {"delta"}}
+
+    def test_ties_break_on_the_token_not_on_the_hash(self):
+        idx = sk_match.Index(self.TIED)
+        # every token has df=1, so a total order can only come from the token
+        self.assertEqual(idx.blocking_tokens(self.TIED[10]),
+                         ["alpha", "beta", "delta"])
+
+    def test_rarity_still_wins_over_the_tiebreaker(self):
+        toks = {1: {"zzz", "aaa"}, 2: {"aaa"}, 3: {"aaa"}, 4: {"aaa"}}
+        idx = sk_match.Index(toks)
+        # 'aaa' has df=4, 'zzz' df=1 — the rare one must come first even though
+        # it sorts last alphabetically
+        self.assertEqual(idx.blocking_tokens(toks[1], n=1), ["zzz"])
+
+    def test_the_same_answer_under_different_hash_seeds(self):
+        """The real proof: a fresh interpreter per seed, which is the only way
+        to vary PYTHONHASHSEED. An in-process test cannot catch this."""
+        import subprocess
+        import sys
+        code = ("import sk_match;"
+                "t={10:{'alpha','beta','gamma','delta'},11:{'alpha'},"
+                "12:{'beta'},13:{'gamma'},14:{'delta'}};"
+                "print(sk_match.Index(t).blocking_tokens(t[10]))")
+        answers = set()
+        for seed in ("1", "2", "3", "4", "5"):
+            env = dict(os.environ, PYTHONHASHSEED=seed)
+            out = subprocess.run([sys.executable, "-c", code], env=env,
+                                 capture_output=True, text=True,
+                                 cwd=os.path.dirname(os.path.abspath(__file__)))
+            answers.add(out.stdout.strip())
+        self.assertEqual(len(answers), 1,
+                         "blocking tokens differ across hash seeds: %s" % answers)
+
+
+class StaleRowsAreNamed(unittest.TestCase):
+    """Rows dropped from the match set are kept — the owner's standing rule is
+    that nothing is deleted — but they must be VISIBLE, or the report's totals
+    silently exceed what the build wrote."""
+
+    def test_report_prints_a_total(self):
+        import contextlib
+        import io
+        reset()
+        cd_row(1, IITB, "Mumbai", "https://www.iitb.ac.in")
+        sk_row(101, IITB, "Mumbai", "https://www.iitb.ac.in")
+        run()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            sk_match.report()
+        self.assertIn("TOTAL", buf.getvalue())
+
+    def test_a_leftover_row_is_called_out(self):
+        import contextlib
+        import io
+        reset()
+        cd_row(1, IITB, "Mumbai", "https://www.iitb.ac.in")
+        sk_row(101, IITB, "Mumbai", "https://www.iitb.ac.in")
+        run()
+        # a pair from an imaginary earlier build that this one no longer emits
+        with sk_db.connect() as c:
+            c.execute("INSERT INTO sk_matches(cd_college_id,sk_college_id,score,"
+                      "tier,evidence,verdict,decided_by,decided_at) "
+                      "VALUES(1,999,0.5,'name','{}','pending','auto',1000)")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            sk_match.report()
+        out = buf.getvalue()
+        self.assertIn("leftovers from an earlier one", out)
+        # and it is still there afterwards — named, not removed
+        with sk_db.connect() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM sk_matches "
+                                       "WHERE sk_college_id=999").fetchone()[0], 1)
+
+
 class ReportContract(unittest.TestCase):
 
     def test_tier_rank_covers_every_tier_add_can_emit(self):

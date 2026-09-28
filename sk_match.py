@@ -261,11 +261,31 @@ class Index:
                 self.idx[w].append(i)
                 self.df[w] += 1
 
+    def blocking_tokens(self, q: Set[str], n: int = 3) -> List[str]:
+        """The n rarest tokens, chosen deterministically.
+
+        The tiebreaker `w` is load-bearing, not tidiness. `q` is a SET, and
+        sorting a set by document frequency alone leaves every tie broken by
+        set iteration order — which follows string hashing, which Python
+        randomises per process. Two builds over IDENTICAL data therefore chose
+        different blocking tokens, scanned different candidate pools, and found
+        a different `best` match for a handful of Collegedunia rows.
+
+        Measured 2026-09-28: four tokens all with df=1, sorted across five
+        PYTHONHASHSEED values, gave five different answers
+        (['beta','delta','gamma'], ['delta','gamma','alpha'], …). Two
+        consecutive builds on unchanged input wrote 22,599 pairs each yet left
+        22,604 rows in the table — five pairs appeared in one run and not the
+        other. Small, but it means the judgement queue is not reproducible: a
+        pair someone judged can be replaced by a different pair on the next
+        build."""
+        return sorted(q, key=lambda w: (self.df.get(w, 0), w))[:n]
+
     def best(self, q: Set[str], cap: int = 600) -> Tuple[int, float]:
         if not q:
             return (0, 0.0)
         best_i, best_j, seen = 0, 0.0, set()
-        for w in sorted(q, key=lambda w: self.df.get(w, 0))[:3]:
+        for w in self.blocking_tokens(q):
             for i in self.idx.get(w, ()):
                 if i in seen:
                     continue
@@ -396,6 +416,18 @@ def build(db_path: str = None) -> int:
             "decided_at=excluded.decided_at", rows)
     print(f"\n3. wrote {len(rows):,} candidate pairs to sk_matches")
     print("   (a verdict already set by a judge or a human is never overwritten)")
+    # Rows this build did not touch are leftovers from an earlier one. Nothing
+    # is deleted — the owner's standing rule — but they are NAMED, because
+    # otherwise the report's totals quietly exceed what the build produced and
+    # the arithmetic stops adding up. This is how the non-determinism above was
+    # caught: 22,599 written, 22,604 counted.
+    with sk_db.connect() as conn:
+        stale = conn.execute("SELECT COUNT(*) FROM sk_matches WHERE decided_at < ?",
+                             (now,)).fetchone()[0]
+    if stale:
+        print(f"   ! {stale:,} row(s) in sk_matches were NOT produced by this "
+              f"build — leftovers from an earlier run, kept, not deleted.")
+        print(f"     list them: SELECT * FROM sk_matches WHERE decided_at < {now:.0f}")
     return 0
 
 
@@ -405,10 +437,24 @@ def report() -> int:
     with sk_db.connect() as conn:
         print(f"Match report [BUILD {BUILD}]\n")
         print("by tier and verdict:")
+        total = 0
         for r in conn.execute(
                 "SELECT tier, verdict, COUNT(*), ROUND(AVG(score),3) "
                 "FROM sk_matches GROUP BY tier, verdict ORDER BY 3 DESC"):
             print(f"   {r[0]:<11} {r[1]:<8} {r[2]:>8,}  avg score {r[3]}")
+            total += r[2]
+        # Print the total. Its absence is what let 22,599-written / 22,604-stored
+        # go unnoticed until someone added the column up by hand.
+        last = conn.execute("SELECT MAX(decided_at) FROM sk_matches").fetchone()[0]
+        fresh = conn.execute("SELECT COUNT(*) FROM sk_matches WHERE decided_at >= ?",
+                             (float(last or 0) - 60,)).fetchone()[0]
+        print(f"   {'TOTAL':<11} {'':<8} {total:>8,}")
+        if fresh and fresh != total:
+            print(f"   ! only {fresh:,} of these came from the latest build; "
+                  f"{total - fresh:,} are leftovers from an earlier one.")
+            print(f"     They are kept, not deleted. To see them:")
+            print(f"     SELECT * FROM sk_matches WHERE decided_at < "
+                  f"{float(last or 0) - 60:.0f}")
         yes_cd = conn.execute(
             "SELECT COUNT(DISTINCT cd_college_id) FROM sk_matches "
             "WHERE verdict='yes'").fetchone()[0]
