@@ -175,7 +175,15 @@ def pick_college() -> Dict[str, Any]:
     return {}
 
 
-def main() -> None:
+def main(tab: str = "") -> None:
+    """`tab` maps a TAB page instead of the home page.
+
+    Added 2026-09-28: the 500-college slice showed 38.8% of base-course rows
+    carry no fee range at all and 28.4% cover more than three actual courses, so
+    the per-course fees on the /courses tab may be needed after all. Before
+    committing to a second request per college, measure what that request
+    actually costs and whether it carries the data — the same discipline that
+    retired the apigateway lead."""
     if _curl is None:
         print("curl_cffi is not installed — `pip install curl_cffi`.")
         sys.exit(1)
@@ -189,17 +197,20 @@ def main() -> None:
         return
     cid, slug = col["college_id"], col["slug"]
     base = col.get("url") or f"{SITE}/college/{slug}-{cid}"
+    target = f"{base}/{tab}" if tab else base
     sess = _curl.Session(impersonate=IMPERSONATE)
 
     print(f"1. Pages for college {cid} ({slug})")
     print(f"   tabs published: {col.get('tabs')}")
-    home = fetch(sess, base, proxy, "home")
+    print(f"   mapping: {tab or 'home'}")
+    home = fetch(sess, target, proxy, tab or "home")
     if home is None or home.status_code != 200:
         print("   home page not reachable; stopping.")
         return
     html = home.text
-    for tab in ("courses", "fees"):
-        fetch(sess, f"{base}/{tab}", proxy, tab)
+    if not tab:
+        for t in ("courses", "fees"):
+            fetch(sess, f"{base}/{t}", proxy, t)
 
     print("\n2. Page anatomy")
     n_script = html.count("<script")
@@ -231,7 +242,8 @@ def main() -> None:
     print("4. Where the 616 KB sits (branches >= 0.5 KB, depth 3)")
     tree(state, max_depth=3)
 
-    out = os.path.join(SAMPLE_DIR, f"sk_sample_{cid}.json")
+    out = os.path.join(SAMPLE_DIR,
+                       f"sk_sample_{cid}{'_' + tab if tab else ''}.json")
     try:
         with open(out, "w", encoding="utf-8") as fh:
             json.dump(state, fh, ensure_ascii=False)
@@ -252,4 +264,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1] if len(sys.argv) > 1 else "")
