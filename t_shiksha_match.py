@@ -265,6 +265,136 @@ class StaleRowsAreNamed(unittest.TestCase):
                                        "WHERE sk_college_id=999").fetchone()[0], 1)
 
 
+class ConflictClassification(unittest.TestCase):
+    """1,304 collisions is one number covering several different situations,
+    and they do not want the same treatment. Each fixture below is one of
+    them, built so exactly one classification can fit."""
+
+    def classify(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            sk_match.conflicts(limit=5)
+        out = buf.getvalue()
+        got = {}
+        for k in ("cd-duplicate", "shared-signal", "parent-child", "ambiguous"):
+            for line in out.splitlines():
+                if line.strip().startswith(k):
+                    got[k] = int(line.split()[1].replace(",", ""))
+                    break
+        return got, out
+
+    def test_two_collegedunia_rows_for_the_same_college(self):
+        """Both matches are CORRECT; the duplicate is Collegedunia's, and this
+        is a fact about their inventory rather than a matcher error."""
+        reset()
+        cd_row(1, "Alpha Institute of Technology", "Pune", "https://alpha1.ac.in")
+        cd_row(2, "Alpha Institute of Technology", "Pune", "https://alpha2.ac.in")
+        sk_row(101, "Alpha Institute of Technology", "Pune",
+               "https://alpha1.ac.in", phone="9000000001")
+        with sk_db.connect() as c:
+            for cdi in (1, 2):
+                c.execute("INSERT INTO sk_matches(cd_college_id,sk_college_id,"
+                          "score,tier,evidence,verdict,decided_by,decided_at) "
+                          "VALUES(?,101,0.98,'name','{}','yes','auto',9e9)", (cdi,))
+        got, _ = self.classify()
+        self.assertEqual(got.get("cd-duplicate"), 1, got)
+
+    def test_one_switchboard_number_claimed_by_two_colleges(self):
+        """Same evidence VALUE on both claimants — the signal is not
+        identifying here, whatever tier it sits in."""
+        reset()
+        cd_row(1, "Alpha College of Arts", "Pune")
+        cd_row(2, "Beta College of Commerce", "Pune")
+        sk_row(101, "Gamma University", "Pune")
+        with sk_db.connect() as c:
+            for cdi in (1, 2):
+                c.execute("INSERT INTO sk_matches(cd_college_id,sk_college_id,"
+                          "score,tier,evidence,verdict,decided_by,decided_at) "
+                          "VALUES(?,101,0.9,'phone',"
+                          "'{\"phone\":\"2025551234\"}','yes','auto',9e9)", (cdi,))
+        got, _ = self.classify()
+        self.assertEqual(got.get("shared-signal"), 1, got)
+
+    def test_a_university_and_its_department(self):
+        reset()
+        cd_row(1, "Delta University", "Delhi")
+        cd_row(2, "Delta University School of Law", "Delhi")
+        sk_row(101, "Delta University", "Delhi")
+        with sk_db.connect() as c:
+            for cdi, sc in ((1, 0.99), (2, 0.86)):
+                c.execute("INSERT INTO sk_matches(cd_college_id,sk_college_id,"
+                          "score,tier,evidence,verdict,decided_by,decided_at) "
+                          "VALUES(?,101,?,'name','{}','yes','auto',9e9)", (cdi, sc))
+        got, _ = self.classify()
+        self.assertEqual(got.get("parent-child"), 1, got)
+
+    def test_anything_else_is_left_for_judgement(self):
+        reset()
+        cd_row(1, "Epsilon College of Nursing", "Jaipur")
+        cd_row(2, "Zeta Academy of Design", "Jaipur")
+        sk_row(101, "Eta Institute", "Jaipur")
+        with sk_db.connect() as c:
+            for cdi, ev in ((1, '{"website":"a.ac.in"}'),
+                            (2, '{"website":"b.ac.in"}')):
+                c.execute("INSERT INTO sk_matches(cd_college_id,sk_college_id,"
+                          "score,tier,evidence,verdict,decided_by,decided_at) "
+                          "VALUES(?,101,0.9,'website',?,'yes','auto',9e9)",
+                          (cdi, ev))
+        got, _ = self.classify()
+        self.assertEqual(got.get("ambiguous"), 1, got)
+
+    def test_it_changes_nothing(self):
+        reset()
+        cd_row(1, "Alpha", "Pune")
+        cd_row(2, "Alpha", "Pune")
+        sk_row(101, "Alpha", "Pune")
+        with sk_db.connect() as c:
+            for cdi in (1, 2):
+                c.execute("INSERT INTO sk_matches(cd_college_id,sk_college_id,"
+                          "score,tier,evidence,verdict,decided_by,decided_at) "
+                          "VALUES(?,101,0.98,'name','{}','yes','auto',9e9)", (cdi,))
+            before = c.execute("SELECT COUNT(*), SUM(score) FROM sk_matches"
+                               ).fetchone()
+        self.classify()
+        with sk_db.connect() as c:
+            after = c.execute("SELECT COUNT(*), SUM(score) FROM sk_matches"
+                              ).fetchone()
+        self.assertEqual(tuple(before), tuple(after))
+
+    def test_a_partly_duplicated_group_is_not_a_clean_duplicate(self):
+        """Three claimants: two identical, one unrelated. Judging the group by
+        the CLOSEST pair would call it a tidy Collegedunia duplicate and hide
+        the third row. Every pair must be alike, so the test uses min()."""
+        reset()
+        cd_row(1, "Alpha Institute of Technology", "Pune")
+        cd_row(2, "Alpha Institute of Technology", "Pune")
+        cd_row(3, "Zeta College of Nursing", "Pune")
+        sk_row(101, "Alpha Institute of Technology", "Pune")
+        with sk_db.connect() as c:
+            for cdi in (1, 2, 3):
+                c.execute("INSERT INTO sk_matches(cd_college_id,sk_college_id,"
+                          "score,tier,evidence,verdict,decided_by,decided_at) "
+                          "VALUES(?,101,0.9,'name','{}','yes','auto',9e9)", (cdi,))
+        got, out = self.classify()
+        self.assertIsNone(got.get("cd-duplicate"), got)
+        self.assertEqual(got.get("ambiguous"), 1, got)
+        self.assertIn("widest collision: 3", out)
+
+    def test_a_single_claimant_is_not_a_conflict(self):
+        reset()
+        cd_row(1, "Solo College", "Pune")
+        sk_row(101, "Solo College", "Pune")
+        with sk_db.connect() as c:
+            c.execute("INSERT INTO sk_matches(cd_college_id,sk_college_id,"
+                      "score,tier,evidence,verdict,decided_by,decided_at) "
+                      "VALUES(1,101,0.99,'name','{}','yes','auto',9e9)")
+        got, out = self.classify()
+        self.assertEqual(got, {})
+        self.assertIn("0 Shiksha colleges claimed by >1", out)
+
+
 class ReportContract(unittest.TestCase):
 
     def test_tier_rank_covers_every_tier_add_can_emit(self):

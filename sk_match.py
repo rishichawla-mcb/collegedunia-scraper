@@ -474,6 +474,103 @@ def report() -> int:
     return 0
 
 
+CD_DUP = 0.80        # two Collegedunia names this alike are the same college
+
+
+def conflicts(limit: int = 12) -> int:
+    """Characterise the Shiksha colleges claimed by more than one Collegedunia
+    row, instead of counting them.
+
+    1,304 collisions is a single number consistent with several different
+    stories, and they do not want the same treatment:
+
+      cd-duplicate    the two Collegedunia rows are the SAME college, listed
+                      twice. Then both matches are correct and the conflict is a
+                      fact about Collegedunia's own inventory, not a matcher
+                      error. Resolution: keep both, and note the CD duplicate.
+      shared-signal   the claimants matched on the SAME value — one switchboard
+                      number, one university-wide email domain. The signal is
+                      not identifying here, whatever tier it sits in.
+      parent-child    one claimant's name contains the other's (a university and
+                      its department). Different institutions; the narrower one
+                      usually belongs elsewhere.
+      ambiguous       none of the above. These need a judgement.
+
+    Read-only: prints, writes nothing.
+    """
+    cd, sk = load_cd(), load_sk()
+    groups: Dict[int, List[Tuple[int, str, str, Dict[str, Any]]]] = defaultdict(list)
+    with sk_db.connect() as conn:
+        for ski, cdi, tier, score, ev in conn.execute(
+                "SELECT sk_college_id, cd_college_id, tier, score, evidence "
+                "FROM sk_matches WHERE verdict='yes' AND sk_college_id IN ("
+                "  SELECT sk_college_id FROM sk_matches WHERE verdict='yes' "
+                "  GROUP BY sk_college_id HAVING COUNT(*)>1) "
+                "ORDER BY sk_college_id"):
+            try:
+                evd = json.loads(ev or "{}")
+            except Exception:  # noqa: BLE001
+                evd = {}
+            groups[int(ski)].append((int(cdi), tier, score, evd))
+
+    print(f"Conflicts [BUILD {BUILD}]")
+    print(f"  {len(groups):,} Shiksha colleges claimed by >1 Collegedunia row\n")
+
+    kinds: Counter = Counter()
+    by_tier: Counter = Counter()
+    samples: Dict[str, List[str]] = defaultdict(list)
+    widest = 0
+    for ski, rows in groups.items():
+        widest = max(widest, len(rows))
+        by_tier[tuple(sorted({r[1] for r in rows}))] += 1
+        ids = [r[0] for r in rows]
+        names = [cd.name.get(i, "") for i in ids]
+        toks = [cd.toks.get(i, set()) for i in ids]
+        pairwise = [jaccard(toks[a], toks[b])
+                    for a in range(len(ids)) for b in range(a + 1, len(ids))]
+        shared = [v for r in rows
+                  for k, v in r[3].items()
+                  if k in ("website", "phone", "email")]
+        lowered = [n.lower() for n in names if n]
+
+        if pairwise and min(pairwise) >= CD_DUP:
+            kind = "cd-duplicate"
+        elif shared and len(set(shared)) == 1 and len(shared) == len(rows):
+            kind = "shared-signal"
+        elif any(a != b and (a in b or b in a)
+                 for a in lowered for b in lowered):
+            kind = "parent-child"
+        else:
+            kind = "ambiguous"
+        kinds[kind] += 1
+        if len(samples[kind]) < limit:
+            samples[kind].append(
+                "  SK %-8s %s\n%s" % (
+                    ski, (sk.name.get(ski) or "?")[:70],
+                    "\n".join("       CD %-8s %-52s [%s %.2f]"
+                              % (r[0], (cd.name.get(r[0]) or "?")[:52],
+                                 r[1], r[2])
+                              for r in rows)))
+
+    print("by kind:")
+    for k, n in kinds.most_common():
+        print(f"   {k:<14} {n:>6,}   ({100.0*n/max(1,len(groups)):.1f}%)")
+    print(f"\n   widest collision: {widest} Collegedunia rows on one Shiksha college")
+
+    print("\nby the tiers involved:")
+    for t, n in by_tier.most_common(8):
+        print(f"   {'+'.join(t):<28} {n:>6,}")
+
+    for k in ("cd-duplicate", "shared-signal", "parent-child", "ambiguous"):
+        if not samples[k]:
+            continue
+        print(f"\n--- {k} — {kinds[k]:,} total, showing {len(samples[k])} ---")
+        for s in samples[k]:
+            print(s)
+    print("\nNothing was changed. Resolution is a judgement, not a default.")
+    return 0
+
+
 def export(limit: int = 300, path: str = "/data/sk_judge.jsonl") -> int:
     """The ambiguous band, smallest file that still carries the evidence."""
     cd, sk = load_cd(), load_sk()
@@ -525,6 +622,7 @@ def apply_verdicts(path: str) -> int:
 USAGE = """usage:
   python sk_match.py build
   python sk_match.py report
+  python sk_match.py conflicts [n]
   python sk_match.py export [n] [path]
   python sk_match.py apply <file>"""
 
@@ -542,6 +640,8 @@ def main(argv: List[str]) -> int:
         return build()
     if cmd == "report":
         return report()
+    if cmd == "conflicts":
+        return conflicts(int(argv[1]) if len(argv) > 1 else 12)
     if cmd == "export":
         n = int(argv[1]) if len(argv) > 1 else 300
         p = argv[2] if len(argv) > 2 else "/data/sk_judge.jsonl"
