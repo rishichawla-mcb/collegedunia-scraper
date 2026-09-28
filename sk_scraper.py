@@ -368,6 +368,16 @@ def fetch_bytes(client: Client, url: str, label: str,
                             timeout=client.timeout, allow_redirects=True)
             client.stats.add(requests=1, byts=_wire(resp))
             client._check_blocked(resp)
+            # A 404/410 is an ANSWER, not a refusal. Without this it fell
+            # through to raise_for_status(), whose HTTPError subclasses OSError,
+            # so the retry loop spent all five attempts on a page the site had
+            # already said does not exist — and then recorded it as an 'error',
+            # which leaves it in the queue to be re-asked on every future run.
+            # Measured on the 500-college slice: one such college, 5 requests.
+            # At 57,751 that is thousands of requests spent learning nothing.
+            if resp.status_code in (404, 410):
+                client.pm.report_success(proxy)   # the transport did its job
+                raise PageGoneError(f"{label}: HTTP {resp.status_code}")
             resp.raise_for_status()
             raw = resp.content or b""
             # A challenge page arrives as HTTP 200 + HTML. Only worth testing

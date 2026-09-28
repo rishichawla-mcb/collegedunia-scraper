@@ -353,6 +353,24 @@ check("a transport error does not flip the route to proxy",
       [m for m in LOGS if "⇄" in m])
 install()
 
+print("\n== 6b. a 404 is an answer, not a refusal ==")
+fresh_db()
+_keep = PAGES.pop(f"{SITE}/college/slug-99")      # now returns 404
+REQUESTS.clear()
+install()
+job404 = run()
+tries = [u for u, _ in REQUESTS if u.endswith("slug-99")]
+check("a 404 is NOT retried — one request, not max_retries",
+      len(tries) == 1, f"{len(tries)} requests")
+with sk_db.connect() as conn:
+    st99 = conn.execute("SELECT status FROM sk_college_progress "
+                        "WHERE college_id=99").fetchone()
+check("and it is recorded 'gone', so it leaves the queue for good",
+      st99 and st99[0] == "gone", st99 and st99[0])
+check("the other colleges still landed",
+      sk_db.counts()["colleges_with_detail"] == 1, sk_db.counts())
+PAGES[f"{SITE}/college/slug-99"] = _keep
+
 print("\n== 7. budget ==")
 fresh_db()
 job6 = run({"budget_requests": 1})
