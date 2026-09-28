@@ -8,9 +8,10 @@ Course Finder verticals, and nothing else reads its tables. Owner instruction,
 """
 from __future__ import annotations
 
-BUILD = "2026-09-24a"
+BUILD = "2026-09-28a"
 
 import vertical_base as vb
+import sk_courses
 import sk_db
 import sk_scraper
 
@@ -56,6 +57,34 @@ SHIKSHA = vb.Vertical(
                  "site refusal. Builds the shared base-course catalogue — the "
                  "join key the Collegedunia comparison needs.",
                  sk_scraper.run_detail, depends_on=["discovery"]),
+        vb.Phase("courses", "Ⓒ Course listing",
+                 "The per-course rows phase Ⓑ cannot give. Ⓑ reads "
+                 "`baseCourseTuples`, which are grouped BY BASE COURSE — one "
+                 "'B.Des' row with a fee RANGE covering every B.Des the college "
+                 "runs. This walks /courses and /courses-2… (12 courses a page, "
+                 "the site's own paginationData) and writes one row per ACTUAL "
+                 "course: fees as a number, duration, seats, exams, "
+                 "eligibility, median salary, skills, admission status — plus "
+                 "the per-course URL phase Ⓓ needs. Measured 155 KB/page, so "
+                 "≈3.8 GB for all 317,907 courses. No API is involved: the page "
+                 "is server-rendered and issues zero data requests.",
+                 sk_courses.run_course_listing, depends_on=["detail"]),
+        vb.Phase("course_detail", "Ⓓ Course detail (optional)",
+                 "One request per COURSE — the expensive pass. The page carries "
+                 "89 top-level keys; 75 are stored. Adds what the listing has "
+                 "not got: specialization and its id, stream/substream ids, "
+                 "course level (UG/PG), credential, education type, delivery "
+                 "method, medium; the full fee BREAKDOWN — tuition, one-time, "
+                 "hostel, deposit, other, what the total includes, the fee "
+                 "year, the brochure and the prose that qualifies each figure; "
+                 "eligibility with CATEGORY-WISE class-XII cutoffs and per-exam "
+                 "cutoffs; the ordered admission steps; seats by "
+                 "category/exam/domicile; placements with the GRAIN of the "
+                 "salary figure; recruiters; the affiliating university; "
+                 "highlights; dated events. Measured 144 KB each: ≈45.8 GB for "
+                 "all 317,907. Use max_courses or a bandwidth budget and let it "
+                 "drain over several runs.",
+                 sk_courses.run_course_detail, depends_on=["courses"]),
     ],
 )
 

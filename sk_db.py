@@ -181,6 +181,20 @@ CREATE TABLE IF NOT EXISTS sk_college_progress (
 );
 CREATE INDEX IF NOT EXISTS sk_idx_cprog_status ON sk_college_progress(status);
 
+-- Phase Ⓒ's own queue. Separate from sk_college_progress on purpose: a college
+-- can be 'done' for detail and still owe its course listing, and merging the two
+-- would either re-crawl finished detail or hide the course backlog.
+CREATE TABLE IF NOT EXISTS sk_course_progress (
+    college_id  INTEGER PRIMARY KEY,
+    status      TEXT,              -- 'done' | 'gone' | 'error'
+    pages       INTEGER DEFAULT 0, -- listing pages actually fetched
+    found       INTEGER DEFAULT 0, -- course rows written
+    expected    INTEGER,           -- the site's own totalCourses, for auditing
+    message     TEXT,
+    updated_at  REAL
+);
+CREATE INDEX IF NOT EXISTS sk_idx_krprog_status ON sk_course_progress(status);
+
 CREATE TABLE IF NOT EXISTS sk_jobs (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     vertical      TEXT,
@@ -293,6 +307,109 @@ DETAIL_COLUMNS = [
     ("reviews_verified", "INTEGER"),
 ]
 
+# Columns phase Ⓒ adds to sk_offerings, for the same reason DETAIL_COLUMNS exist:
+# the table was created by discovery and CREATE TABLE IF NOT EXISTS will not
+# touch it. The first block comes from the listing page, the second only from the
+# per-course page — kept apart here so it stays obvious which pass fills what,
+# and so a database with the listing pass done but not the deep pass reads as
+# "specialization not collected yet" rather than "this course has none".
+OFFERING_COLUMNS = [
+    # from /courses (cheap: ~1 page per 12 courses)
+    ("base_course_id", "INTEGER"), ("base_course_name", "TEXT"),
+    ("total_seats", "INTEGER"), ("median_salary", "INTEGER"),
+    ("rating", "REAL"), ("rating_count", "INTEGER"), ("money_rating", "REAL"),
+    ("scholarships_count", "INTEGER"), ("eligibility_x", "INTEGER"),
+    ("eligibility_xii", "INTEGER"), ("eligibility_grad", "INTEGER"),
+    ("eligibility_pg", "INTEGER"), ("work_experience", "TEXT"),
+    ("difficulty_level", "TEXT"), ("skills", "TEXT"), ("credential", "TEXT"),
+    ("is_online", "INTEGER"), ("curriculum_pdf", "TEXT"),
+    ("intake_dates", "TEXT"), ("commencement_dates", "TEXT"),
+    ("admission_status", "TEXT"), ("shiksha_rank", "INTEGER"),
+    ("exams_count", "INTEGER"), ("institute_grade", "TEXT"),
+    ("ranking", "TEXT"), ("listed_at", "REAL"),
+    # from /course-<slug>-<id> (expensive: 1 page per course, 144 KB measured).
+    # The page carries 89 top-level keys; these are the ones that are DATA about
+    # the course rather than page furniture (widgets, SEO blocks, breadcrumbs,
+    # author details, A/B variants, "also viewed" carousels).
+    #   taxonomy
+    ("specialization", "TEXT"), ("specialization_id", "INTEGER"),
+    ("substream", "TEXT"), ("substream_id", "INTEGER"),
+    ("stream_id", "INTEGER"), ("course_level", "TEXT"),
+    ("education_type", "TEXT"), ("delivery_method", "TEXT"),
+    ("medium", "TEXT"), ("course_type", "TEXT"), ("institute_type", "TEXT"),
+    ("course_variant", "INTEGER"), ("is_course_paid", "INTEGER"),
+    ("nzqf", "TEXT"),
+    #   fees — scalars are the `general` category, the _json twins keep the
+    #   whole category-keyed map so a college that ever publishes SC/ST/OBC
+    #   figures does not lose them to a scalar that only looked at `general`.
+    ("fees_total", "INTEGER"), ("fees_onetime", "INTEGER"),
+    ("fees_hostel", "INTEGER"), ("fees_deposit", "INTEGER"),
+    ("fees_other", "INTEGER"),
+    ("fees_total_json", "TEXT"), ("fees_onetime_json", "TEXT"),
+    ("fees_hostel_json", "TEXT"), ("fees_deposit_json", "TEXT"),
+    ("fees_period_json", "TEXT"), ("fees_period_type", "TEXT"),
+    ("fees_includes", "TEXT"), ("fees_categories", "TEXT"),
+    ("fees_location_json", "TEXT"), ("fees_year", "INTEGER"),
+    ("fees_currency", "TEXT"), ("fees_note", "TEXT"),
+    ("fees_hostel_note", "TEXT"), ("fees_onetime_note", "TEXT"),
+    ("fees_deposit_note", "TEXT"), ("fees_brochure_url", "TEXT"),
+    #   eligibility
+    ("elig_year", "INTEGER"), ("elig_x_json", "TEXT"), ("elig_xii_json", "TEXT"),
+    ("elig_grad_json", "TEXT"), ("elig_pg_json", "TEXT"),
+    ("elig_xii_general", "INTEGER"), ("elig_xii_scores", "TEXT"),
+    ("elig_xii_score_type", "TEXT"), ("elig_exams_json", "TEXT"),
+    ("elig_min_workex", "INTEGER"), ("elig_max_workex", "INTEGER"),
+    ("elig_min_age", "INTEGER"), ("elig_max_age", "INTEGER"),
+    ("elig_backlogs", "INTEGER"), ("elig_note", "TEXT"),
+    ("elig_intl_note", "TEXT"),
+    #   structure, admission, seats
+    ("course_period", "TEXT"), ("period_courses_json", "TEXT"),
+    ("admission_steps", "TEXT"), ("seats_total", "INTEGER"),
+    ("seats_category_json", "TEXT"), ("seats_exam_json", "TEXT"),
+    ("seats_domicile_json", "TEXT"),
+    #   placements — `placement_grain` records WHAT the salary describes
+    ("placement_grain", "TEXT"), ("placement_batch_year", "INTEGER"),
+    ("placement_pct", "REAL"), ("salary_avg", "INTEGER"),
+    ("salary_median", "INTEGER"), ("salary_max", "INTEGER"),
+    ("salary_min", "INTEGER"), ("salary_currency", "TEXT"),
+    ("placement_report_url", "TEXT"), ("internships_available", "INTEGER"),
+    ("recruiters", "TEXT"),
+    #   affiliation, highlights, dates
+    ("affiliation_university_id", "INTEGER"), ("affiliation_name", "TEXT"),
+    ("affiliation_url", "TEXT"), ("affiliation_scope", "TEXT"),
+    ("highlights", "TEXT"), ("important_dates_json", "TEXT"),
+    ("deep_scraped_at", "REAL"),
+]
+
+# The Ⓓ-only columns, named once so OFFERING_LISTING_COLS and OFFERING_DEEP_COLS
+# cannot drift apart. `curriculum_pdf` is deliberately NOT here: phase Ⓒ already
+# fills it from the listing tuple, and phase Ⓓ refreshes it from
+# courseStructure, so it belongs to both.
+DEEP_ONLY = {
+    "specialization", "specialization_id", "substream", "substream_id",
+    "stream_id", "course_level", "education_type", "delivery_method", "medium",
+    "course_type", "institute_type", "course_variant", "is_course_paid", "nzqf",
+    "fees_total", "fees_onetime", "fees_hostel", "fees_deposit", "fees_other",
+    "fees_total_json", "fees_onetime_json", "fees_hostel_json",
+    "fees_deposit_json", "fees_period_json", "fees_period_type",
+    "fees_includes", "fees_categories", "fees_location_json", "fees_year",
+    "fees_currency", "fees_note", "fees_hostel_note", "fees_onetime_note",
+    "fees_deposit_note", "fees_brochure_url",
+    "elig_year", "elig_x_json", "elig_xii_json", "elig_grad_json",
+    "elig_pg_json", "elig_xii_general", "elig_xii_scores",
+    "elig_xii_score_type", "elig_exams_json", "elig_min_workex",
+    "elig_max_workex", "elig_min_age", "elig_max_age", "elig_backlogs",
+    "elig_note", "elig_intl_note",
+    "course_period", "period_courses_json", "admission_steps", "seats_total",
+    "seats_category_json", "seats_exam_json", "seats_domicile_json",
+    "placement_grain", "placement_batch_year", "placement_pct", "salary_avg",
+    "salary_median", "salary_max", "salary_min", "salary_currency",
+    "placement_report_url", "internships_available", "recruiters",
+    "affiliation_university_id", "affiliation_name", "affiliation_url",
+    "affiliation_scope", "highlights", "important_dates_json",
+    "deep_scraped_at",
+}
+
 
 def init_db(db_path: str = SK_DB_PATH) -> None:
     with connect(db_path) as conn:
@@ -310,6 +427,10 @@ def init_db(db_path: str = SK_DB_PATH) -> None:
         for col, typ in DETAIL_COLUMNS:
             if col not in have:
                 conn.execute(f"ALTER TABLE sk_colleges ADD COLUMN {col} {typ}")
+        have = {r[1] for r in conn.execute("PRAGMA table_info(sk_offerings)")}
+        for col, typ in OFFERING_COLUMNS:
+            if col not in have:
+                conn.execute(f"ALTER TABLE sk_offerings ADD COLUMN {col} {typ}")
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +530,87 @@ def upsert_offerings(rows, db_path: str = SK_DB_PATH) -> int:
     with connect(db_path) as conn:
         return _upsert(conn, "sk_offerings", OFFERING_COLS,
                        ["college_id", "course_id"], rows)
+
+
+# --------------------------------------------------------------------------- Ⓒ
+# The listing pass writes the discovery columns AND the new ones; the deep pass
+# writes only what the listing cannot give. Two column lists rather than one so
+# the deep pass cannot silently blank a listing value it does not carry.
+OFFERING_LISTING_COLS = OFFERING_COLS + [c for c, _ in OFFERING_COLUMNS
+                                         if c not in DEEP_ONLY]
+
+OFFERING_DEEP_COLS = (["college_id", "course_id", "course_name",
+                       "base_course_name", "credential", "duration",
+                       "curriculum_pdf", "source_job_id"]
+                      + [c for c, _ in OFFERING_COLUMNS if c in DEEP_ONLY])
+
+
+def upsert_offering_listing(rows, db_path: str = SK_DB_PATH) -> int:
+    rows = [r for r in rows
+            if r.get("college_id") is not None and r.get("course_id") is not None]
+    with connect(db_path) as conn:
+        return _upsert(conn, "sk_offerings", OFFERING_LISTING_COLS,
+                       ["college_id", "course_id"], rows)
+
+
+def upsert_offering_deep(rows, db_path: str = SK_DB_PATH) -> int:
+    rows = [r for r in rows
+            if r.get("college_id") is not None and r.get("course_id") is not None]
+    with connect(db_path) as conn:
+        return _upsert(conn, "sk_offerings", OFFERING_DEEP_COLS,
+                       ["college_id", "course_id"], rows)
+
+
+def set_course_progress(college_id: int, status: str, pages: int = 0,
+                        found: int = 0, expected: Optional[int] = None,
+                        message: str = "", db_path: str = SK_DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO sk_course_progress"
+            "(college_id,status,pages,found,expected,message,updated_at) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(college_id) DO UPDATE SET "
+            "status=excluded.status,pages=excluded.pages,found=excluded.found,"
+            "expected=excluded.expected,message=excluded.message,"
+            "updated_at=excluded.updated_at",
+            (int(college_id), status, int(pages), int(found),
+             None if expected is None else int(expected), message[:500],
+             time.time()))
+
+
+def colleges_pending_courses(limit: int = 0, order: str = "value",
+                             db_path: str = SK_DB_PATH) -> List[Dict[str, Any]]:
+    """Self-draining phase Ⓒ queue.
+
+    Only colleges phase Ⓑ has already resolved: a college whose home page is
+    'gone' has no course listing either, and asking for one would spend a
+    request to be told so again. Default order is 'value' — most known offerings
+    first — so a run stopped by a budget has collected the courses that matter
+    rather than the numerically lowest ids."""
+    order_sql = ("(SELECT COUNT(*) FROM sk_offerings o WHERE o.college_id=c.college_id) DESC"
+                 if order == "value" else "c.college_id ASC")
+    sql = ("SELECT c.college_id, c.slug, c.url FROM sk_colleges c "
+           "JOIN sk_college_progress d ON d.college_id=c.college_id "
+           "                          AND d.status='done' "
+           "LEFT JOIN sk_course_progress p ON p.college_id=c.college_id "
+           "WHERE p.college_id IS NULL OR p.status NOT IN ('done','gone') "
+           f"ORDER BY {order_sql}")
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    with connect(db_path) as conn:
+        return [dict(r) for r in conn.execute(sql)]
+
+
+def offerings_pending_deep(limit: int = 0,
+                           db_path: str = SK_DB_PATH) -> List[Dict[str, Any]]:
+    """Courses whose per-course page has not been fetched. Requires the listing
+    pass first, because the per-course URL comes from it."""
+    sql = ("SELECT college_id, course_id, url FROM sk_offerings "
+           "WHERE deep_scraped_at IS NULL AND url IS NOT NULL AND url<>'' "
+           "ORDER BY college_id, course_id")
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    with connect(db_path) as conn:
+        return [dict(r) for r in conn.execute(sql)]
 
 
 # --------------------------------------------------------------------------- Ⓑ
@@ -588,6 +790,17 @@ def counts(db_path: str = SK_DB_PATH) -> Dict[str, int]:
             "college_base_courses": one("SELECT COUNT(*) FROM sk_college_base_courses"),
             "colleges_done": one("SELECT COUNT(*) FROM sk_college_progress "
                                  "WHERE status IN ('done','gone')"),
+            "course_listing_done": one("SELECT COUNT(*) FROM sk_course_progress "
+                                       "WHERE status IN ('done','gone')"),
+            "offerings_with_fees": one("SELECT COUNT(*) FROM sk_offerings "
+                                       "WHERE fees_amount IS NOT NULL"),
+            "offerings_listed": one("SELECT COUNT(*) FROM sk_offerings "
+                                    "WHERE listed_at IS NOT NULL"),
+            "offerings_deep": one("SELECT COUNT(*) FROM sk_offerings "
+                                  "WHERE deep_scraped_at IS NOT NULL"),
+            "offerings_with_spec": one("SELECT COUNT(*) FROM sk_offerings "
+                                       "WHERE specialization IS NOT NULL "
+                                       "AND specialization<>''"),
             "sitemaps_done": one("SELECT COUNT(*) FROM sk_sitemap_progress "
                                  "WHERE status='done'"),
         }

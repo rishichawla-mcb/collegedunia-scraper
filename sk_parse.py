@@ -390,6 +390,373 @@ def parse_all(state: Any, college_id: Any = None,
 
 
 # ---------------------------------------------------------------------------
+# Ⓒ  per-course rows
+#
+# Where this came from, and why the earlier reading was wrong
+# ----------------------------------------------------------
+# sk_api_probe.py said the /courses tab carried "the same tuples plus
+# totalCourses: 42, pageSize: 12, totalCourseCount: 0 — the actual course list
+# is fetched client-side AFTER hydration and is not in the HTML."
+#
+# That was an inference from a summary field, and it was WRONG. Measured in a
+# real browser on 2026-09-28 (college 72, /courses):
+#
+#   * the page issues ZERO requests to any api host. The only network calls are
+#     the document itself, Google Analytics, and a tracking beacon — before and
+#     after scrolling the page to the bottom. There is nothing to hydrate from.
+#   * __PRELOADED_STATE__.childPageData.courseTuples is a list of 12 REAL course
+#     rows — 50 keys each, `fees` a plain integer — and totalCourses is 42.
+#     `totalCourseCount: 0` is a filtered-result counter, not the list length;
+#     reading it as the list length is what produced the wrong conclusion.
+#   * childPageData.paginationData.nextUrls gives /courses-2 … /courses-4.
+#     Page 4 returns 6 rows: 12+12+12+6 = 42. The pages are plain server-
+#     rendered URLs, so no endpoint has to be found at all.
+#   * config.API_SERVER is "apis.shiksha.jsb9.net" — an internal host the
+#     browser never calls. There is no public API to piggyback on, which is why
+#     the probe's constructed candidates were never going to land.
+#
+# Grain: these rows are the ACTUAL courses, not the base-course groups in
+# sk_college_base_courses. "B.Des" there is one row with a fee range; here it is
+# five rows each with its own fee, seats and eligibility.
+COURSE_TUPLE_MARKER = "courseTuples"
+
+
+def find_listing(state: Any, depth: int = 0) -> Optional[Dict[str, Any]]:
+    """The node carrying `courseTuples`. Located by shape, like find_node, and
+    for the same reason: the obvious key is not where the data lives."""
+    if isinstance(state, dict):
+        if isinstance(state.get(COURSE_TUPLE_MARKER), list):
+            return state
+        if depth < 3:
+            for v in state.values():
+                got = find_listing(v, depth + 1)
+                if got is not None:
+                    return got
+    return None
+
+
+def _course_duration(t: Dict[str, Any]) -> str:
+    lo, hi = as_int(t.get("duration")), as_int(t.get("maxDuration"))
+    unit = t.get("durationUnit") or t.get("maxDurationUnit") or ""
+    if lo is None and hi is None:
+        return ""
+    if hi is None or hi == lo:
+        return f"{lo} {unit}".strip()
+    return f"{lo}-{hi} {unit}".strip()
+
+
+def parse_course_listing(state: Any, college_id: Any = None,
+                         job_id: Optional[int] = None) -> Dict[str, Any]:
+    """One /courses (or /courses-N) page → offering rows + the next page paths.
+
+    Returns {'offerings', 'courses', 'next_paths', 'total', 'page'}. `next_paths`
+    is what the runner follows; it is taken from the site's own paginationData
+    rather than constructed, so a college whose pagination stops early stops
+    here too instead of being probed for pages that do not exist."""
+    node = find_listing(state)
+    if node is None:
+        return {"offerings": [], "courses": [], "next_paths": [],
+                "total": None, "page": None}
+    # `listingId` first. The obvious-looking instituteTopCardData.instituteId
+    # does NOT exist — checked against NIT Trichy's listing, whose top card
+    # carries instituteName, h1, logoImageUrl … and no id at all. Reading it
+    # first worked only because the fallback caught it; leaving it there would
+    # have been a lookup that never fires pretending to be the primary source.
+    cid = as_int(node.get("listingId")) or as_int(college_id)
+    offerings: List[Dict[str, Any]] = []
+    courses: List[Dict[str, Any]] = []
+    seen = set()
+    for t in (node.get(COURSE_TUPLE_MARKER) or []):
+        if not isinstance(t, dict):
+            continue
+        course_id = as_int(t.get("courseId"))
+        # A tuple carrying another college's id is a cross-sell card, not an
+        # offering of THIS college. Dropping it here keeps the edge table
+        # honest; the listing page does carry such cards.
+        row_cid = as_int(t.get("instituteId")) or cid
+        if course_id is None or row_cid != cid or (cid, course_id) in seen:
+            continue
+        seen.add((cid, course_id))
+        exams = [e.get("name") or e.get("examName")
+                 for e in (t.get("exams") or []) if isinstance(e, dict)]
+        skills = [s.get("name") if isinstance(s, dict) else s
+                  for s in (t.get("skills") or [])]
+        url = text(t.get("url"), 400)
+        offerings.append({
+            "college_id": cid,
+            "course_id": course_id,
+            "url": url,
+            "course_slug": url.rsplit("/", 1)[-1] if url else "",
+            "course_name": text(t.get("name"), 300),
+            "fees_amount": as_int(t.get("fees")),
+            "fees_text": "",
+            "duration": _course_duration(t),
+            "level": text(dget(t, "courseLevel", "name")
+                          or t.get("courseLevel"), 40),
+            "exams": jlist([e for e in exams if e]),
+            "base_course_id": as_int(t.get("baseCourseId")),
+            "base_course_name": text(t.get("baseCourseName"), 200),
+            "total_seats": as_int(t.get("totalSeats")),
+            "median_salary": as_int(t.get("courseMedianSalary")),
+            "rating": as_float(t.get("courseRating")),
+            "rating_count": as_int(t.get("ratingCount")),
+            "money_rating": as_float(t.get("moneyRating")),
+            "scholarships_count": as_int(t.get("scholarshipsCount")),
+            # Percentages, not prose: the live tuple carries eligibilityXII=50
+            # and eligibilityGraduation=0. Stored as integers, matching
+            # sk_college_base_courses, so the two grains stay comparable.
+            "eligibility_x": as_int(t.get("eligibilityX")),
+            "eligibility_xii": as_int(t.get("eligibilityXII")),
+            "eligibility_grad": as_int(t.get("eligibilityGraduation")),
+            "eligibility_pg": as_int(t.get("eligibilityPostGraduation")),
+            "work_experience": text(t.get("workExpString"), 200),
+            "difficulty_level": text(t.get("difficultyLevel"), 60),
+            "skills": jlist([s for s in skills if s]),
+            "credential": text(dget(t, "credential", "name")
+                               or t.get("credential"), 60),
+            "is_online": 1 if t.get("isOnline") else 0,
+            "curriculum_pdf": text(t.get("curricullumPDF"), 400),
+            "intake_dates": jlist(t.get("intakeDates") or []),
+            "commencement_dates": jlist(t.get("courseCommencementDates") or []),
+            "admission_status": text(t.get("courseAdmissionStatus"), 60),
+            "shiksha_rank": as_int(t.get("shikshaRank")),
+            "exams_count": as_int(t.get("totalExamsCount")),
+            "institute_grade": text(t.get("instituteGrade"), 40),
+            "ranking": text(t.get("rankingString"), 200),
+            "source_job_id": job_id,
+        })
+        courses.append({
+            "course_id": course_id,
+            "slug": url.rsplit("/", 1)[-1] if url else "",
+            "name": text(t.get("name"), 300),
+            "level": text(dget(t, "courseLevel", "name") or t.get("courseLevel"), 40),
+            "duration": _course_duration(t),
+            "source_job_id": job_id,
+        })
+    pag = node.get("paginationData") or {}
+    nxt = [text(u.get("url"), 400) for u in (pag.get("nextUrls") or [])
+           if isinstance(u, dict) and u.get("url")]
+    return {"offerings": offerings, "courses": courses, "next_paths": nxt,
+            "total": as_int(node.get("totalCourses")),
+            "page": as_int(pag.get("currentPageNUmber"))}
+
+
+def parse_course_detail(state: Any, job_id: Optional[int] = None
+                        ) -> Optional[Dict[str, Any]]:
+    """One /course-<slug>-<id> page → the fields the LISTING cannot give.
+
+    Measured on college 72 / course 306967: the listing has no specialization,
+    no course level, no delivery method and only a single `fees` number, while
+    courseData here carries specializationName ("Fashion Design"),
+    entryCourseTypeInformation.hierarchy[].specialization_id (183),
+    course_level ({id:14,name:'UG'}), credential, educationType ("Full Time"),
+    deliveryMethod ("Classroom"), mediumOfInstruction, and a fee BREAKDOWN
+    (totalFees 19,40,000 + oneTimePayment 75,000, with a currency and a year).
+
+    This costs one request per course — 144 KB measured — so it is a separate
+    pass, not part of the listing crawl."""
+    cd = state.get("courseData") if isinstance(state, dict) else None
+    if not isinstance(cd, dict) or as_int(cd.get("courseId")) is None:
+        return None
+    ent = cd.get("entryCourseTypeInformation") or {}
+    hier = (ent.get("hierarchy") or [{}])[0] if isinstance(ent, dict) else {}
+    hier = hier if isinstance(hier, dict) else {}
+    fees = cd.get("courseFees") or {}
+    fblock = dget(fees, "fees", default={}) or {}
+    elig = cd.get("eligibility") or {}
+    xii = elig.get("twelthDetails") or {}
+    struct = cd.get("courseStructure") or {}
+    seats = cd.get("seatsData") or {}
+    plc = cd.get("placements") or {}
+    aff = cd.get("affiliationData") or {}
+    media = [m.get("name") if isinstance(m, dict) else m
+             for m in (cd.get("mediumOfInstruction") or [])]
+    return {
+        "college_id": as_int(cd.get("instituteId")),
+        "course_id": as_int(cd.get("courseId")),
+        "course_name": text(cd.get("courseName"), 300),
+        "base_course_name": text(cd.get("baseCourseName"), 200),
+        # ---- taxonomy -----------------------------------------------------
+        "specialization": text(cd.get("specializationName"), 200),
+        "specialization_id": as_int(hier.get("specialization_id")),
+        "substream": text(cd.get("substreamName"), 200),
+        "substream_id": as_int(hier.get("substream_id")),
+        "stream_id": as_int(hier.get("stream_id")),
+        "course_level": text(dget(ent, "course_level", "name"), 40),
+        "credential": text(dget(ent, "credential", "name"), 60),
+        "education_type": text(dget(cd, "educationType", "name"), 60),
+        "delivery_method": text(dget(cd, "deliveryMethod", "name"), 60),
+        "medium": jlist([m for m in media if m]),
+        "duration": (f"{as_int(cd.get('durationValue'))} "
+                     f"{cd.get('durationUnit') or ''}".strip()
+                     if as_int(cd.get("durationValue")) is not None else ""),
+        "course_type": text(cd.get("courseType"), 60),
+        "institute_type": text(cd.get("instituteType"), 60),
+        "course_variant": as_int(cd.get("courseVariant")),
+        "is_course_paid": 1 if cd.get("isCoursePaid") else 0,
+        "nzqf": text(dget(cd, "nzqfCategorization", "name"), 120),
+        # ---- fees ---------------------------------------------------------
+        # Every money figure is a CATEGORY-KEYED map ({general: {value,…}}), so
+        # the map is stored whole and `general` is broken out for querying.
+        # Measured across a private design college, a private B-school and NIT
+        # Trichy: only `general` is ever populated — and NIT's own description
+        # says that one number covers "OPEN/OPEN-PWD/OPEN-EWS/OBC-NCL/OBC-PWD/
+        # ICCR/DASA(CIWG)". The prose is therefore not decoration, it is the
+        # qualification the number lacks, which is why every *_note is stored.
+        "fees_total": as_int(dget(fblock, "totalFees", "general", "value")),
+        "fees_onetime": as_int(dget(fblock, "oneTimePayment", "general", "value")),
+        "fees_hostel": as_int(dget(fblock, "hostelFees", "general", "value")),
+        "fees_deposit": as_int(dget(fblock, "deposit", "general", "value")),
+        "fees_other": as_int(fblock.get("otherFees")),
+        "fees_total_json": _jmap(fblock.get("totalFees")),
+        "fees_onetime_json": _jmap(fblock.get("oneTimePayment")),
+        "fees_hostel_json": _jmap(fblock.get("hostelFees")),
+        "fees_deposit_json": _jmap(fblock.get("deposit")),
+        "fees_period_json": _jmap(fblock.get("fees")),
+        "fees_period_type": text(fblock.get("periodType"), 40),
+        "fees_includes": jlist([t_ for t_ in (fblock.get("totalIncludes") or [])
+                                if t_]),
+        "fees_categories": _jmap(fees.get("categoryNameMapping")),
+        "fees_location_json": _jmap(fees.get("locationWiseFees")),
+        "fees_year": as_int(fees.get("year")),
+        "fees_currency": text(fees.get("feesUnitName"), 8),
+        "fees_note": text(fees.get("description"), 600),
+        "fees_hostel_note": text(fees.get("hostelDescription"), 600),
+        "fees_onetime_note": text(fees.get("otpDescription"), 600),
+        "fees_deposit_note": text(fees.get("depositDescription"), 600),
+        "fees_brochure_url": text(fees.get("feesBrochureUrl"), 400),
+        # ---- eligibility --------------------------------------------------
+        # categoryWiseScores DOES populate: NIT Trichy asks 75% general, 65% SC,
+        # 65% ST. So the category-keyed shape is real and used — it is the fee
+        # maps specifically that collapse to `general`, not the schema.
+        "elig_year": as_int(elig.get("year")),
+        "elig_x_json": _jmap(elig.get("tenthDetails")),
+        "elig_xii_json": _jmap(xii),
+        "elig_grad_json": _jmap(elig.get("graduationDetails")),
+        "elig_pg_json": _jmap(elig.get("postGraduationDetails")),
+        "elig_xii_general": as_int(dget(xii, "categoryWiseScores", "general",
+                                        "score")),
+        "elig_xii_scores": _jmap(xii.get("categoryWiseScores")),
+        "elig_xii_score_type": text(xii.get("scoreType"), 40),
+        "elig_exams_json": _exams(elig.get("exams")),
+        "elig_min_workex": as_int(elig.get("minWorkEx")),
+        "elig_max_workex": as_int(elig.get("maxWorkEx")),
+        "elig_min_age": as_int(elig.get("minAge")),
+        "elig_max_age": as_int(elig.get("maxAge")),
+        "elig_backlogs": as_int(elig.get("numberofBacklog")),
+        "elig_note": text(elig.get("description"), 2000),
+        "elig_intl_note": text(elig.get("internationalDescription"), 1000),
+        # ---- structure, admission, seats ----------------------------------
+        "curriculum_pdf": text(struct.get("curriculumPdfUrl"), 400),
+        "course_period": text(struct.get("period"), 60),
+        "period_courses_json": _jmap(struct.get("periodWiseCourses")),
+        "admission_steps": _steps(cd.get("admissionProcess")),
+        "seats_total": as_int(seats.get("totalSeats")),
+        "seats_category_json": _jmap(seats.get("categoryWiseSeats")),
+        "seats_exam_json": _jmap(seats.get("examWiseSeats")),
+        "seats_domicile_json": _jmap(seats.get("domicileWiseSeats")),
+        # ---- placements ---------------------------------------------------
+        # `course_type` says WHAT the figure describes. At college 72 it is
+        # "substreamId" — the salary belongs to the substream, not to this one
+        # course. Storing the grain beside the number is the difference between
+        # a usable figure and a misleading one.
+        "placement_grain": text(plc.get("course_type"), 40),
+        "placement_batch_year": as_int(plc.get("batch_year")),
+        "placement_pct": as_float(plc.get("percentage_batch_placed")),
+        "salary_avg": as_int(plc.get("avg_salary")),
+        "salary_median": as_int(plc.get("median_salary")),
+        "salary_max": as_int(plc.get("max_salary")),
+        "salary_min": as_int(plc.get("min_salary")),
+        "salary_currency": text(plc.get("salary_unit_name"), 8),
+        "placement_report_url": text(plc.get("report_url"), 400),
+        "internships_available": (1 if plc.get("is_internship_available")
+                                  else (0 if plc.get("is_internship_available")
+                                        is not None else None)),
+        "recruiters": jlist([r.get("companyName") for r
+                             in (cd.get("recruitmentCompanies") or [])
+                             if isinstance(r, dict) and r.get("companyName")],
+                            limit=40),
+        # ---- affiliation, highlights, dates --------------------------------
+        "affiliation_university_id": as_int(aff.get("universityId")),
+        "affiliation_name": text(aff.get("name"), 200),
+        "affiliation_url": text(aff.get("url"), 400),
+        "affiliation_scope": text(aff.get("scope"), 40),
+        "highlights": jlist([h.get("description") if isinstance(h, dict) else h
+                             for h in (cd.get("highlights") or [])], limit=20,
+                            item_cap=400),
+        "important_dates_json": _dates(cd.get("importantDates")),
+        "source_job_id": job_id,
+    }
+
+
+def _jmap(o: Any, limit: int = 4000) -> str:
+    """Store a nested block whole, or '' when it is empty.
+
+    '' rather than '{}' on purpose: the upsert preserves a stored value when the
+    incoming one is blank, so an empty block must read as "nothing to say" and
+    not overwrite what an earlier run captured."""
+    if o in (None, {}, []):
+        return ""
+    try:
+        return json.dumps(o, ensure_ascii=False, separators=(",", ":"))[:limit]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _exams(exams: Any) -> str:
+    """The accepted-exam block, keyed `exam:<id>`, reduced to what is useful:
+    the exam, and the cutoffs it carries per category."""
+    if not isinstance(exams, dict):
+        return ""
+    out = []
+    for v in exams.values():
+        if not isinstance(v, dict):
+            continue
+        out.append({"id": as_int(v.get("examId")),
+                    "name": text(v.get("examName"), 120),
+                    "scoreType": text(v.get("scoreType"), 40),
+                    "scores": v.get("categoryWiseScores") or {},
+                    "cutoff": v.get("cutOffData") or v.get("cutoff") or {}})
+    return _jmap(out)
+
+
+def _steps(proc: Any) -> str:
+    """`admissionProcess` is keyed "1","2","3" — an ORDERED list wearing a dict.
+    Sorting numerically keeps the steps in the order a candidate follows."""
+    if not isinstance(proc, dict):
+        return ""
+    try:
+        keys = sorted(proc, key=lambda k: int(k))
+    except Exception:  # noqa: BLE001
+        keys = sorted(proc)
+    out = [{"step": k, "name": text(proc[k].get("admissionName"), 120),
+            "description": text(proc[k].get("description"), 800)}
+           for k in keys if isinstance(proc.get(k), dict)]
+    return _jmap(out)
+
+
+def _dates(blk: Any) -> str:
+    """The dated events, flattened out of `entityWiseDates`'s bucket keys."""
+    if not isinstance(blk, dict):
+        return ""
+    out = []
+    for bucket in (blk.get("entityWiseDates") or {}).values():
+        for ev in (bucket or []):
+            if not isinstance(ev, dict):
+                continue
+            out.append({"name": text(ev.get("eventName"), 160),
+                        "type": text(ev.get("type"), 40),
+                        "examId": as_int(ev.get("examId")),
+                        "start": [as_int(ev.get("startYear")),
+                                  as_int(ev.get("startMonth")),
+                                  as_int(ev.get("startDate"))],
+                        "end": [as_int(ev.get("endYear")),
+                                as_int(ev.get("endMonth")),
+                                as_int(ev.get("endDate"))]})
+    return _jmap(out)
+
+
+# ---------------------------------------------------------------------------
 # CLI — check the parser against a real saved payload before trusting it
 # ---------------------------------------------------------------------------
 def _main(path: str) -> int:

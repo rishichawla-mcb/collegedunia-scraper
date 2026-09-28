@@ -230,8 +230,8 @@ def render() -> None:
     m[3].metric("Universities", f"{c['universities']:,}")
     m[4].metric("Sitemaps done", f"{c['sitemaps_done']:,}")
 
-    tab_a, tab_b, tab_data, tab_hist = st.tabs(
-        ["Ⓐ Discovery", "Ⓑ College detail", "Data", "History"])
+    tab_a, tab_b, tab_c, tab_data, tab_hist = st.tabs(
+        ["Ⓐ Discovery", "Ⓑ College detail", "Ⓒ Courses", "Data", "History"])
 
     # ----------------------------------------------------------------- Ⓐ
     with tab_a:
@@ -347,13 +347,134 @@ def render() -> None:
                         "Collegedunia comparison.")
             st.dataframe(cat, use_container_width=True, hide_index=True)
 
+    # ----------------------------------------------------------------- Ⓒ/Ⓓ
+    with tab_c:
+        st.subheader("Ⓒ Course listing — one row per ACTUAL course")
+        st.caption(
+            "Phase Ⓑ reads `baseCourseTuples`, which are grouped **by base "
+            "course**: one *B.Des* row whose fee range covers every B.Des the "
+            "college runs. This walks `/courses` and `/courses-2…` — 12 courses "
+            "a page, following the site's own `paginationData` — and writes "
+            "**fees as a number**, duration, seats, exams, eligibility, median "
+            "salary, skills and admission status, per course.")
+        st.info(
+            "**No API is involved.** Loading `/courses` in a real browser and "
+            "scrolling it to the bottom produces zero requests to any api host — "
+            "the rows are already in `__PRELOADED_STATE__.childPageData."
+            "courseTuples`. The earlier note that the list was 'fetched "
+            "client-side after hydration' read `totalCourseCount: 0` as the list "
+            "length; it is a filtered counter. Measured live on 2026-09-28.",
+            icon="🔎")
+
+        g = st.columns(4)
+        left_c = len(sk_db.colleges_pending_courses())
+        g[0].metric("Colleges pending", f"{left_c:,}")
+        g[1].metric("Colleges listed", f"{c['course_listing_done']:,}")
+        g[2].metric("Course rows with fees", f"{c['offerings_with_fees']:,}")
+        g[3].metric("of offerings", f"{c['offerings']:,}")
+
+        if not c["colleges_with_detail"]:
+            st.info("Run phase Ⓑ first — phase Ⓒ only asks for the courses of a "
+                    "college whose home page it has already resolved.")
+        else:
+            k1, k2, k3 = st.columns(3)
+            conc_c = k1.number_input("Parallel workers", 1, 12, 4, key="skc_conc")
+            budget_c = k2.number_input("Bandwidth budget (MB, 0 = none)", 0,
+                                       40000, 0, step=250, key="skc_mb")
+            max_c = k3.number_input("Max colleges (0 = all)", 0, 100000, 0,
+                                    step=500, key="skc_max")
+            est_pages = max(left_c, int(c["offerings"] / 12) + left_c)
+            st.caption(
+                f"≈**{est_pages:,} pages** for the {left_c:,} colleges left "
+                f"≈ **{est_pages*155/1048576:,.1f} GB** at the measured "
+                f"155 KB/page.")
+            if st.button("▶️ Run course listing", type="primary", key="skc_run"):
+                jid = sk_db.create_job("courses", _cfg(
+                    concurrency=int(conc_c), budget_mb=float(budget_c),
+                    max_colleges=int(max_c)))
+                _launch(jid)
+                st.success(f"Started course listing — job #{jid}")
+                time.sleep(1)
+                st.rerun()
+            _job_monitor("c")
+
+        st.divider()
+        st.subheader("Ⓓ Course detail — specialization and the fee breakdown")
+        st.caption(
+            "One request **per course** — 89 top-level keys on the page, of "
+            "which 75 are stored. Adds what the listing has not got: "
+            "specialization + id, stream/substream ids, level (UG/PG), "
+            "credential, education type, delivery method, medium; the full fee "
+            "**breakdown** — tuition, one-time payment, hostel, deposit, other, "
+            "what the total includes, the fee year, the brochure, and the prose "
+            "that qualifies each figure; eligibility including **category-wise "
+            "class-XII cutoffs** and per-exam cutoffs; the ordered admission "
+            "steps; seats by category/exam/domicile; placements with the "
+            "**grain** of the salary figure; recruiters; the affiliating "
+            "university; highlights; and dated events.")
+        st.info(
+            "**Two things worth knowing before you use the numbers.** (1) Every "
+            "fee is a *category-keyed* map, but across a private design "
+            "college, a private B-school and NIT Trichy only `general` is ever "
+            "populated — NIT's own note says that one figure covers "
+            "OPEN/OPEN-PWD/OPEN-EWS/OBC-NCL/OBC-PWD, which is why the prose is "
+            "stored beside the number. The whole map is kept anyway, so a "
+            "college that does publish SC/ST figures will not lose them. "
+            "(2) `placement_grain` says what the salary describes — at college "
+            "72 it is `substreamId` (the substream, not this course); at NIT "
+            "Trichy it is `clientCourse`.", icon="⚖️")
+        d = st.columns(3)
+        d[0].metric("Courses enriched", f"{c['offerings_deep']:,}")
+        d[1].metric("With a specialization", f"{c['offerings_with_spec']:,}")
+        d[2].metric("Listed, not yet enriched",
+                    f"{max(0, c['offerings_listed'] - c['offerings_deep']):,}")
+        st.warning(
+            f"At the measured 144 KB each, all {c['offerings']:,} offerings "
+            f"would be ≈**{c['offerings']*144/1048576:,.0f} GB**. Use a cap and "
+            f"let it drain across several runs.", icon="💸")
+        if not c["offerings_listed"]:
+            st.info("Run phase Ⓒ first — it is what supplies the per-course URL.")
+        else:
+            e1, e2, e3 = st.columns(3)
+            conc_d = e1.number_input("Parallel workers", 1, 12, 4, key="skd_conc")
+            budget_d = e2.number_input("Bandwidth budget (MB, 0 = none)", 0,
+                                       60000, 2000, step=250, key="skd_mb")
+            max_d = e3.number_input("Max courses (0 = all)", 0, 500000, 5000,
+                                    step=1000, key="skd_max")
+            if st.button("▶️ Run course detail", key="skdd_run"):
+                jid = sk_db.create_job("course_detail", _cfg(
+                    concurrency=int(conc_d), budget_mb=float(budget_d),
+                    max_courses=int(max_d)))
+                _launch(jid)
+                st.success(f"Started course detail — job #{jid}")
+                time.sleep(1)
+                st.rerun()
+            _job_monitor("d")
+
+        if c["offerings_with_fees"]:
+            with sk_db.connect() as conn:
+                sample = pd.read_sql_query(
+                    "SELECT college_id, course_id, course_name, base_course_name,"
+                    "       specialization, course_level, duration, total_seats,"
+                    "       fees_amount, fees_total, fees_onetime, fees_hostel,"
+                    "       fees_other, fees_year, elig_xii_general,"
+                    "       placement_grain, placement_pct, salary_max,"
+                    "       affiliation_name FROM sk_offerings "
+                    "WHERE fees_amount IS NOT NULL "
+                    "ORDER BY fees_amount DESC LIMIT 25", conn)
+            st.markdown("**Per-course rows** — the grain phase Ⓑ could not reach. "
+                        "A blank `specialization` means phase Ⓓ has not reached "
+                        "that course yet, not that it has none.")
+            st.dataframe(sample, use_container_width=True, hide_index=True)
+
     # -------------------------------------------------------------- Data
     with tab_data:
         st.subheader("Data")
         which = st.selectbox(
             "Table", ["sk_colleges", "sk_offerings", "sk_courses",
                       "sk_universities", "sk_college_aliases",
-                      "sk_sitemap_progress", "sk_college_progress"],
+                      "sk_sitemap_progress", "sk_college_progress",
+                      "sk_course_progress"],
             key="skd_tbl")
         with sk_db.connect() as conn:
             n = conn.execute(f"SELECT COUNT(*) FROM {which}").fetchone()[0]
