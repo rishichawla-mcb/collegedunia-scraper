@@ -50,8 +50,14 @@ from typing import Any, Dict, List, Optional
 # rows.
 NODE_MARKERS = ("instituteTopCardData", "baseCourseTuples")
 
-MAX_TEXT = 4000          # cap on any single stored text field
-MAX_LIST = 40            # cap on any stored list
+# Caps, tuned against the real payload on 2026-09-28. The first pass stored
+# 6.7 KB per college — 379 MB over 57,751, against ~900 MB free on a disk the
+# Collegedunia data is still growing into. Most of the excess was prose:
+# `description` and `admission_text` came back as near-duplicates of each other,
+# and a "highlight" turned out to be a paragraph about institutional memberships.
+MAX_TEXT = 1500          # cap on any single stored text field
+MAX_LIST = 30            # cap on any stored list
+MAX_ITEM = 200           # cap on one item inside a stored list
 
 
 # ---------------------------------------------------------------------------
@@ -98,11 +104,41 @@ def dget(obj: Any, *keys, default=None):
     return default if cur is None else cur
 
 
-def jlist(values: List[Any], limit: int = MAX_LIST) -> str:
-    """A compact JSON list, capped. Empty list stores as '' so the
-    preserve_nonempty upsert treats it as absent rather than as a value."""
-    vals = [v for v in values if v not in (None, "")][:limit]
+def jlist(values: List[Any], limit: int = MAX_LIST,
+          item_cap: int = MAX_ITEM) -> str:
+    """A compact JSON list, capped per item and in length. Empty list stores as
+    '' so the preserve_nonempty upsert treats it as absent, not as a value."""
+    vals = []
+    for v in values:
+        if v in (None, ""):
+            continue
+        vals.append(str(v)[:item_cap] if isinstance(v, str) else v)
+        if len(vals) >= limit:
+            break
     return json.dumps(vals, ensure_ascii=False, separators=(",", ":")) if vals else ""
+
+
+def first_text(obj: Any, *keys, limit: int = MAX_TEXT) -> str:
+    """The first of several candidate keys that holds something.
+
+    Contact details are a 15-key bag whose spelling is not documented, so the
+    parser tries the plausible names rather than betting on one. The CLI prints
+    the raw bag, so a key we do not yet know shows up as data instead of as a
+    silently empty column."""
+    if not isinstance(obj, dict):
+        return ""
+    for k in keys:
+        v = obj.get(k)
+        if v not in (None, "", [], {}):
+            return text(v, limit)
+    return ""
+
+
+def _same_prose(a: str, b: str, n: int = 120) -> bool:
+    """True when two text fields are the same piece of prose."""
+    if not a or not b:
+        return False
+    return a[:n].strip().lower() == b[:n].strip().lower()
 
 
 def find_node(state: Any, depth: int = 0) -> Optional[Dict[str, Any]]:
@@ -181,6 +217,9 @@ def parse_college(state: Any, college_id: Any = None,
             if nm and nm not in exams:
                 exams.append(str(nm))
 
+    admission = text(dget(node, "admissionData", "admissionDetails"))
+    desc = text(node.get("description"))
+
     rankings = []
     for r in (top.get("rankingData") or []):
         if isinstance(r, dict):
@@ -201,14 +240,29 @@ def parse_college(state: Any, college_id: Any = None,
         "state_id": as_int(loc.get("state_id")),
         "locality": text(loc.get("locality_name"), 120),
         "country_id": as_int(node.get("countryId")),
-        "address": text(contact.get("address") or contact.get("full_address"), 600),
-        "website": text(contact.get("website") or contact.get("url"), 300),
-        "phone": text(contact.get("phone") or contact.get("mobile"), 120),
-        "email": text(contact.get("email"), 200),
+        "address": first_text(contact, "address", "full_address", "address1",
+                              "street_address", "addressLine1", limit=600),
+        "website": first_text(contact, "website", "web_site", "websiteUrl",
+                              "url", "site_url", "homepage", "web", limit=300),
+        "phone": first_text(contact, "phone", "phone_no", "phoneNumber",
+                            "mobile", "contact_no", "contactNumber", "telephone",
+                            "landline", limit=120),
+        "email": first_text(contact, "email", "email_id", "emailId",
+                            "email_address", limit=200),
         "logo": text(top.get("logoImageUrl"), 400),
-        "rating": as_float(rev.get("rating") or rev.get("averageRating")),
-        "reviews_count": as_int(rev.get("count") or rev.get("reviewCount")
-                                or node.get("reviewCount")),
+        # 4.518181822516701 is false precision — two decimals is all the site
+        # itself displays, and it keeps the content hash from churning on
+        # floating-point noise between refreshes.
+        "rating": (lambda v: round(v, 2) if v is not None else None)(
+            as_float(rev.get("rating") or rev.get("averageRating"))),
+        # The two counts disagree (`reviewCount` 6 vs "24 Student Reviews" in the
+        # meta description), so keep the larger: a count that undercounts is
+        # worse than one that includes every review type.
+        "reviews_count": max([x for x in (as_int(rev.get("count")),
+                                          as_int(rev.get("reviewCount")),
+                                          as_int(node.get("reviewCount")))
+                              if x is not None] or [None],
+                             key=lambda x: (x is not None, x)),
         "questions_count": as_int(node.get("anaCountString")),
         "photo_count": as_int(top.get("photoCount")),
         "video_count": as_int(top.get("videoCount")),
@@ -222,11 +276,15 @@ def parse_college(state: Any, college_id: Any = None,
         "streams": jlist(streams),
         "accepted_exams": jlist(exams),
         "rankings": jlist([r for r in rankings if r]),
-        "admission_text": text(dget(node, "admissionData", "admissionDetails"), 3000),
+        "admission_text": admission,
         "admission_updated": text(dget(node, "admissionData", "admissionPostedDate"), 40),
-        "description": text(node.get("description"), 4000),
-        "meta_title": text(seo.get("metaTitle"), 300),
-        "meta_description": text(seo.get("metaDescription"), 600),
+        # `description` and `admissionDetails` come back as near-duplicates —
+        # same opening sentence, same content. Storing both doubles the biggest
+        # text column for nothing, so the description is dropped when it merely
+        # repeats the admission text.
+        "description": "" if _same_prose(desc, admission) else desc,
+        "meta_title": text(seo.get("metaTitle"), 200),
+        "meta_description": text(seo.get("metaDescription"), 400),
         "canonical_url": text(seo.get("canonicalUrl") or node.get("seoUrl"), 400),
         "tab_urls": jlist(sorted((node.get("childPageToUrls") or {}).keys())
                           if isinstance(node.get("childPageToUrls"), dict) else []),
@@ -350,6 +408,27 @@ def _main(path: str) -> int:
               f"fees {b['min_fees']}–{b['max_fees']}  {b['duration']:<10} "
               f"{b['level']:<4} seats={b['total_seats']} covers={b['course_count']} "
               f"exams={b['exams'][:40]}")
+    node = find_node(state) or {}
+    contact = dget(node, "currentLocation", "contact_details", default={})
+    print(f"\nraw contact_details keys: {sorted(contact) if isinstance(contact, dict) else contact}")
+    if isinstance(contact, dict):
+        for k, v in list(contact.items())[:15]:
+            print(f"   {k:<22} {str(v)[:70]}")
+    rev = dget(node, "instituteTopCardData", "reviewDetails", default={})
+    print(f"raw reviewDetails: {rev}")
+
+    nofee = [b for b in bcs if b["min_fees"] is None and b["max_fees"] is None]
+    print(f"\nbase courses with NO fee range: {len(nofee)}/{len(bcs)}"
+          + (f"  ({', '.join(b['name'] for b in nofee)})" if nofee else ""))
+    wide = [b for b in bcs if (b.get("course_count") or 0) > 3]
+    if wide:
+        names = ", ".join("{}x{}".format(b["name"], b["course_count"])
+                          for b in wide)
+        print("base courses covering >3 actual courses: "
+              "{}/{}  ({})".format(len(wide), len(bcs), names))
+    else:
+        print("base courses covering >3 actual courses: 0/{}".format(len(bcs)))
+
     print(f"\ncatalogue rows: {len(cat)} -> "
           f"{[(c['base_course_id'], c['name']) for c in cat][:10]}")
     total = len(json.dumps(col, ensure_ascii=False)) + \
