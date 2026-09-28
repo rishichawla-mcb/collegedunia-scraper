@@ -748,22 +748,35 @@ def render_system_bar() -> None:
         la1, la5, la15 = os.getloadavg()
     except Exception:
         la1 = la5 = la15 = None
-    # Count running jobs across EVERY vertical, not just the domestic one. The
-    # counter used to read db.jobs only, so a Course Finder or Study Abroad job
-    # showed "Active jobs 0" while it was plainly running.
+    # Count running jobs across EVERY vertical, not just the domestic one.
+    #
+    # This was a hardcoded list — ("sa_db", "cf_db") — and Shiksha was added to
+    # the app without being added here, so a Shiksha job read "Active jobs 0"
+    # while it was plainly running. That is the SECOND time this counter has told
+    # the same lie: the comment it replaced records the first, when Course Finder
+    # and Study Abroad were missing from it.
+    #
+    # So it now asks the vertical REGISTRY instead of a list someone has to
+    # remember to update. Every vertical already declares `list_jobs` for orphan
+    # recovery, and a vertical that registers itself is counted for free.
     running = 0
     try:
         running += sum(1 for j in db.list_jobs(40)
                        if j["status"] in ("running", "queued"))
     except Exception:  # noqa: BLE001
         pass
-    for _mod, _fn in (("sa_db", "list_jobs"), ("cf_db", "list_jobs")):
-        try:
-            _m = __import__(_mod)
-            running += sum(1 for j in getattr(_m, _fn)(40)
-                           if (j.get("status") or "") in ("running", "queued"))
-        except Exception:  # noqa: BLE001
-            pass
+    try:
+        import vertical_base as _vb
+        for _v in _vb.all_verticals():
+            if not _v.list_jobs:
+                continue
+            try:
+                running += sum(1 for j in (_v.list_jobs(40) or [])
+                               if (j.get("status") or "") in ("running", "queued"))
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
     threads = threading.active_count()
     cores = os.cpu_count() or 1
     uptime = now - _proc_start_time()
