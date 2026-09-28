@@ -454,6 +454,13 @@ USAGE = """usage:
 
 
 def main(argv: List[str]) -> int:
+    # sk_db.connect() opens the file; it does not create anything. The
+    # sk_matches table ships in sk_db.SCHEMA, but SCHEMA is only applied by
+    # init_db(), and nothing here was calling it — so a correctly deployed
+    # schema still produced "no such table" after several minutes of matching
+    # work. init_db() is idempotent (CREATE TABLE IF NOT EXISTS throughout) and
+    # also adds any phase Ⓑ columns a database predating them is missing.
+    sk_db.init_db()
     cmd = argv[0] if argv else "report"
     if cmd == "build":
         return build()
