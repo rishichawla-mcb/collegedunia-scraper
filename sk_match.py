@@ -74,6 +74,29 @@ JUNK_SITE_DOMAINS = JUNK_DOMAINS | {
     "instagram.com", "blogspot.com", "wordpress.com", "wixsite.com",
 }
 
+# Evidence strength, strongest first. This is the ONLY thing that may decide a
+# pair's `tier`, and it exists because scores are not comparable across tiers.
+#
+# The bug it fixes (found 2026-09-28, reproduced before being fixed): `add()`
+# replaced the tier whenever a later tier scored higher. A website match with
+# 2-3 candidates scores 0.9; a name match can score 0.97. So the pair
+#
+#   CD "Indian Institute of Technology Bombay" <-> SK "Indian Institute of
+#   Technology Bombay", agreeing on BOTH iitb.ac.in and the name
+#
+# was stored as tier='name' — the weakest label — while the far weaker pair
+#
+#   CD "IIT Bombay" <-> SK "Shailesh J Mehta School of Management", sharing
+#   only the domain, name_jaccard 0.1
+#
+# kept tier='website'. The column was inverted for exactly the pairs that
+# mattered most, so `WHERE tier='website'` returned the weak one and missed the
+# strong one. The evidence was never lost (it was in `also`), but the headline
+# label — the one the report groups by and a consumer would filter on — was
+# wrong, which defeats the whole point of recording which evidence produced a
+# match.
+TIER_RANK = {"website": 5, "phone": 4, "email": 3, "shortform": 2, "name": 1}
+
 ACCEPT_NAME = 0.85      # name+city similarity accepted without judgement
 JUDGE_FLOOR = 0.45      # below this, not even worth a judgement
 SHORTFORM_MIN = 3       # "IIT" yes, "IT" no — two letters collide constantly
@@ -286,20 +309,27 @@ def build(db_path: str = None) -> int:
             matches[key] = {"score": score, "tier": tier, "verdict": verdict,
                             "evidence": ev}
             return
-        # Keep the strongest score, but never LOSE the weaker evidence: a pair
-        # agreeing on website AND phone AND name is a different claim from one
-        # agreeing on name alone, and the fixture showed the earlier version
-        # silently discarding the shortform agreement when the name scored
-        # higher. `also` is what makes a match auditable afterwards.
+        # Never LOSE the weaker evidence: a pair agreeing on website AND phone
+        # AND name is a different claim from one agreeing on name alone.
         merged = dict(prev["evidence"])
         merged.update(ev)
         also = set(merged.get("also") or [])
         also.add(prev["tier"])
         also.add(tier)
+        # `tier` follows TIER_RANK, never the score. See the note on TIER_RANK:
+        # ranking by score relabelled the strongest matches as the weakest.
+        if TIER_RANK.get(tier, 0) > TIER_RANK.get(prev["tier"], 0):
+            prev["tier"] = tier
+        # `score` stays the best across all the evidence — a pair agreeing on
+        # two things is more confident than one agreeing on either alone — so
+        # `tier` names the strongest EVIDENCE and `score` is the confidence.
         if score > prev["score"]:
-            prev["score"], prev["tier"], prev["verdict"] = score, tier, verdict
-        elif prev["verdict"] == "pending" and verdict == "yes":
-            prev["verdict"] = verdict          # stronger evidence resolves it
+            prev["score"] = score
+        # A verdict is never downgraded. Once any evidence says 'yes' the pair
+        # is accepted; weaker evidence arriving later cannot push it back into
+        # the judgement queue.
+        if verdict == "yes":
+            prev["verdict"] = "yes"
         merged["also"] = sorted(also - {prev["tier"]})
         prev["evidence"] = merged
 
