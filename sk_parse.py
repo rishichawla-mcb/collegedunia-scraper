@@ -134,8 +134,15 @@ def first_text(obj: Any, *keys, limit: int = MAX_TEXT) -> str:
     return ""
 
 
-def _same_prose(a: str, b: str, n: int = 120) -> bool:
-    """True when two text fields are the same piece of prose."""
+def _same_prose(a: str, b: str, n: int = 60) -> bool:
+    """True when two text fields are the same piece of prose.
+
+    60 characters, not 120: on the college sampled, `description` and
+    `admissionDetails` share an opening of ~78 characters and then diverge
+    ("...UCEED 2027 exami" vs "...Find other lates"). A 120-char window missed
+    the duplicate entirely and the drop never fired. Both texts open with the
+    college's own name, so 60 characters is still specific enough not to
+    collide across colleges."""
     if not a or not b:
         return False
     return a[:n].strip().lower() == b[:n].strip().lower()
@@ -240,29 +247,29 @@ def parse_college(state: Any, college_id: Any = None,
         "state_id": as_int(loc.get("state_id")),
         "locality": text(loc.get("locality_name"), 120),
         "country_id": as_int(node.get("countryId")),
-        "address": first_text(contact, "address", "full_address", "address1",
-                              "street_address", "addressLine1", limit=600),
-        "website": first_text(contact, "website", "web_site", "websiteUrl",
-                              "url", "site_url", "homepage", "web", limit=300),
-        "phone": first_text(contact, "phone", "phone_no", "phoneNumber",
-                            "mobile", "contact_no", "contactNumber", "telephone",
-                            "landline", limit=120),
-        "email": first_text(contact, "email", "email_id", "emailId",
-                            "email_address", limit=200),
+        # Confirmed against the live payload 2026-09-28. The admission contact
+        # is preferred over the generic one because the generic pair came back
+        # empty on the college sampled; both are tried, in that order.
+        "address": first_text(contact, "address", "full_address", limit=600),
+        "website": first_text(contact, "website_url", "website", limit=300),
+        "phone": first_text(contact, "admission_contact_number",
+                            "generic_contact_number", limit=120),
+        "email": first_text(contact, "admission_email", "generic_email",
+                            limit=200),
+        "latitude": as_float(contact.get("latitude")),
+        "longitude": as_float(contact.get("longitude")),
         "logo": text(top.get("logoImageUrl"), 400),
         # 4.518181822516701 is false precision — two decimals is all the site
         # itself displays, and it keeps the content hash from churning on
         # floating-point noise between refreshes.
         "rating": (lambda v: round(v, 2) if v is not None else None)(
-            as_float(rev.get("rating") or rev.get("averageRating"))),
-        # The two counts disagree (`reviewCount` 6 vs "24 Student Reviews" in the
-        # meta description), so keep the larger: a count that undercounts is
-        # worse than one that includes every review type.
-        "reviews_count": max([x for x in (as_int(rev.get("count")),
-                                          as_int(rev.get("reviewCount")),
-                                          as_int(node.get("reviewCount")))
-                              if x is not None] or [None],
-                             key=lambda x: (x is not None, x)),
+            as_float(rev.get("averageRating") or rev.get("rating"))),
+        # `reviewDetails.totalCount` (24) is the real figure — it matches the
+        # page's own "Read 24 Student Reviews". `node.reviewCount` (6) counts
+        # something narrower and reading it as the review count understated
+        # every college by 4x. Aggregate counts only; no review text, no authors.
+        "reviews_count": as_int(rev.get("totalCount")) or as_int(rev.get("count")),
+        "reviews_verified": as_int(rev.get("verifiedCount")),
         "questions_count": as_int(node.get("anaCountString")),
         "photo_count": as_int(top.get("photoCount")),
         "video_count": as_int(top.get("videoCount")),
@@ -431,10 +438,17 @@ def _main(path: str) -> int:
 
     print(f"\ncatalogue rows: {len(cat)} -> "
           f"{[(c['base_course_id'], c['name']) for c in cat][:10]}")
-    total = len(json.dumps(col, ensure_ascii=False)) + \
+    def _values_bytes(d):
+        return sum(len(str(v)) for v in d.values() if v not in (None, ""))
+
+    total = _values_bytes(col) + sum(_values_bytes(b) for b in bcs)
+    with_keys = len(json.dumps(col, ensure_ascii=False)) + \
         sum(len(json.dumps(b, ensure_ascii=False)) for b in bcs)
-    print(f"\nstored size for this college: {total/1024:,.1f} KB "
+    print(f"\nstored size for this college: {total/1024:,.1f} KB of VALUES "
           f"-> {total*57751/1024/1024:,.0f} MB for 57,751 colleges")
+    print(f"   (as JSON with key names it is {with_keys/1024:,.1f} KB, but "
+          f"SQLite stores columns, not key names — the earlier 378 MB figure "
+          f"was that inflated number.)")
     return 0
 
 

@@ -267,6 +267,8 @@ DETAIL_COLUMNS = [
     ("admission_updated", "TEXT"), ("description", "TEXT"),
     ("meta_title", "TEXT"), ("meta_description", "TEXT"),
     ("canonical_url", "TEXT"), ("tab_urls", "TEXT"),
+    ("latitude", "REAL"), ("longitude", "REAL"),
+    ("reviews_verified", "INTEGER"),
 ]
 
 
@@ -396,8 +398,8 @@ COLLEGE_DETAIL_COLS = [
     "flagship_course_id", "parent_university", "affiliations", "facilities",
     "recruiters", "highlights", "streams", "accepted_exams", "rankings",
     "admission_text", "admission_updated", "description", "meta_title",
-    "meta_description", "canonical_url", "tab_urls", "detail_scraped_at",
-    "scraped_at", "source_job_id",
+    "meta_description", "canonical_url", "tab_urls", "latitude", "longitude",
+    "reviews_verified", "detail_scraped_at", "scraped_at", "source_job_id",
 ]
 
 BASE_COURSE_COLS = ["base_course_id", "name", "level", "scraped_at",

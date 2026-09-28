@@ -56,15 +56,23 @@ def node_for(cid: int, name: str, tuples):
             "instituteSpecificationType": "College",
             "logoImageUrl": "https://img/logo.jpg",
             "photoCount": 24, "videoCount": 23,
-            "reviewDetails": {"rating": 4.4, "count": 16},
+            "reviewDetails": {"averageRating": 4.518181822516701,
+                              "totalCount": 24, "verifiedCount": 22},
             "affiliationData": [{"name": "University of Rajasthan"}],
             "parentUniversityData": None, "rankingData": [],
         },
         "currentLocation": {"city_name": "Jaipur", "state_name": "Rajasthan",
                             "city_id": 109, "state_id": 121,
+                            # the REAL key spellings, read off the live payload
+                            # 2026-09-28 — the fixture must not test a shape the
+                            # site does not actually send
                             "contact_details": {"address": "9, Govind Marg",
-                                                "website": "archedu.org",
-                                                "phone": "+91-141"}},
+                                                "website_url": "https://archedu.org/",
+                                                "admission_contact_number": "9414070678",
+                                                "admission_email": "a@archedu.org",
+                                                "generic_email": "",
+                                                "latitude": "26.85",
+                                                "longitude": "75.80"}},
         "seoData": {"metaTitle": "T", "metaDescription": "D",
                     "canonicalUrl": f"/college/x-{cid}"},
         "facilityInfo": [{"facilityName": "Design Studio"}],
@@ -237,6 +245,16 @@ bcs = sk_parse.parse_base_courses(state)
 cat = sk_parse.parse_catalogue(state)
 check("node found by SHAPE, past the empty `instituteData` decoy",
       col is not None and col["college_id"] == 72, col)
+check("contact details read from the real key names",
+      (col["website"], col["phone"], col["email"])
+      == ("https://archedu.org/", "9414070678", "a@archedu.org"),
+      (col["website"], col["phone"], col["email"]))
+check("geo coordinates captured",
+      (col["latitude"], col["longitude"]) == (26.85, 75.80), col["latitude"])
+check("review count is totalCount (24), not the narrower reviewCount (6)",
+      col["reviews_count"] == 24, col["reviews_count"])
+check("rating rounded to 2dp, not stored at full float precision",
+      col["rating"] == 4.52, col["rating"])
 check("name, city, state, ownership picked up",
       (col["name"], col["city"], col["state"], col["ownership"])
       == ("Arch College", "Jaipur", "Rajasthan", "Private"), col)
