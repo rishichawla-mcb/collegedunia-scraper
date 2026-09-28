@@ -249,6 +249,28 @@ CREATE TABLE IF NOT EXISTS sk_college_base_courses (
 );
 CREATE INDEX IF NOT EXISTS sk_idx_cbc_base ON sk_college_base_courses(base_course_id);
 CREATE INDEX IF NOT EXISTS sk_idx_cbc_fees ON sk_college_base_courses(min_fees);
+
+-- Collegedunia college  <->  Shiksha college.
+-- Lives in the SHIKSHA database on purpose: the Collegedunia file stays
+-- untouched, so a bad matching run can be dropped by deleting this one table.
+-- `tier` records WHICH evidence produced the pair, because "these two are the
+-- same college" is a claim of very different strength depending on whether it
+-- came from a shared website domain or from two names looking alike.
+CREATE TABLE IF NOT EXISTS sk_matches (
+    cd_college_id INTEGER,
+    sk_college_id INTEGER,
+    score         REAL,
+    tier          TEXT,     -- website|phone|email|shortform|name
+    evidence      TEXT,     -- JSON: the signals that agreed, and their values
+    verdict       TEXT,     -- yes | no | pending
+    decided_by    TEXT,     -- auto | judge | human
+    note          TEXT,
+    decided_at    REAL,
+    PRIMARY KEY (cd_college_id, sk_college_id)
+);
+CREATE INDEX IF NOT EXISTS sk_idx_match_sk  ON sk_matches(sk_college_id);
+CREATE INDEX IF NOT EXISTS sk_idx_match_v   ON sk_matches(verdict);
+CREATE INDEX IF NOT EXISTS sk_idx_match_t   ON sk_matches(tier);
 """
 
 # Columns phase Ⓑ adds to sk_colleges. `CREATE TABLE IF NOT EXISTS` does nothing

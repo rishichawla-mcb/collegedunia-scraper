@@ -1,0 +1,473 @@
+"""
+Collegedunia college  <->  Shiksha college, matched on EVIDENCE, tier by tier.
+
+    python sk_match.py build            # compute and store candidate matches
+    python sk_match.py report           # what was matched, by tier and strength
+    python sk_match.py export [n]       # write the ambiguous band for judging
+    python sk_match.py apply <file>     # read judged verdicts back in
+    python sk_match.py verify [n]       # fetch live pages to settle a sample
+
+The brief was "every comparison goes through your brain". Two honest limits on
+that, stated before the design rather than after:
+
+**1. Nothing on Render can call a model.** The deployed app has no API key and no
+model access. A judged comparison therefore either goes out to an LLM API (a key
+and a bill someone has to agree to) or comes back through this conversation in
+batches. This tool supports both by writing the ambiguous band to a file and
+reading verdicts back — `export` then `apply`.
+
+**2. Judging all of it is the wrong thing to want.** 20,646 x 57,751 is 1.2
+billion pairs. Even after blocking, most pairs do not need judgement: when both
+sites publish the SAME WEBSITE DOMAIN for a college, that is not a similarity
+score, it is the institution telling you its own identity. No model improves on
+it. Reasoning is worth spending where the evidence is genuinely ambiguous, and
+that band is what `export` produces.
+
+So the tiers below run cheapest-and-strongest first, and each match records which
+evidence produced it — because "these are the same college" means something very
+different when it comes from a shared domain than from two names looking alike.
+
+  tier 1  website domain   both sites publish the same registrable domain
+  tier 2  phone            same last-10 digits
+  tier 3  email domain     same domain in the contact email
+  tier 4  shortform+city   both publish the abbreviation (IIT-B, AIIMS...) and agree on city
+  tier 5  name+city        token-set similarity, the weakest signal
+          --------         below the accept line: exported for judgement
+
+Tiers 1-3 need phase Ⓑ data on the Shiksha side (website/phone/email come from
+the detail crawl), so their reach grows as that crawl progresses. `report` says
+how much of the inventory each tier could even see.
+
+Writes only `sk_matches`, in the Shiksha database. The Collegedunia file is never
+opened for writing.
+"""
+from __future__ import annotations
+
+BUILD = "2026-09-28a"
+
+import json
+import re
+import sys
+import time
+from collections import Counter, defaultdict
+from typing import Any, Dict, List, Set, Tuple
+
+import db as _core
+import sk_db
+
+STOP = {"of", "the", "and", "for", "in", "at", "a", "an", "s"}
+_NON = re.compile(r"[^a-z0-9]+")
+_ID_SUFFIX = re.compile(r"-\d+$")
+_DIGITS = re.compile(r"\D+")
+
+# Free email/domain hosts carry no identity: a college using gmail tells you
+# nothing about which college it is, and matching on it would merge thousands.
+JUNK_DOMAINS = {
+    "gmail.com", "yahoo.com", "yahoo.co.in", "hotmail.com", "outlook.com",
+    "rediffmail.com", "live.com", "aol.com", "icloud.com", "protonmail.com",
+    "googlemail.com", "ymail.com", "mail.com",
+}
+# Aggregator/CDN domains a college page may cite that are not the college.
+JUNK_SITE_DOMAINS = JUNK_DOMAINS | {
+    "shiksha.com", "collegedunia.com", "facebook.com", "wikipedia.org",
+    "google.com", "youtube.com", "linkedin.com", "twitter.com", "x.com",
+    "instagram.com", "blogspot.com", "wordpress.com", "wixsite.com",
+}
+
+ACCEPT_NAME = 0.85      # name+city similarity accepted without judgement
+JUDGE_FLOOR = 0.45      # below this, not even worth a judgement
+SHORTFORM_MIN = 3       # "IIT" yes, "IT" no — two letters collide constantly
+
+
+# ---------------------------------------------------------------------------
+# normalisation
+# ---------------------------------------------------------------------------
+def tokens(*parts: str) -> Set[str]:
+    out: Set[str] = set()
+    for p in parts:
+        if not p:
+            continue
+        for t in _NON.split(str(p).lower()):
+            if t and t not in STOP and not t.isdigit():
+                out.add(t)
+    return out
+
+
+def slug_tokens(slug: str) -> Set[str]:
+    return tokens(_ID_SUFFIX.sub("", slug or ""))
+
+
+def jaccard(a: Set[str], b: Set[str]) -> float:
+    return len(a & b) / len(a | b) if a and b else 0.0
+
+
+def domain(url_or_email: Any) -> str:
+    """The registrable-ish domain, lowercased, `www.` stripped.
+
+    Deliberately crude — no public-suffix list — because the failure mode that
+    matters is merging two different colleges, and that is guarded by the junk
+    list, not by suffix precision."""
+    s = str(url_or_email or "").strip().lower()
+    if not s:
+        return ""
+    if "@" in s:
+        s = s.rsplit("@", 1)[-1]
+    s = re.sub(r"^[a-z]+://", "", s)
+    s = s.split("/")[0].split("?")[0].split(":")[0]
+    if s.startswith("www."):
+        s = s[4:]
+    return s if "." in s and len(s) > 4 else ""
+
+
+def phone_key(v: Any) -> str:
+    """Last 10 digits. India's numbers are 10 long; the country code and any
+    0/+91/(0) prefix vary by who typed it in."""
+    d = _DIGITS.sub("", str(v or ""))
+    return d[-10:] if len(d) >= 10 else ""
+
+
+def shortform_key(v: Any) -> str:
+    s = _NON.sub("", str(v or "").lower())
+    return s if len(s) >= SHORTFORM_MIN else ""
+
+
+# ---------------------------------------------------------------------------
+# loading
+# ---------------------------------------------------------------------------
+class Side:
+    def __init__(self) -> None:
+        self.name: Dict[int, str] = {}
+        self.city: Dict[int, str] = {}
+        self.toks: Dict[int, Set[str]] = {}
+        self.site: Dict[int, str] = {}
+        self.phone: Dict[int, str] = {}
+        self.email: Dict[int, str] = {}
+        self.short: Dict[int, str] = {}
+
+
+def load_cd() -> Side:
+    """Union of both domestic tables. `colleges` holds 453 institutions the
+    directory has never seen (IIT Bombay among them) — the 2026-09-18 finding —
+    so either table alone would under-count the left-hand side."""
+    s = Side()
+    with _core.connect() as conn:
+        try:
+            for cid, nm, sf, city in conn.execute(
+                    "SELECT college_id, COALESCE(name,''), COALESCE(short_form,''), "
+                    "COALESCE(city,'') FROM colleges_directory"):
+                cid = int(cid)
+                s.name[cid] = nm
+                s.city[cid] = city
+                if sf:
+                    s.short[cid] = shortform_key(sf)
+        except Exception as err:  # noqa: BLE001
+            print(f"   ! colleges_directory: {str(err)[:70]}")
+        try:
+            for cid, nm, sf, city, web, mail, ph in conn.execute(
+                    "SELECT college_id, COALESCE(name,''), COALESCE(short_form,''), "
+                    "COALESCE(city,''), COALESCE(website,''), COALESCE(email,''), "
+                    "COALESCE(phone,'') FROM colleges"):
+                cid = int(cid)
+                if len(nm) > len(s.name.get(cid, "")):
+                    s.name[cid] = nm
+                if city and not s.city.get(cid):
+                    s.city[cid] = city
+                if sf and not s.short.get(cid):
+                    s.short[cid] = shortform_key(sf)
+                d = domain(web)
+                if d and d not in JUNK_SITE_DOMAINS:
+                    s.site[cid] = d
+                e = domain(mail)
+                if e and e not in JUNK_DOMAINS:
+                    s.email[cid] = e
+                p = phone_key(ph)
+                if p:
+                    s.phone[cid] = p
+        except Exception as err:  # noqa: BLE001
+            print(f"   ! colleges: {str(err)[:70]}")
+    for cid, nm in s.name.items():
+        s.toks[cid] = tokens(nm, s.city.get(cid, ""))
+    return s
+
+
+def load_sk() -> Side:
+    s = Side()
+    with sk_db.connect() as conn:
+        for (cid, slug, nm, short, city, web, mail, ph) in conn.execute(
+                "SELECT college_id, COALESCE(slug,''), COALESCE(name,''), "
+                "COALESCE(short_name,''), COALESCE(city,''), COALESCE(website,''), "
+                "COALESCE(email,''), COALESCE(phone,'') FROM sk_colleges"):
+            cid = int(cid)
+            s.name[cid] = nm or slug
+            s.city[cid] = city
+            # name+city where phase Ⓑ has reached; the slug otherwise. The slug
+            # already contains the city, so the two forms are comparable.
+            s.toks[cid] = tokens(nm, city) if nm else slug_tokens(slug)
+            if short:
+                k = shortform_key(short)
+                # Shiksha repeats the full name in short_name when there is no
+                # real abbreviation; that is not a short form.
+                if k and k != shortform_key(nm):
+                    s.short[cid] = k
+            d = domain(web)
+            if d and d not in JUNK_SITE_DOMAINS:
+                s.site[cid] = d
+            e = domain(mail)
+            if e and e not in JUNK_DOMAINS:
+                s.email[cid] = e
+            p = phone_key(ph)
+            if p:
+                s.phone[cid] = p
+    return s
+
+
+# ---------------------------------------------------------------------------
+# matching
+# ---------------------------------------------------------------------------
+class Index:
+    """Blocking on the rarest token. A pair sharing no token cannot reach the
+    threshold, so nothing reachable is skipped by only considering pairs that
+    share one."""
+
+    def __init__(self, toks: Dict[int, Set[str]]):
+        self.toks = toks
+        self.idx: Dict[str, List[int]] = defaultdict(list)
+        self.df: Counter = Counter()
+        for i, t in toks.items():
+            for w in t:
+                self.idx[w].append(i)
+                self.df[w] += 1
+
+    def best(self, q: Set[str], cap: int = 600) -> Tuple[int, float]:
+        if not q:
+            return (0, 0.0)
+        best_i, best_j, seen = 0, 0.0, set()
+        for w in sorted(q, key=lambda w: self.df.get(w, 0))[:3]:
+            for i in self.idx.get(w, ()):
+                if i in seen:
+                    continue
+                seen.add(i)
+                j = jaccard(q, self.toks[i])
+                if j > best_j:
+                    best_i, best_j = i, j
+            if len(seen) > cap:
+                break
+        return (best_i, best_j)
+
+
+def _invert(d: Dict[int, str]) -> Dict[str, List[int]]:
+    out: Dict[str, List[int]] = defaultdict(list)
+    for k, v in d.items():
+        if v:
+            out[v].append(k)
+    return out
+
+
+def build(db_path: str = None) -> int:
+    print(f"Collegedunia x Shiksha matcher [BUILD {BUILD}]")
+    cd, sk = load_cd(), load_sk()
+    print("\n1. Populations and signal reach")
+    print(f"   Collegedunia colleges : {len(cd.name):,}")
+    print(f"   Shiksha colleges      : {len(sk.name):,}")
+    for label, a, b in (("website domain", cd.site, sk.site),
+                        ("phone", cd.phone, sk.phone),
+                        ("email domain", cd.email, sk.email),
+                        ("short form", cd.short, sk.short)):
+        print(f"   {label:<15} known for {len(a):>7,} CD / {len(b):>7,} SK")
+    print("   (the Shiksha side of the top three grows as phase Ⓑ progresses)")
+
+    matches: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+    def add(cdi: int, ski: int, tier: str, score: float, ev: Dict[str, Any],
+            verdict: str):
+        key = (cdi, ski)
+        prev = matches.get(key)
+        if prev is None:
+            matches[key] = {"score": score, "tier": tier, "verdict": verdict,
+                            "evidence": ev}
+            return
+        # Keep the strongest score, but never LOSE the weaker evidence: a pair
+        # agreeing on website AND phone AND name is a different claim from one
+        # agreeing on name alone, and the fixture showed the earlier version
+        # silently discarding the shortform agreement when the name scored
+        # higher. `also` is what makes a match auditable afterwards.
+        merged = dict(prev["evidence"])
+        merged.update(ev)
+        also = set(merged.get("also") or [])
+        also.add(prev["tier"])
+        also.add(tier)
+        if score > prev["score"]:
+            prev["score"], prev["tier"], prev["verdict"] = score, tier, verdict
+        elif prev["verdict"] == "pending" and verdict == "yes":
+            prev["verdict"] = verdict          # stronger evidence resolves it
+        merged["also"] = sorted(also - {prev["tier"]})
+        prev["evidence"] = merged
+
+    # ---- tiers 1-3: identity the institutions publish about themselves ----
+    for tier, cdmap, skmap in (("website", cd.site, sk.site),
+                               ("phone", cd.phone, sk.phone),
+                               ("email", cd.email, sk.email)):
+        inv = _invert(skmap)
+        hits = 0
+        for cdi, val in cdmap.items():
+            cands = inv.get(val) or []
+            # A domain shared by many Shiksha rows is a university's rows, or
+            # junk we failed to list. Either way it is not identifying.
+            if not cands or len(cands) > 3:
+                continue
+            for ski in cands:
+                nj = jaccard(cd.toks.get(cdi, set()), sk.toks.get(ski, set()))
+                add(cdi, ski, tier, 1.0 if len(cands) == 1 else 0.9,
+                    {tier: val, "name_jaccard": round(nj, 2)}, "yes")
+                hits += 1
+        print(f"\n2.{tier:<9} matched {hits:,} pairs")
+
+    # ---- tier 4: abbreviations, which both sites publish ----
+    inv_short = _invert(sk.short)
+    hits = 0
+    for cdi, sf in cd.short.items():
+        for ski in (inv_short.get(sf) or [])[:8]:
+            if cd.city.get(cdi) and sk.city.get(ski):
+                if tokens(cd.city[cdi]) & tokens(sk.city[ski]):
+                    add(cdi, ski, "shortform", 0.95,
+                        {"short_form": sf, "city": cd.city[cdi]}, "yes")
+                    hits += 1
+    print(f"2.shortform matched {hits:,} pairs")
+
+    # ---- tier 5: names, the weakest signal ----
+    idx = Index(sk.toks)
+    acc = judge = 0
+    for cdi, t in cd.toks.items():
+        ski, j = idx.best(t)
+        if not ski or j < JUDGE_FLOOR:
+            continue
+        if j >= ACCEPT_NAME:
+            add(cdi, ski, "name", j, {"name_jaccard": round(j, 2)}, "yes")
+            acc += 1
+        else:
+            add(cdi, ski, "name", j, {"name_jaccard": round(j, 2)}, "pending")
+            judge += 1
+    print(f"2.name      accepted {acc:,} (>= {ACCEPT_NAME}), "
+          f"{judge:,} sent for judgement ({JUDGE_FLOOR}-{ACCEPT_NAME})")
+
+    now = time.time()
+    rows = [(cdi, ski, m["score"], m["tier"],
+             json.dumps(m["evidence"], ensure_ascii=False), m["verdict"],
+             "auto", None, now)
+            for (cdi, ski), m in matches.items()]
+    with sk_db.connect() as conn:
+        conn.executemany(
+            "INSERT INTO sk_matches(cd_college_id,sk_college_id,score,tier,"
+            "evidence,verdict,decided_by,note,decided_at) VALUES(?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(cd_college_id,sk_college_id) DO UPDATE SET "
+            "score=excluded.score, tier=excluded.tier, evidence=excluded.evidence, "
+            "verdict=CASE WHEN sk_matches.decided_by IN ('judge','human') "
+            "  THEN sk_matches.verdict ELSE excluded.verdict END, "
+            "decided_at=excluded.decided_at", rows)
+    print(f"\n3. wrote {len(rows):,} candidate pairs to sk_matches")
+    print("   (a verdict already set by a judge or a human is never overwritten)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+def report() -> int:
+    cd_n = len(load_cd().name)
+    with sk_db.connect() as conn:
+        print(f"Match report [BUILD {BUILD}]\n")
+        print("by tier and verdict:")
+        for r in conn.execute(
+                "SELECT tier, verdict, COUNT(*), ROUND(AVG(score),3) "
+                "FROM sk_matches GROUP BY tier, verdict ORDER BY 3 DESC"):
+            print(f"   {r[0]:<11} {r[1]:<8} {r[2]:>8,}  avg score {r[3]}")
+        yes_cd = conn.execute(
+            "SELECT COUNT(DISTINCT cd_college_id) FROM sk_matches "
+            "WHERE verdict='yes'").fetchone()[0]
+        pend = conn.execute("SELECT COUNT(*) FROM sk_matches "
+                            "WHERE verdict='pending'").fetchone()[0]
+        dupe = conn.execute(
+            "SELECT COUNT(*) FROM (SELECT sk_college_id FROM sk_matches "
+            "WHERE verdict='yes' GROUP BY sk_college_id HAVING COUNT(*)>1)"
+        ).fetchone()[0]
+        print(f"\nCollegedunia colleges with >=1 accepted match: "
+              f"{yes_cd:,} / {cd_n:,} ({100.0*yes_cd/max(1,cd_n):.1f}%)")
+        print(f"awaiting judgement                           : {pend:,}")
+        print(f"Shiksha colleges claimed by >1 Collegedunia row: {dupe:,}")
+        if dupe:
+            print("   ^ these are conflicts and need resolving before the")
+            print("     match set is used for anything.")
+    return 0
+
+
+def export(limit: int = 300, path: str = "/data/sk_judge.jsonl") -> int:
+    """The ambiguous band, smallest file that still carries the evidence."""
+    cd, sk = load_cd(), load_sk()
+    n = 0
+    with sk_db.connect() as conn, open(path, "w", encoding="utf-8") as fh:
+        for cdi, ski, score, ev in conn.execute(
+                "SELECT cd_college_id, sk_college_id, score, evidence "
+                "FROM sk_matches WHERE verdict='pending' "
+                "ORDER BY score DESC LIMIT ?", (int(limit),)):
+            fh.write(json.dumps({
+                "cd_id": cdi, "sk_id": ski, "score": round(score, 3),
+                "cd": {"name": cd.name.get(cdi, ""), "city": cd.city.get(cdi, ""),
+                       "site": cd.site.get(cdi, ""), "short": cd.short.get(cdi, "")},
+                "sk": {"name": sk.name.get(ski, ""), "city": sk.city.get(ski, ""),
+                       "site": sk.site.get(ski, ""), "short": sk.short.get(ski, "")},
+            }, ensure_ascii=False) + "\n")
+            n += 1
+    print(f"wrote {n:,} pairs to {path}")
+    print("Judge each one and write back a file of "
+          '{"cd_id":…,"sk_id":…,"verdict":"yes|no","note":"…"}, then:')
+    print("   python sk_match.py apply <file>")
+    return 0
+
+
+def apply_verdicts(path: str) -> int:
+    now, n = time.time(), 0
+    with sk_db.connect() as conn, open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            v = str(d.get("verdict", "")).lower()
+            if v not in ("yes", "no"):
+                continue
+            conn.execute(
+                "UPDATE sk_matches SET verdict=?, decided_by='judge', note=?, "
+                "decided_at=? WHERE cd_college_id=? AND sk_college_id=?",
+                (v, str(d.get("note", ""))[:300], now,
+                 int(d["cd_id"]), int(d["sk_id"])))
+            n += 1
+    print(f"applied {n:,} judged verdicts")
+    return 0
+
+
+USAGE = """usage:
+  python sk_match.py build
+  python sk_match.py report
+  python sk_match.py export [n] [path]
+  python sk_match.py apply <file>"""
+
+
+def main(argv: List[str]) -> int:
+    cmd = argv[0] if argv else "report"
+    if cmd == "build":
+        return build()
+    if cmd == "report":
+        return report()
+    if cmd == "export":
+        n = int(argv[1]) if len(argv) > 1 else 300
+        p = argv[2] if len(argv) > 2 else "/data/sk_judge.jsonl"
+        return export(n, p)
+    if cmd == "apply" and len(argv) > 1:
+        return apply_verdicts(argv[1])
+    print(USAGE)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -39,7 +39,7 @@ BUILD = "2026-09-25a"
 import random
 import sys
 import time
-from typing import Optional, Tuple
+from typing import Optional
 from urllib.parse import urlparse, urlunparse
 
 import requests

@@ -256,14 +256,19 @@ def main() -> int:
     rm = Matcher(cd_toks)
     r_strict = r_loose = 0
     sk_only: List[Tuple[int, str, float]] = []
+    # Kept, not recomputed: section 5 needs exactly this set, and matching
+    # 57,751 rows a second time would double the runtime for nothing.
+    unmatched_sk: Set[int] = set()
     for cid, t in sk_toks.items():
         rid, j = rm.best(t, LOOSE)
         if j >= STRICT:
             r_strict += 1
         if j >= LOOSE:
             r_loose += 1
-        elif len(sk_only) < 15:
-            sk_only.append((cid, sk_slugs.get(cid, ""), j))
+        else:
+            unmatched_sk.add(cid)
+            if len(sk_only) < 15:
+                sk_only.append((cid, sk_slugs.get(cid, ""), j))
     sn = len(sk_toks)
     print(f"   exact token match  (>= {STRICT:.2f}) : {r_strict:,}/{sn:,} "
           f"({100.0*r_strict/sn:.1f}%)")
@@ -280,8 +285,7 @@ def main() -> int:
         no_off = {r[0] for r in conn.execute(
             "SELECT c.college_id FROM sk_colleges c WHERE NOT EXISTS "
             "(SELECT 1 FROM sk_offerings o WHERE o.college_id=c.college_id)")}
-    only_ids = {cid for cid, t in sk_toks.items()
-                if rm.best(t, LOOSE)[1] < LOOSE}
+    only_ids = unmatched_sk
 
     def profile(ids, label):
         b = Counter()
