@@ -389,7 +389,14 @@ def fetch_bytes(client: Client, url: str, label: str,
             if client.adaptive:
                 client.adaptive.on_success()
             if client.verbose:
-                client.log(f"   · GET …{url[-46:]} → {len(raw)//1024} KB")
+                # Both numbers, labelled. `len(raw)` is the DECOMPRESSED body
+                # and _wire() is what actually crossed the socket — they differ
+                # by ~5.7x on Shiksha. Logging only the first invites the reader
+                # to multiply it by 57,751 and conclude the crawl needs 40 GB
+                # when the real figure is 7. (Job 7's log showed "714 KB" per
+                # college while its own byte counter averaged 125 KB.)
+                client.log(f"   · GET …{url[-46:]} → {_wire(resp)//1024} KB wire"
+                           f" / {len(raw)//1024} KB unzipped")
             return raw
         # curl_cffi's RequestsError subclasses OSError, and requests'
         # RequestException subclasses IOError, so one clause covers both stacks.

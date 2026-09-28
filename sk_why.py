@@ -105,10 +105,25 @@ def main(argv) -> int:
         ago(j.get("started_at")), ago(j.get("updated_at"))))
     print("  pid %s · stop_requested %s" % (j.get("pid"), j.get("stop_requested")))
 
-    # Rate from the row itself. NOT from finished_at: on a reaped job that is
-    # when the reaper NOTICED, not when work stopped — reading it as the end
-    # time produced a 28.5h ETA on 2026-09-26 when the real figure was 5.6h.
-    span = float(j.get("updated_at") or 0) - float(j.get("started_at") or 0)
+    # When did work actually STOP? Not finished_at — on a reaped job that is
+    # when the reaper noticed (reading it as the end time produced a 28.5h ETA
+    # on 2026-09-26 when the real figure was 5.6h). And not updated_at either:
+    # the reaper finalises the row with update_job(), which stamps updated_at
+    # with the reap time, so a job killed by a deploy reads as "last update 73s
+    # ago" hours after it died. The last LOG line is the only timestamp nothing
+    # rewrites afterwards.
+    last_work = None
+    with sk_db.connect() as conn:
+        try:
+            last_work = conn.execute(
+                "SELECT MAX(ts) FROM sk_logs WHERE job_id=?", (jid,)).fetchone()[0]
+        except Exception:  # noqa: BLE001
+            pass
+    if last_work:
+        print("  last work  %s   (the newest log line; updated_at above can be "
+              "the reaper's own stamp)" % ago(last_work))
+    span = (float(last_work or j.get("updated_at") or 0)
+            - float(j.get("started_at") or 0))
     if span > 0 and done:
         rate = done / span
         # Print per minute below 0.5/s: "0.00 colleges/s" beside a non-zero ETA
@@ -118,6 +133,15 @@ def main(argv) -> int:
         print("  rate       %s over %s of work" % (shown, dur(span)))
     else:
         rate = 0.0
+
+    # Cost per unit from the job's OWN counters rather than a constant. The
+    # byte counter is WIRE bytes; the per-GET line in the crawl log prints the
+    # decompressed body, which is ~5.7x larger on Shiksha. Multiplying the log
+    # figure by the queue size overstates the crawl by that factor.
+    kb_each = ((j.get("bytes_count") or 0) / 1024.0 / done) if done else 0.0
+    if kb_each:
+        print("  cost       %.0f KB wire per unit (measured by this job)"
+              % kb_each)
 
     print("\nqueue state (the truth, independent of any job row)")
     with sk_db.connect() as conn:
@@ -136,7 +160,7 @@ def main(argv) -> int:
     print("  %-10s %s colleges still pending" % ("Ⓑ left", f"{left_b:,}"))
     if rate:
         print("  %-10s ≈%s at the rate above, ≈%.1f GB" % (
-            "Ⓑ eta", dur(left_b / rate), left_b * 171 / 1048576))
+            "Ⓑ eta", dur(left_b / rate), left_b * (kb_each or 171) / 1048576))
     try:
         left_c = len(sk_db.colleges_pending_courses())
         print("  %-10s %s colleges ready for phase Ⓒ" % ("Ⓒ left", f"{left_c:,}"))
