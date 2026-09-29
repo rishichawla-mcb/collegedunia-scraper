@@ -475,6 +475,9 @@ def build(db_path: str = None) -> int:
     # otherwise the report's totals quietly exceed what the build produced and
     # the arithmetic stops adding up. This is how the non-determinism above was
     # caught: 22,599 written, 22,604 counted.
+    # Record WHEN, so `report` can separate this build's rows from an earlier
+    # build's exactly, instead of guessing with a time window.
+    sk_db.set_setting("last_match_build_at", now)
     with sk_db.connect() as conn:
         stale = conn.execute("SELECT COUNT(*) FROM sk_matches WHERE decided_at < ?",
                              (now,)).fetchone()[0]
@@ -490,34 +493,44 @@ def report() -> int:
     cd_n = len(load_cd().name)
     with sk_db.connect() as conn:
         print(f"Match report [BUILD {BUILD}]\n")
-        print("by tier and verdict:")
+        # Every figure below describes the LATEST build only. Rows an earlier
+        # build wrote and this one did not re-emit are kept (nothing is deleted)
+        # but counted separately, because mixing them makes the report describe
+        # a match set that was never produced by any single run. That is not
+        # hypothetical: after the cap and tokeniser fixes the build wrote 21,715
+        # pairs while the table held 23,100, and the mixture showed website=9,982
+        # against a build that had matched 9,523 — and coverage RISING when the
+        # fixes had removed matches.
+        cut = float(sk_db.get_setting("last_match_build_at") or 0)
+        where = "decided_at >= ?" if cut else "1=1"
+        args = (cut,) if cut else ()
+        print("by tier and verdict (latest build only):")
         total = 0
         for r in conn.execute(
                 "SELECT tier, verdict, COUNT(*), ROUND(AVG(score),3) "
-                "FROM sk_matches GROUP BY tier, verdict ORDER BY 3 DESC"):
+                f"FROM sk_matches WHERE {where} "
+                "GROUP BY tier, verdict ORDER BY 3 DESC", args):
             print(f"   {r[0]:<11} {r[1]:<8} {r[2]:>8,}  avg score {r[3]}")
             total += r[2]
-        # Print the total. Its absence is what let 22,599-written / 22,604-stored
-        # go unnoticed until someone added the column up by hand.
-        last = conn.execute("SELECT MAX(decided_at) FROM sk_matches").fetchone()[0]
-        fresh = conn.execute("SELECT COUNT(*) FROM sk_matches WHERE decided_at >= ?",
-                             (float(last or 0) - 60,)).fetchone()[0]
         print(f"   {'TOTAL':<11} {'':<8} {total:>8,}")
-        if fresh and fresh != total:
-            print(f"   ! only {fresh:,} of these came from the latest build; "
-                  f"{total - fresh:,} are leftovers from an earlier one.")
-            print(f"     They are kept, not deleted. To see them:")
-            print(f"     SELECT * FROM sk_matches WHERE decided_at < "
-                  f"{float(last or 0) - 60:.0f}")
+        stored = conn.execute("SELECT COUNT(*) FROM sk_matches").fetchone()[0]
+        if stored != total:
+            print(f"   ({stored - total:,} further row(s) from an earlier build "
+                  f"are stored but excluded here — kept, not deleted:")
+            print(f"    SELECT * FROM sk_matches WHERE decided_at < {cut:.0f})")
+        if not cut:
+            print("   ! no build timestamp recorded — run `build` once so the "
+                  "report can tell this build's rows from an earlier one.")
         yes_cd = conn.execute(
             "SELECT COUNT(DISTINCT cd_college_id) FROM sk_matches "
-            "WHERE verdict='yes'").fetchone()[0]
+            f"WHERE verdict='yes' AND {where}", args).fetchone()[0]
         pend = conn.execute("SELECT COUNT(*) FROM sk_matches "
-                            "WHERE verdict='pending'").fetchone()[0]
+                            f"WHERE verdict='pending' AND {where}",
+                            args).fetchone()[0]
         dupe = conn.execute(
             "SELECT COUNT(*) FROM (SELECT sk_college_id FROM sk_matches "
-            "WHERE verdict='yes' GROUP BY sk_college_id HAVING COUNT(*)>1)"
-        ).fetchone()[0]
+            f"WHERE verdict='yes' AND {where} "
+            "GROUP BY sk_college_id HAVING COUNT(*)>1)", args).fetchone()[0]
         print(f"\nCollegedunia colleges with >=1 accepted match: "
               f"{yes_cd:,} / {cd_n:,} ({100.0*yes_cd/max(1,cd_n):.1f}%)")
         print(f"awaiting judgement                           : {pend:,}")
@@ -553,14 +566,21 @@ def conflicts(limit: int = 12) -> int:
     Read-only: prints, writes nothing.
     """
     cd, sk = load_cd(), load_sk()
+    # Same window as `report`: a conflict between a current row and a leftover
+    # from a build that no longer stands is not a conflict.
+    cut = float(sk_db.get_setting("last_match_build_at") or 0)
+    where = "decided_at >= ?" if cut else "1=1"
+    args = (cut,) if cut else ()
     groups: Dict[int, List[Tuple[int, str, str, Dict[str, Any]]]] = defaultdict(list)
     with sk_db.connect() as conn:
         for ski, cdi, tier, score, ev in conn.execute(
                 "SELECT sk_college_id, cd_college_id, tier, score, evidence "
-                "FROM sk_matches WHERE verdict='yes' AND sk_college_id IN ("
+                f"FROM sk_matches WHERE verdict='yes' AND {where} "
+                "AND sk_college_id IN ("
                 "  SELECT sk_college_id FROM sk_matches WHERE verdict='yes' "
+                f"  AND {where} "
                 "  GROUP BY sk_college_id HAVING COUNT(*)>1) "
-                "ORDER BY sk_college_id"):
+                "ORDER BY sk_college_id", args + args):
             try:
                 evd = json.loads(ev or "{}")
             except Exception:  # noqa: BLE001

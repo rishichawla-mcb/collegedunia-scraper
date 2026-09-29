@@ -242,27 +242,64 @@ class StaleRowsAreNamed(unittest.TestCase):
             sk_match.report()
         self.assertIn("TOTAL", buf.getvalue())
 
+    def leftover_setup(self):
+        reset()
+        cd_row(1, IITB, "Mumbai", "https://www.iitb.ac.in")
+        sk_row(101, IITB, "Mumbai", "https://www.iitb.ac.in")
+        run()
+        # A pair an earlier build accepted and this one no longer emits — the
+        # exact shape of the 1,385 rows the cap and tokeniser fixes removed.
+        with sk_db.connect() as c:
+            c.execute("INSERT INTO sk_matches(cd_college_id,sk_college_id,score,"
+                      "tier,evidence,verdict,decided_by,decided_at) "
+                      "VALUES(42,999,0.99,'website','{}','yes','auto',1000)")
+
+    def report_text(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            sk_match.report()
+        return buf.getvalue()
+
     def test_a_leftover_row_is_called_out(self):
+        self.leftover_setup()
+        self.assertIn("stored but excluded here", self.report_text())
+
+    def test_a_leftover_row_is_kept_not_removed(self):
+        self.leftover_setup()
+        self.report_text()
+        with sk_db.connect() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM sk_matches "
+                                       "WHERE sk_college_id=999").fetchone()[0], 1)
+
+    def test_a_leftover_does_not_inflate_the_headline_figures(self):
+        """The failure this exists for: after the cap and tokeniser fixes the
+        build wrote 21,715 pairs while the table held 23,100, and the mixture
+        reported website=9,982 against a build that had matched 9,523 — and
+        COVERAGE RISING when the fixes had removed matches."""
+        self.leftover_setup()
+        out = self.report_text()
+        # CD 42 exists only in the leftover row, so it must not be counted as
+        # a matched Collegedunia college
+        self.assertIn("1 / 1", out.replace(",", ""))
+        self.assertNotIn("2 / 1", out)
+
+    def test_a_leftover_is_not_counted_as_a_conflict(self):
         import contextlib
         import io
         reset()
         cd_row(1, IITB, "Mumbai", "https://www.iitb.ac.in")
         sk_row(101, IITB, "Mumbai", "https://www.iitb.ac.in")
         run()
-        # a pair from an imaginary earlier build that this one no longer emits
-        with sk_db.connect() as c:
+        with sk_db.connect() as c:      # a second, stale claimant on SK 101
             c.execute("INSERT INTO sk_matches(cd_college_id,sk_college_id,score,"
                       "tier,evidence,verdict,decided_by,decided_at) "
-                      "VALUES(1,999,0.5,'name','{}','pending','auto',1000)")
+                      "VALUES(42,101,0.99,'website','{}','yes','auto',1000)")
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            sk_match.report()
-        out = buf.getvalue()
-        self.assertIn("leftovers from an earlier one", out)
-        # and it is still there afterwards — named, not removed
-        with sk_db.connect() as c:
-            self.assertEqual(c.execute("SELECT COUNT(*) FROM sk_matches "
-                                       "WHERE sk_college_id=999").fetchone()[0], 1)
+            sk_match.conflicts(limit=5)
+        self.assertIn("0 Shiksha colleges claimed by >1", buf.getvalue())
 
 
 class ConflictClassification(unittest.TestCase):
