@@ -100,11 +100,20 @@ def run_course_listing(job_id: int, cfg: Dict[str, Any],
     concurrency = max(1, int(merged.get("concurrency", 4)))
     delay = float(merged.get("delay", 1.0))
     max_colleges = int(merged.get("max_colleges", 0))
-    # A guard, not a limit anyone should need: 42 courses is 4 pages, and the
-    # busiest college in the database has nowhere near 300. It exists so a
-    # paginationData that ever loops cannot spend the whole budget on one
-    # college.
-    max_pages = max(1, int(merged.get("max_pages", 25)))
+    # A backstop against a runaway, nothing else. It was 25, written on the
+    # assumption that "the busiest college in the database has nowhere near
+    # 300" courses. That assumption was wrong and the first live run proved it:
+    # colleges 36321, 60197 and 182205 advertise 444, 473 and 319 courses and
+    # all three stopped at exactly 25 pages, keeping 300 and silently dropping
+    # the rest — while being recorded `done`.
+    #
+    # Measured afterwards: the busiest college holds 473 courses (40 pages), and
+    # only 3 colleges exceed 300. 100 pages is 1,200 courses, ~2.5x the largest
+    # real case. The walk is ended by the site's own paginationData; this only
+    # stops a loop, and the seen-URL guard below already covers the loop the
+    # site could cause. So the cap should be far out of the way of real data,
+    # which is the mistake the first value taught.
+    max_pages = max(1, int(merged.get("max_pages", 100)))
     order = str(merged.get("order", "value"))
     budget_check = _budget_guard(stats, int(merged.get("budget_requests", 0)),
                                  int(float(merged.get("budget_mb", 0)) * 1048576))
@@ -219,6 +228,17 @@ def run_course_listing(job_id: int, cfg: Dict[str, Any],
                 # 'short' is recorded, not hidden: if the site says 42 and we
                 # wrote 30, that is a fact a later audit needs to see.
                 short = expected is not None and len(rows) < expected
+                # Short because WE stopped, or short because the site's own
+                # count disagrees with what it served? Only the first is our
+                # bug, and only the first must stay in the queue. Recording a
+                # truncated college as `done` is how three colleges lost 144,
+                # 173 and 19 courses apiece on the first live run and left the
+                # queue for good.
+                if short and pages >= max_pages:
+                    raise ParseEmptyError(
+                        f"college {cid}: stopped at the {max_pages}-page cap "
+                        f"with {len(rows)} of {expected} courses. Not marking "
+                        f"it done — raise max_pages and re-run.")
                 notes = []
                 if short:
                     notes.append(f"{len(rows)} of {expected} advertised")

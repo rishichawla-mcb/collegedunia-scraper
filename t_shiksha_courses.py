@@ -964,6 +964,51 @@ class RunnerWiring(unittest.TestCase):
                              "WHERE college_id=72").fetchone()
         self.assertEqual(p["status"], "done")
 
+    def test_hitting_the_page_cap_is_an_error_not_a_done(self):
+        """The first live run capped three colleges at 25 pages — 300 of 444,
+        300 of 473, 300 of 319 — and recorded all three `done`, so they left the
+        queue with a third of their courses missing. Truncation by US is our bug
+        and must stay in the queue; a count the site itself disagrees with is
+        not."""
+        page = listing_state([TUPLE], pagination={"nextUrls": [
+            {"pageNumber": 2, "url": f"/college/{SLUG}/courses-2"}]}, total=444)
+        pages = {"courses": page}
+        for i in range(2, 40):
+            pages["courses-%d" % i] = listing_state(
+                [dict(TUPLE, courseId=900000 + i)],
+                pagination={"nextUrls": [
+                    {"pageNumber": i + 1,
+                     "url": f"/college/{SLUG}/courses-{i+1}"}]}, total=444)
+        # drive it with the cap set low, through the same seam
+        def fake(client, url, cid, route=None):
+            self.seen.append(url)
+            key = url.rsplit("/", 1)[-1]
+            if key not in pages:
+                raise self.mod.NoStateError("no state")
+            return pages[key]
+        self.mod.fetch_college_state = fake
+        self.mod.run_course_listing(self.job, {"concurrency": 1, "delay": 0,
+                                               "max_pages": 5,
+                                               "proxy_mode": "none"},
+                                    log=lambda m: None)
+        with sk_db.connect(self.path) as conn:
+            p = conn.execute("SELECT status, pages, message FROM "
+                             "sk_course_progress WHERE college_id=72").fetchone()
+        self.assertEqual(p["status"], "error")
+        self.assertEqual(p["pages"], 5)
+        self.assertIn("cap", p["message"])
+        self.assertIn(72, [c["college_id"] for c in
+                           sk_db.colleges_pending_courses(db_path=self.path)])
+
+    def test_the_default_cap_clears_the_busiest_real_college(self):
+        """473 courses is the largest in the inventory — 40 pages. A default
+        that does not clear it by a wide margin is the bug again."""
+        import inspect
+        src = inspect.getsource(self.mod.run_course_listing)
+        line = [l for l in src.splitlines() if 'merged.get("max_pages"' in l][0]
+        default = int(line.split('"max_pages",')[1].split(")")[0])
+        self.assertGreaterEqual(default, 40 * 2, line.strip())
+
     def test_short_count_is_recorded_not_hidden(self):
         p1 = listing_state([TUPLE], pagination={"nextUrls": []}, total=42)
         self.run_with({"courses": p1})
