@@ -395,6 +395,78 @@ class ConflictClassification(unittest.TestCase):
         self.assertIn("0 Shiksha colleges claimed by >1", out)
 
 
+class InitialsAreNotInterchangeable(unittest.TestCase):
+    """Splitting on punctuation and collecting into a SET made two different
+    institutions identical. From the live conflict report: R.R. Group of
+    Institutions and S.R Group of Institutions, both Lucknow, scored
+    `name 1.00` and were accepted as one college.
+
+    ['r','r',...] collapses to {'r'}; ['s','r',...] loses 's' to the stopword
+    list (which is there for possessives) and also leaves {'r'}."""
+
+    def test_two_different_initialisms_stay_different(self):
+        a = sk_match.tokens("R.R. Group of Institutions", "Lucknow")
+        b = sk_match.tokens("S.R Group of Institutions", "Lucknow")
+        self.assertNotEqual(a, b)
+        self.assertLess(sk_match.jaccard(a, b), sk_match.ACCEPT_NAME)
+        self.assertIn("rr", a)
+        self.assertIn("sr", b)
+
+    def test_spacing_of_the_same_initialism_does_not_matter(self):
+        a = sk_match.tokens("B. N. M. Institute of Technology", "Bangalore")
+        b = sk_match.tokens("B.N.M. Institute of Technology", "Bangalore")
+        self.assertEqual(a, b)
+        self.assertIn("bnm", a)
+
+    def test_a_possessive_s_is_still_dropped(self):
+        a = sk_match.tokens("St. Xavier's College", "Mumbai")
+        b = sk_match.tokens("St Xavier College", "Mumbai")
+        self.assertEqual(a, b)
+        self.assertNotIn("s", a)
+
+    def test_a_single_trailing_letter_is_not_glued_to_the_previous_word(self):
+        self.assertEqual(sk_match.tokens("Alpha College B"),
+                         {"alpha", "college", "b"})
+
+    def test_digits_are_still_ignored(self):
+        self.assertNotIn("2026", sk_match.tokens("Alpha College 2026"))
+
+
+class SharedValuesAreCappedOnBothSides(unittest.TestCase):
+    """The cap on how many rows may share an identifying value was applied to
+    Shiksha only. The live report shows what that cost: five Maharishi
+    Markandeshwar colleges on one domain all claiming SK 4274, nine Uka Tarsadia
+    colleges on one email all claiming SK 101689, and fifteen Collegedunia rows
+    on a single Shiksha college at the widest."""
+
+    def group(self, n):
+        reset()
+        for i in range(1, n + 1):
+            cd_row(i, f"Group College Number {i}", "Pune",
+                   "https://onegroup.ac.in")
+        sk_row(101, "One Group Institute", "Pune", "https://onegroup.ac.in")
+        return run()
+
+    def test_a_domain_on_too_many_collegedunia_rows_does_not_identify(self):
+        m = self.group(sk_match.MAX_SHARERS + 1)
+        self.assertEqual([k for k in m if m[k]["tier"] == "website"], [])
+
+    def test_a_domain_on_few_enough_rows_still_matches(self):
+        m = self.group(sk_match.MAX_SHARERS)
+        self.assertTrue([k for k in m if m[k]["tier"] == "website"])
+
+    def test_the_cap_is_the_same_number_on_both_sides(self):
+        """One constant, so the two sides cannot drift apart again."""
+        import inspect
+        import re
+        src = inspect.getsource(sk_match.build)
+        guards = [ln.strip() for ln in src.splitlines()
+                  if re.search(r"if\s+.*len\(.*\)\s*>", ln)]
+        self.assertEqual(len(guards), 2, guards)
+        for g in guards:
+            self.assertIn("MAX_SHARERS", g, g)
+
+
 class ReportContract(unittest.TestCase):
 
     def test_tier_rank_covers_every_tier_add_can_emit(self):

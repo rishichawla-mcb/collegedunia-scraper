@@ -100,18 +100,51 @@ TIER_RANK = {"website": 5, "phone": 4, "email": 3, "shortform": 2, "name": 1}
 ACCEPT_NAME = 0.85      # name+city similarity accepted without judgement
 JUDGE_FLOOR = 0.45      # below this, not even worth a judgement
 SHORTFORM_MIN = 3       # "IIT" yes, "IT" no — two letters collide constantly
+# A website/phone/email published by more than this many rows on EITHER side
+# belongs to a group, not to a college, and cannot identify one.
+MAX_SHARERS = 3
 
 
 # ---------------------------------------------------------------------------
 # normalisation
 # ---------------------------------------------------------------------------
 def tokens(*parts: str) -> Set[str]:
+    """Name + city as a token set, with runs of initials joined into one token.
+
+    Joining the initials is load-bearing. Splitting on punctuation turns
+    "R.R. Group of Institutions" into ['r','r','group','institutions'] and a SET
+    collapses the repeat to {'r', group, institutions}; "S.R Group of
+    Institutions" gives ['s','r',...] and 's' is a stopword (it is there to strip
+    possessives), leaving {'r', group, institutions} — the SAME set. The two
+    scored a Jaccard of 1.00 and were accepted as one college. They are not:
+    R.R. Group and S.R Group are different institutions in Lucknow, and the live
+    conflict report of 2026-09-28 shows the matcher claiming otherwise.
+
+    Coalescing first gives 'rr' and 'sr', which differ, and incidentally makes
+    the token agree with the shortform tier's key. "B. N. M. Institute" becomes
+    {bnm, institute}, which is what a reader would call it.
+    """
     out: Set[str] = set()
     for p in parts:
         if not p:
             continue
-        for t in _NON.split(str(p).lower()):
-            if t and t not in STOP and not t.isdigit():
+        raw = [t for t in _NON.split(str(p).lower()) if t and not t.isdigit()]
+        merged: List[str] = []
+        run: List[str] = []
+        for t in raw:
+            if len(t) == 1:
+                run.append(t)
+                continue
+            if run:
+                merged.append("".join(run))
+                run = []
+            merged.append(t)
+        if run:
+            merged.append("".join(run))
+        for t in merged:
+            # The stopword list applies to WORDS. A joined initialism is not one,
+            # so "s" is dropped from "St. Xavier's" but kept inside "sr".
+            if t not in STOP:
                 out.add(t)
     return out
 
@@ -358,19 +391,40 @@ def build(db_path: str = None) -> int:
                                ("phone", cd.phone, sk.phone),
                                ("email", cd.email, sk.email)):
         inv = _invert(skmap)
-        hits = 0
+        cd_inv = _invert(cdmap)
+        hits = dropped = 0
         for cdi, val in cdmap.items():
             cands = inv.get(val) or []
             # A domain shared by many Shiksha rows is a university's rows, or
             # junk we failed to list. Either way it is not identifying.
-            if not cands or len(cands) > 3:
+            if not cands or len(cands) > MAX_SHARERS:
+                continue
+            # The SAME test on the Collegedunia side, which was missing. It
+            # capped how many SHIKSHA rows could share a value but not how many
+            # COLLEGEDUNIA rows, so a university's whole group was accepted
+            # against one Shiksha college. The live conflict report of
+            # 2026-09-28 is full of it: five Maharishi Markandeshwar colleges
+            # (Pharmacy, Engineering, Nursing, Computer Tech, the university)
+            # all claiming SK 4274 on one domain; nine Uka Tarsadia colleges
+            # claiming SK 101689 on one email; fifteen Collegedunia rows on a
+            # single Shiksha college at the widest.
+            #
+            # Dropping rather than accepting is right: the evidence is real but
+            # not IDENTIFYING, and the name tier can still tell the group's
+            # members apart. Keeping it meant a confident 'yes' on a claim the
+            # evidence never supported.
+            if len(cd_inv.get(val) or ()) > MAX_SHARERS:
+                dropped += 1
                 continue
             for ski in cands:
                 nj = jaccard(cd.toks.get(cdi, set()), sk.toks.get(ski, set()))
                 add(cdi, ski, tier, 1.0 if len(cands) == 1 else 0.9,
                     {tier: val, "name_jaccard": round(nj, 2)}, "yes")
                 hits += 1
-        print(f"\n2.{tier:<9} matched {hits:,} pairs")
+        print(f"\n2.{tier:<9} matched {hits:,} pairs"
+              + (f"  ({dropped:,} skipped: the value is shared by more than "
+                 f"{MAX_SHARERS} Collegedunia rows, so it does not identify)"
+                 if dropped else ""))
 
     # ---- tier 4: abbreviations, which both sites publish ----
     inv_short = _invert(sk.short)
