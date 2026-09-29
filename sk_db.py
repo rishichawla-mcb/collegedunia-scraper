@@ -461,6 +461,58 @@ OFFERING_COLS = ["college_id", "course_id", "url", "course_slug", "course_name",
                  "source_job_id"]
 
 
+def mark_first_observation(conn, table: str, key_cols: List[str],
+                           rows: List[Dict[str, Any]], stamp_col: str) -> int:
+    """Null the freshness fingerprint on rows this PHASE has never written.
+
+    `freshness.reconcile()` branches on the stored `content_hash`. If it is set,
+    the write is treated as a change and `diff_row()` emits ONE LOG ROW PER
+    DIFFERING FIELD. Discovery creates every row and fingerprints it, so when a
+    later phase fills thirty or eighty empty columns for the first time, thirty
+    or eighty "changes" are recorded — for a page nothing had ever looked at.
+
+    Measured 2026-09-29 on 2,000 offerings driven through the real writers:
+
+        Ⓒ + Ⓓ with the log as-is   8.73 KB/row  ->  2.65 GB for 317,907
+        the change log alone       6.63 KB/row  ->  2.01 GB   (76% of it)
+        the course data alone      2.10 KB/row  ->  0.64 GB
+
+    A null hash takes reconcile's other branch and logs exactly one `new` row.
+    Nothing is lost: the freshness columns are still maintained, and a genuine
+    later change — a fee moving, a course closing — still diffs field by field,
+    because by then the stamp column is set and this function leaves it alone.
+
+    `stamp_col` is the column that says "this phase has seen this row":
+    detail_scraped_at for Ⓑ, listed_at for Ⓒ, deep_scraped_at for Ⓓ.
+
+    Returns the number of rows re-marked. A table without freshness columns yet
+    is not an error — there is nothing to null.
+    """
+    keys = [tuple(r.get(c) for c in key_cols) for r in rows
+            if all(r.get(c) is not None for c in key_cols)]
+    if not keys:
+        return 0
+    try:
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    except Exception:  # noqa: BLE001
+        return 0
+    if "content_hash" not in have or stamp_col not in have:
+        return 0
+    cond = " AND ".join(f"{c}=?" for c in key_cols)
+    n = 0
+    # SQLite's parameter limit is 999; len(key_cols) params per key.
+    chunk = max(1, 900 // max(1, len(key_cols)))
+    for i in range(0, len(keys), chunk):
+        part = keys[i:i + chunk]
+        where = " OR ".join(f"({cond})" for _ in part)
+        args = [v for k in part for v in k]
+        cur = conn.execute(
+            f"UPDATE {table} SET content_hash=NULL "
+            f"WHERE {stamp_col} IS NULL AND ({where})", args)
+        n += cur.rowcount or 0
+    return n
+
+
 def _job_of(rows):
     """The job that produced this batch, read off the rows themselves."""
     for r in rows:
@@ -549,6 +601,8 @@ def upsert_offering_listing(rows, db_path: str = SK_DB_PATH) -> int:
     rows = [r for r in rows
             if r.get("college_id") is not None and r.get("course_id") is not None]
     with connect(db_path) as conn:
+        mark_first_observation(conn, "sk_offerings",
+                               ["college_id", "course_id"], rows, "listed_at")
         return _upsert(conn, "sk_offerings", OFFERING_LISTING_COLS,
                        ["college_id", "course_id"], rows)
 
@@ -557,6 +611,8 @@ def upsert_offering_deep(rows, db_path: str = SK_DB_PATH) -> int:
     rows = [r for r in rows
             if r.get("college_id") is not None and r.get("course_id") is not None]
     with connect(db_path) as conn:
+        mark_first_observation(conn, "sk_offerings", ["college_id", "course_id"],
+                               rows, "deep_scraped_at")
         return _upsert(conn, "sk_offerings", OFFERING_DEEP_COLS,
                        ["college_id", "course_id"], rows)
 
@@ -646,6 +702,8 @@ def upsert_college_detail(rows, db_path: str = SK_DB_PATH) -> int:
     must not blank any of them."""
     rows = [r for r in rows if r.get("college_id") is not None]
     with connect(db_path) as conn:
+        mark_first_observation(conn, "sk_colleges", ["college_id"], rows,
+                               "detail_scraped_at")
         return _upsert(conn, "sk_colleges", COLLEGE_DETAIL_COLS,
                        ["college_id"], rows)
 

@@ -61,6 +61,21 @@ EXCLUDED_FROM_HASH = FRESHNESS_NAMES | {
     # it was the one volatile column still inside a fingerprint, and would have
     # made all 14,997 colleges read as changed on every refresh.
     "basic_scraped_at",
+    # Phase Ⓒ's visit stamp on sk_offerings. It does NOT end in `_scraped_at`,
+    # so VOLATILE_SUFFIXES below does not catch it, and it was sitting inside
+    # the fingerprint — every re-crawl would have logged a `changed` row for all
+    # 317,907 offerings with nothing behind it. Caught 2026-09-29 by a test
+    # asserting that writing the same row twice logs nothing, which failed with
+    # 3 != 2. Exactly the failure the 2026-09-21 canary audit found in
+    # basic_scraped_at, and exactly what the comment under VOLATILE_SUFFIXES
+    # predicted would happen again.
+    "listed_at",
+    # The same thing one layer earlier, and pre-existing: discovery stamps
+    # `discovered_at` on every row it writes, so re-running discovery — which is
+    # cheap, ~48 requests, and therefore likely — moved the fingerprint of every
+    # offering and college and logged a `changed` row apiece. "When we first saw
+    # it" is a visit stamp, never content, in every vertical.
+    "discovered_at",
     "source_job_id", "job_id",
     "raw_json", "detail_json",
     # The raw basic_info object that colleges' 29 basic_* columns are parsed
@@ -308,15 +323,36 @@ def has_freshness(conn: sqlite3.Connection, table: str) -> bool:
         return False
 
 
+def _db_file(conn: sqlite3.Connection) -> str:
+    """The file this connection is attached to, '' for an in-memory database."""
+    try:
+        for row in conn.execute("PRAGMA database_list"):
+            if row[1] == "main":
+                return str(row[2] or "")
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 def _ready(conn: sqlite3.Connection, table: str) -> bool:
-    """Make sure the table can be tracked, at most once per process per table."""
-    if table in _SCHEMA_READY:
+    """Make sure the table can be tracked, at most once per process per table.
+
+    Keyed by (database FILE, table), not by table alone. The cache exists to
+    skip a repeated ALTER check, but a process that opens more than one database
+    — the Shiksha file beside data.db, or a test run using two — has a different
+    `colleges` table in each. Keying on the name alone made the SECOND file
+    inherit the first file's "already tracked" answer and then fail every write
+    with "no such column: content_hash". Same shape as the sk_db `data_changes`
+    bug of 2026-09-24: a process-global cache that ignored which file it was
+    talking about."""
+    key = (_db_file(conn), table)
+    if key in _SCHEMA_READY:
         return True
     try:
         ensure_schema(conn, table)
     except Exception:  # noqa: BLE001
         return False
-    _SCHEMA_READY.add(table)
+    _SCHEMA_READY.add(key)
     return True
 
 

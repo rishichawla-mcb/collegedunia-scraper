@@ -769,6 +769,129 @@ class Writes(unittest.TestCase):
         self.assertNotIn(306967, [p["course_id"] for p in pend])
 
 
+class FirstObservationIsNotAChange(unittest.TestCase):
+    """Discovery creates every offering row and fingerprints it, so when phase Ⓒ
+    later fills forty empty columns, `freshness` takes the 'changed' branch and
+    logs one row PER FIELD — forty "changes" to a page nothing had ever looked
+    at. Phase Ⓓ makes it worse: eighty more columns.
+
+    Measured 2026-09-29 on 2,000 offerings through the real writers: 8.73 KB per
+    row, of which 6.63 KB was change log — 2.01 GB of the 2.65 GB that Ⓒ+Ⓓ would
+    cost across 317,907 offerings. Nulling the fingerprint for a row the phase
+    has never written takes the other branch and logs a single `new`.
+
+    What must NOT be lost is the log's actual job: a fee moving later is still a
+    change and must still be diffed field by field."""
+
+    def setUp(self):
+        self.path = fresh_db()
+        # discovery's thin row — the fingerprint that causes the problem
+        sk_db.upsert_offerings([{"college_id": 72, "course_id": 306967,
+                                 "url": "/college/x-72/course-y-306967",
+                                 "course_slug": "course-y-306967",
+                                 "discovered_at": time.time()}],
+                               db_path=self.path)
+
+    def changes(self, kind=None):
+        sql = ("SELECT change_type, field, old_value, new_value FROM data_changes "
+               "WHERE table_name='sk_offerings'")
+        if kind:
+            sql += " AND change_type='%s'" % kind
+        with sk_db.connect(self.path) as c:
+            return [tuple(r) for r in c.execute(sql)]
+
+    def listing_row(self, **over):
+        r = one(listing_state([TUPLE]))["offerings"][0]
+        r.update({"listed_at": time.time(), "scraped_at": time.time()})
+        r.update(over)
+        return r
+
+    def test_the_first_listing_write_logs_one_new_not_forty_changes(self):
+        before = len(self.changes())
+        sk_db.upsert_offering_listing([self.listing_row()], db_path=self.path)
+        added = self.changes()[before:]
+        self.assertEqual(len(added), 1, added)
+        self.assertEqual(added[0][0], "new")
+
+    def test_the_first_deep_write_also_logs_one_new(self):
+        sk_db.upsert_offering_listing([self.listing_row()], db_path=self.path)
+        before = len(self.changes())
+        deep = sk_parse.parse_course_detail(DETAIL_STATE_NIT, job_id=9)
+        deep.update({"college_id": 72, "course_id": 306967,
+                     "deep_scraped_at": time.time()})
+        sk_db.upsert_offering_deep([deep], db_path=self.path)
+        added = self.changes()[before:]
+        self.assertEqual(len(added), 1, added)
+        self.assertEqual(added[0][0], "new")
+
+    def test_a_genuine_later_change_is_still_diffed_field_by_field(self):
+        """The whole point. Suppressing first observations must not suppress
+        real ones — a fee moving is what the log exists for."""
+        sk_db.upsert_offering_listing([self.listing_row()], db_path=self.path)
+        sk_db.upsert_offering_listing(
+            [self.listing_row(fees_amount=2500000)], db_path=self.path)
+        changed = self.changes("changed")
+        self.assertTrue(changed, "a real fee change was not logged")
+        fields = {c[1] for c in changed}
+        self.assertIn("fees_amount", fields)
+        row = [c for c in changed if c[1] == "fees_amount"][0]
+        self.assertEqual((row[2], row[3]), ("1940000", "2500000"))
+
+    def test_a_second_pass_over_an_unchanged_row_logs_nothing_new(self):
+        sk_db.upsert_offering_listing([self.listing_row()], db_path=self.path)
+        n = len(self.changes())
+        sk_db.upsert_offering_listing([self.listing_row()], db_path=self.path)
+        self.assertEqual(len(self.changes()), n)
+
+    def test_the_stamp_is_what_decides_not_the_row_existing(self):
+        """Once listed_at is set the row is no longer a first observation, so a
+        later write must go down the diff path even if deep columns are empty."""
+        sk_db.upsert_offering_listing([self.listing_row()], db_path=self.path)
+        with sk_db.connect(self.path) as c:
+            n = sk_db.mark_first_observation(
+                c, "sk_offerings", ["college_id", "course_id"],
+                [{"college_id": 72, "course_id": 306967}], "listed_at")
+        self.assertEqual(n, 0)
+
+    def test_a_missing_stamp_column_is_not_an_error(self):
+        with sk_db.connect(self.path) as c:
+            self.assertEqual(
+                sk_db.mark_first_observation(
+                    c, "sk_offerings", ["college_id", "course_id"],
+                    [{"college_id": 72, "course_id": 306967}], "no_such_column"), 0)
+
+    def test_rows_without_keys_are_skipped(self):
+        with sk_db.connect(self.path) as c:
+            self.assertEqual(
+                sk_db.mark_first_observation(
+                    c, "sk_offerings", ["college_id", "course_id"],
+                    [{"college_id": None, "course_id": None}], "listed_at"), 0)
+
+    def test_no_visit_stamp_sits_inside_the_offerings_fingerprint(self):
+        """A contract, not an example. `listed_at` was in the fingerprint
+        because it does not end in `_scraped_at`, so the suffix rule missed it
+        and the explicit list had not been extended — the exact failure mode the
+        comment above VOLATILE_SUFFIXES warns about. This fails the moment
+        someone adds another stamp under a new name."""
+        import freshness as _fr
+        with sk_db.connect(self.path) as c:
+            tracked = set(_fr.tracked_columns(c, "sk_offerings"))
+        hashed = {c for c in tracked if c.endswith("_at")}
+        self.assertEqual(hashed, set(),
+                         "these visit stamps are inside the fingerprint and "
+                         "will log a phantom change on every re-crawl: %s"
+                         % sorted(hashed))
+
+    def test_a_batch_larger_than_sqlites_parameter_limit_works(self):
+        """900 parameters is the chunk; a batch of 1,000 two-key rows is 2,000."""
+        many = [{"college_id": 72, "course_id": 306967}] + [
+            {"college_id": 99, "course_id": 500000 + i} for i in range(999)]
+        with sk_db.connect(self.path) as c:
+            n = sk_db.mark_first_observation(
+                c, "sk_offerings", ["college_id", "course_id"], many, "listed_at")
+        self.assertEqual(n, 1)     # only the one discovery row exists
+
+
 class RunnerWiring(unittest.TestCase):
     """Drive the REAL runner with the transport monkeypatched at
     fetch_college_state — the same seam the phase Ⓑ tests use — so pagination,
